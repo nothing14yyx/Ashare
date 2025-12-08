@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import math
 import os
-import time
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from typing import Callable, List, Optional, Sequence
@@ -108,6 +106,54 @@ class AKShareClient:
             error_message
             + "（网络波动或证书校验异常，已尝试直连与跳过 SSL 验证，请稍后重试）"
         ) from last_error
+
+    @contextmanager
+    def _patched_requests_verify(self, verify: bool):
+        """临时覆盖 ``requests.get`` 的 ``verify`` 参数。"""
+
+        original_get = requests.get
+
+        def patched_get(*args, **kwargs):
+            kwargs.setdefault("verify", verify)
+            return original_get(*args, **kwargs)
+
+        try:
+            requests.get = patched_get
+            yield
+        finally:
+            requests.get = original_get
+
+    def _run_akshare_with_resilience(
+        self, action: Callable[[], pd.DataFrame], error_message: str
+    ) -> pd.DataFrame:
+        """在代理与 SSL 设置之间切换，执行 AkShare 接口调用。"""
+
+        proxy_attempts = [None]
+        if self.use_proxies:
+            proxy_attempts.append(False)
+
+        last_error: Exception | None = None
+        for enable_proxy in proxy_attempts:
+            for verify_ssl in (True, False):
+                try:
+                    with self._temporary_proxy_env(enable=enable_proxy):
+                        with self._patched_requests_verify(verify_ssl):
+                            return action()
+                except (
+                    requests.exceptions.ProxyError,
+                    requests.exceptions.SSLError,
+                    requests.exceptions.HTTPError,
+                    JSONDecodeError,
+                ) as exc:
+                    last_error = exc
+                    if (enable_proxy is False or not self.use_proxies) and not verify_ssl:
+                        break
+
+        raise ConnectionError(
+            error_message
+            + "（网络波动或证书校验异常，已尝试直连与跳过 SSL 验证，请稍后重试）",
+        ) from last_error
+
 
     @staticmethod
     def _normalize_code(code: str) -> str:
@@ -592,208 +638,29 @@ class AKShareClient:
         if normalized_type not in board_type_map:
             raise ValueError("board_type 仅支持 industry、concept 或 area")
 
-        indicator_map = {
-            "今日": [
-                "f62",
-                "1",
-                "f12,f14,f2,f3,f62,f184,f66,f69,f72,f75,f78,f81,f84,f87,f204,f205,f124",
-            ],
-            "5日": [
-                "f164",
-                "5",
-                "f12,f14,f2,f109,f164,f165,f166,f167,f168,f169,f170,f171,f172,f173,f257,f258,f124",
-            ],
-            "10日": [
-                "f174",
-                "10",
-                "f12,f14,f2,f160,f174,f175,f176,f177,f178,f179,f180,f181,f182,f183,f260,f261,f124",
-            ],
-        }
-
-        if indicator not in indicator_map:
+        if indicator not in {"今日", "5日", "10日"}:
             raise ValueError("indicator 仅支持 今日、5日 或 10日")
 
-        def action_builder(verify_ssl: bool) -> pd.DataFrame:
-            url = "https://push2.eastmoney.com/api/qt/clist/get"
-            headers = {
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) Chrome/81.0.4044.138 Safari/537.36"
-                )
-            }
-            params = {
-                "pn": "1",
-                "pz": "100",
-                "po": "1",
-                "np": "1",
-                "ut": "b2884a393a59ad64002292a3e90d46a5",
-                "fltt": "2",
-                "invt": "2",
-                "fid0": indicator_map[indicator][0],
-                "fs": f"m:90 t:{'2' if normalized_type == 'industry' else '3' if normalized_type == 'concept' else '1'}",
-                "stat": indicator_map[indicator][1],
-                "fields": indicator_map[indicator][2],
-                "rt": "52975239",
-                "_": int(time.time() * 1000),
-            }
-            response = requests.get(
-                url, params=params, headers=headers, timeout=15, verify=verify_ssl
-            )
-            response.raise_for_status()
-            data_json = response.json()
-            total_page = math.ceil(data_json["data"]["total"] / 100)
-            temp_list: list[pd.DataFrame] = []
-            for page in range(1, total_page + 1):
-                params.update({"pn": page})
-                response = requests.get(
-                    url, params=params, headers=headers, timeout=15, verify=verify_ssl
-                )
-                response.raise_for_status()
-                data_json = response.json()
-                inner_df = pd.DataFrame(data_json.get("data", {}).get("diff", []))
-                temp_list.append(inner_df)
-            if not temp_list:
-                raise LookupError("未获取到板块资金流数据")
-
-            temp_df = pd.concat(temp_list, ignore_index=True)
-
-            if indicator == "今日":
-                temp_df.columns = [
-                    "-",
-                    "今日涨跌幅",
-                    "_",
-                    "名称",
-                    "今日主力净流入-净额",
-                    "今日超大单净流入-净额",
-                    "今日超大单净流入-净占比",
-                    "今日大单净流入-净额",
-                    "今日大单净流入-净占比",
-                    "今日中单净流入-净额",
-                    "今日中单净流入-净占比",
-                    "今日小单净流入-净额",
-                    "今日小单净流入-净占比",
-                    "-",
-                    "今日主力净流入-净占比",
-                    "今日主力净流入最大股",
-                    "今日主力净流入最大股代码",
-                    "是否净流入",
-                ]
-
-                temp_df = temp_df[
-                    [
-                        "名称",
-                        "今日涨跌幅",
-                        "今日主力净流入-净额",
-                        "今日主力净流入-净占比",
-                        "今日超大单净流入-净额",
-                        "今日超大单净流入-净占比",
-                        "今日大单净流入-净额",
-                        "今日大单净流入-净占比",
-                        "今日中单净流入-净额",
-                        "今日中单净流入-净占比",
-                        "今日小单净流入-净额",
-                        "今日小单净流入-净占比",
-                        "今日主力净流入最大股",
-                    ]
-                ]
-                temp_df.sort_values(
-                    ["今日主力净流入-净额"], ascending=False, inplace=True
-                )
-            elif indicator == "5日":
-                temp_df.columns = [
-                    "-",
-                    "_",
-                    "名称",
-                    "5日涨跌幅",
-                    "_",
-                    "5日主力净流入-净额",
-                    "5日主力净流入-净占比",
-                    "5日超大单净流入-净额",
-                    "5日超大单净流入-净占比",
-                    "5日大单净流入-净额",
-                    "5日大单净流入-净占比",
-                    "5日中单净流入-净额",
-                    "5日中单净流入-净占比",
-                    "5日小单净流入-净额",
-                    "5日小单净流入-净占比",
-                    "5日主力净流入最大股",
-                    "_",
-                    "_",
-                ]
-
-                temp_df = temp_df[
-                    [
-                        "名称",
-                        "5日涨跌幅",
-                        "5日主力净流入-净额",
-                        "5日主力净流入-净占比",
-                        "5日超大单净流入-净额",
-                        "5日超大单净流入-净占比",
-                        "5日大单净流入-净额",
-                        "5日大单净流入-净占比",
-                        "5日中单净流入-净额",
-                        "5日中单净流入-净占比",
-                        "5日小单净流入-净额",
-                        "5日小单净流入-净占比",
-                        "5日主力净流入最大股",
-                    ]
-                ]
-                temp_df.sort_values(["5日主力净流入-净额"], ascending=False, inplace=True)
-            else:
-                temp_df.columns = [
-                    "-",
-                    "_",
-                    "名称",
-                    "_",
-                    "10日涨跌幅",
-                    "10日主力净流入-净额",
-                    "10日主力净流入-净占比",
-                    "10日超大单净流入-净额",
-                    "10日超大单净流入-净占比",
-                    "10日大单净流入-净额",
-                    "10日大单净流入-净占比",
-                    "10日中单净流入-净额",
-                    "10日中单净流入-净占比",
-                    "10日小单净流入-净额",
-                    "10日小单净流入-净占比",
-                    "10日主力净流入最大股",
-                    "_",
-                    "_",
-                ]
-
-                temp_df = temp_df[
-                    [
-                        "名称",
-                        "10日涨跌幅",
-                        "10日主力净流入-净额",
-                        "10日主力净流入-净占比",
-                        "10日超大单净流入-净额",
-                        "10日超大单净流入-净占比",
-                        "10日大单净流入-净额",
-                        "10日大单净流入-净占比",
-                        "10日中单净流入-净额",
-                        "10日中单净流入-净占比",
-                        "10日小单净流入-净额",
-                        "10日小单净流入-净占比",
-                        "10日主力净流入最大股",
-                    ]
-                ]
-                temp_df.sort_values(
-                    ["10日主力净流入-净额"], ascending=False, inplace=True
-                )
-
-            temp_df.reset_index(drop=True, inplace=True)
-            temp_df.index = range(1, len(temp_df) + 1)
-            temp_df.insert(0, "序号", temp_df.index)
-            return temp_df
-
-        raw_flows = self._run_with_proxy_and_ssl_fallback(
-            action_builder=action_builder,
+        flows_raw = self._run_akshare_with_resilience(
+            action=lambda: ak.stock_sector_fund_flow_rank(
+                indicator=indicator, sector_type=board_type_map[normalized_type]
+            ),
             error_message=f"板块资金流查询失败：{normalized_type}",
         )
 
+        if flows_raw.empty:
+            raise LookupError("未获取到板块资金流数据")
+
+        flows = flows_raw.copy()
+        name_column = self._find_first_column(
+            flows, ["名称", "板块名称", "行业名称", "概念名称"]
+        )
+        if not name_column:
+            raise LookupError("返回数据缺少板块名称字段")
+
         rename_prefix = indicator if indicator in {"今日", "5日", "10日"} else ""
         rename_mapping = {
+            name_column: "board_name",
             f"{rename_prefix}主力净流入-净额": "net_main_inflow",
             f"{rename_prefix}主力净流入-净占比": "net_main_ratio",
             f"{rename_prefix}超大单净流入-净额": "net_super_large_order",
@@ -806,10 +673,9 @@ class AKShareClient:
             f"{rename_prefix}小单净流入-净占比": "net_small_ratio",
             f"{rename_prefix}涨跌幅": "change_ratio",
             f"{rename_prefix}主力净流入最大股": "top_stock",
-            "名称": "board_name",
         }
+        flows.rename(columns=rename_mapping, inplace=True)
 
-        flows = raw_flows.rename(columns=rename_mapping)
         numeric_columns = [
             "net_main_inflow",
             "net_main_ratio",
@@ -960,77 +826,17 @@ class AKShareClient:
         normalized_code = self._normalize_code(code)
         market = self._detect_market(normalized_code)
 
-        def action_builder(verify_ssl: bool) -> pd.DataFrame:
-            url = "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
-            headers = {
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) Chrome/81.0.4044.138 Safari/537.36"
-                )
-            }
-            params = {
-                "lmt": "0",
-                "klt": "101",
-                "secid": f"{1 if market == 'sh' else 0}.{normalized_code}",
-                "fields1": "f1,f2,f3,f7",
-                "fields2": (
-                    "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63,f64,f65"
-                ),
-                "ut": "b2884a393a59ad64002292a3e90d46a5",
-                "_": int(time.time() * 1000),
-            }
-            response = requests.get(
-                url, params=params, headers=headers, timeout=15, verify=verify_ssl
-            )
-            response.raise_for_status()
-            data_json = response.json()
-            klines = data_json.get("data", {}).get("klines")
-            if not klines:
-                raise LookupError("未获取到个股资金流数据")
-
-            columns = [
-                "日期",
-                "主力净流入-净额",
-                "小单净流入-净额",
-                "中单净流入-净额",
-                "大单净流入-净额",
-                "超大单净流入-净额",
-                "主力净流入-净占比",
-                "小单净流入-净占比",
-                "中单净流入-净占比",
-                "大单净流入-净占比",
-                "超大单净流入-净占比",
-                "收盘价",
-                "涨跌幅",
-                "-",
-                "-",
-            ]
-            df = pd.DataFrame([item.split(",") for item in klines], columns=columns)
-            df = df[
-                [
-                    "日期",
-                    "收盘价",
-                    "涨跌幅",
-                    "主力净流入-净额",
-                    "主力净流入-净占比",
-                    "超大单净流入-净额",
-                    "超大单净流入-净占比",
-                    "大单净流入-净额",
-                    "大单净流入-净占比",
-                    "中单净流入-净额",
-                    "中单净流入-净占比",
-                    "小单净流入-净额",
-                    "小单净流入-净占比",
-                ]
-            ]
-            return df
-
-        flows = self._run_with_proxy_and_ssl_fallback(
-            action_builder=action_builder,
+        flows_raw = self._run_akshare_with_resilience(
+            action=lambda: ak.stock_individual_fund_flow(
+                stock=normalized_code, market=market
+            ),
             error_message=f"资金流向查询失败：{normalized_code}",
         )
 
-        flows = flows.copy()
+        if flows_raw.empty:
+            raise LookupError("未获取到个股资金流数据")
+
+        flows = flows_raw.copy()
         flows["日期"] = pd.to_datetime(flows["日期"], errors="coerce").dt.date
         flows = flows[(flows["日期"] >= start_dt) & (flows["日期"] <= end_dt)]
 
@@ -1049,7 +855,7 @@ class AKShareClient:
             "中单净流入-净占比": "net_medium_ratio",
             "小单净流入-净额": "net_small_order",
             "小单净流入-净占比": "net_small_ratio",
-            "收盘价": "close",  # noqa: RUF100
+            "收盘价": "close",
             "涨跌幅": "pct_change",
         }
         flows.rename(columns=rename_mapping, inplace=True)
@@ -1084,89 +890,6 @@ class AKShareClient:
 
         return flows[ordered_columns]
 
-    def _standardize_board_list(
-        self, boards: pd.DataFrame, code_label: str, name_label: str
-    ) -> pd.DataFrame:
-        boards = boards.copy()
-        code_column = self._find_first_column(
-            boards, ["代码", "code", "板块代码", "板块编号", "行业代码", "概念代码", "编号"]
-        )
-        name_column = self._find_first_column(
-            boards, ["名称", "name", "板块名称", "行业名称", "概念名称", "指数名称"]
-        )
-
-        boards[code_label] = boards[code_column] if code_column else pd.NA
-        boards[name_label] = boards[name_column] if name_column else pd.NA
-        boards[code_label] = boards[code_label].astype(str).str.strip()
-        boards[name_label] = boards[name_label].astype(str).str.strip()
-
-        boards = boards[[code_label, name_label]]
-        boards.dropna(how="all", inplace=True)
-        boards = boards[boards[name_label] != ""]
-        boards.reset_index(drop=True, inplace=True)
-        return boards
-
-    def _extract_board_name(self, members: pd.DataFrame) -> str:
-        name_column = self._find_first_column(
-            members, ["板块名称", "行业名称", "概念名称", "名称", "name"]
-        )
-        if name_column is None or members.empty:
-            return ""
-
-        valid_names = members[name_column].dropna()
-        if valid_names.empty:
-            return ""
-
-        return str(valid_names.iloc[0]).strip()
-
-    def _standardize_board_members(
-        self,
-        members: pd.DataFrame,
-        board_code: str,
-        code_label: str,
-        name_label: str,
-    ) -> pd.DataFrame:
-        members = members.copy()
-        stock_code_column = self._find_first_column(
-            members, ["代码", "code", "股票代码", "证券代码", "成分券代码"]
-        )
-        stock_name_column = self._find_first_column(
-            members, ["名称", "name", "股票简称", "证券简称", "股票名称"]
-        )
-
-        board_name = self._extract_board_name(members) or str(board_code).strip()
-        members[code_label] = str(board_code).strip()
-        members[name_label] = board_name
-
-        stock_codes = (
-            members[stock_code_column].apply(
-                lambda value: self._normalize_code(value) if pd.notna(value) else pd.NA
-            )
-            if stock_code_column
-            else pd.Series(pd.NA, index=members.index)
-        )
-        stock_names = (
-            members[stock_name_column]
-            if stock_name_column
-            else pd.Series(pd.NA, index=members.index)
-        )
-
-        standardized = pd.DataFrame(
-            {
-                code_label: members[code_label],
-                name_label: members[name_label],
-                "stock_code": stock_codes,
-                "stock_name": stock_names,
-            }
-        )
-
-        standardized = standardized[
-            (standardized["stock_code"].notna()) | (standardized["stock_name"].notna())
-        ]
-        standardized.reset_index(drop=True, inplace=True)
-        return standardized
-
-    @staticmethod
     def _ensure_float_columns(history: pd.DataFrame, columns: list[str]) -> None:
         for column in columns:
             if column in history:
