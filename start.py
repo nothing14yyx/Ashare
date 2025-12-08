@@ -2,19 +2,31 @@
 
 from __future__ import annotations
 
+import os
 import pathlib
 from typing import List
 
-import pandas as pd
-
-from src.akshare_client import AKShareClient
 from src.config import (
     DEFAULT_ADJUST,
     DEFAULT_END_DATE,
     DEFAULT_START_DATE,
     DEFAULT_STOCK_CODES,
+    HTTP_PROXY,
+    HTTPS_PROXY,
     USE_PROXIES,
 )
+
+if USE_PROXIES:
+    if HTTP_PROXY:
+        os.environ["HTTP_PROXY"] = HTTP_PROXY
+        os.environ["http_proxy"] = HTTP_PROXY
+    if HTTPS_PROXY:
+        os.environ["HTTPS_PROXY"] = HTTPS_PROXY
+        os.environ["https_proxy"] = HTTPS_PROXY
+
+import pandas as pd
+
+from src.akshare_client import AKShareClient
 
 OUTPUT_DIR = pathlib.Path("output")
 
