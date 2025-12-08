@@ -13,6 +13,7 @@ from src.config import (
     DEFAULT_END_DATE,
     DEFAULT_START_DATE,
     DEFAULT_STOCK_CODES,
+    USE_PROXIES,
 )
 
 OUTPUT_DIR = pathlib.Path("output")
@@ -52,7 +53,7 @@ def fetch_and_save_history(
 
 def run() -> None:
     """项目的统一入口，不依赖命令行参数。"""
-    client = AKShareClient()
+    client = AKShareClient(use_proxies=USE_PROXIES)
     realtime_path = fetch_and_save_realtime(client, DEFAULT_STOCK_CODES)
 
     history_paths = [
