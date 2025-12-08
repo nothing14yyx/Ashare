@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import math
 import os
+import time
 from contextlib import contextmanager
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Callable, List, Optional, Sequence
 
 import akshare as ak
@@ -77,12 +79,52 @@ class AKShareClient:
             + "（数据接口返回异常或被风控，请稍后重试，必要时更换网络环境）"
         ) from last_error
 
+    def _run_with_proxy_and_ssl_fallback(
+        self, action_builder: Callable[[bool], pd.DataFrame], error_message: str
+    ) -> pd.DataFrame:
+        """在代理与 SSL 验证之间尝试多次调用，提升可用性。"""
+
+        proxy_attempts = [None]
+        if self.use_proxies:
+            proxy_attempts.append(False)
+
+        last_error: Exception | None = None
+        for enable_proxy in proxy_attempts:
+            for verify_ssl in (True, False):
+                try:
+                    with self._temporary_proxy_env(enable=enable_proxy):
+                        return action_builder(verify_ssl)
+                except (
+                    requests.exceptions.ProxyError,
+                    requests.exceptions.SSLError,
+                    requests.exceptions.HTTPError,
+                    JSONDecodeError,
+                ) as exc:
+                    last_error = exc
+                    if (enable_proxy is False or not self.use_proxies) and not verify_ssl:
+                        break
+
+        raise ConnectionError(
+            error_message
+            + "（网络波动或证书校验异常，已尝试直连与跳过 SSL 验证，请稍后重试）"
+        ) from last_error
+
     @staticmethod
     def _normalize_code(code: str) -> str:
         """将股票代码规范化为 6 位数字字符串。"""
 
         digits = "".join(ch for ch in str(code) if ch.isdigit())
         return digits[-6:].zfill(6)
+
+    @staticmethod
+    def _detect_market(code: str) -> str:
+        """根据代码推断市场标识。"""
+
+        if code.startswith("6"):
+            return "sh"
+        if code.startswith("8") or code.startswith("4"):
+            return "bj"
+        return "sz"
 
     @staticmethod
     def _find_first_column(df: pd.DataFrame, candidates: list[str]) -> str | None:
@@ -347,6 +389,283 @@ class AKShareClient:
 
         return standardized
 
+    def fetch_board_fund_flow(self, board_type: str, indicator: str = "今日") -> pd.DataFrame:
+        """获取行业、概念等板块层面的资金流排行。"""
+
+        board_type_map = {
+            "industry": "行业资金流",
+            "concept": "概念资金流",
+            "area": "地域资金流",
+        }
+        normalized_type = board_type.lower()
+        if normalized_type not in board_type_map:
+            raise ValueError("board_type 仅支持 industry、concept 或 area")
+
+        indicator_map = {
+            "今日": [
+                "f62",
+                "1",
+                "f12,f14,f2,f3,f62,f184,f66,f69,f72,f75,f78,f81,f84,f87,f204,f205,f124",
+            ],
+            "5日": [
+                "f164",
+                "5",
+                "f12,f14,f2,f109,f164,f165,f166,f167,f168,f169,f170,f171,f172,f173,f257,f258,f124",
+            ],
+            "10日": [
+                "f174",
+                "10",
+                "f12,f14,f2,f160,f174,f175,f176,f177,f178,f179,f180,f181,f182,f183,f260,f261,f124",
+            ],
+        }
+
+        if indicator not in indicator_map:
+            raise ValueError("indicator 仅支持 今日、5日 或 10日")
+
+        def action_builder(verify_ssl: bool) -> pd.DataFrame:
+            url = "https://push2.eastmoney.com/api/qt/clist/get"
+            headers = {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/81.0.4044.138 Safari/537.36"
+                )
+            }
+            params = {
+                "pn": "1",
+                "pz": "100",
+                "po": "1",
+                "np": "1",
+                "ut": "b2884a393a59ad64002292a3e90d46a5",
+                "fltt": "2",
+                "invt": "2",
+                "fid0": indicator_map[indicator][0],
+                "fs": f"m:90 t:{'2' if normalized_type == 'industry' else '3' if normalized_type == 'concept' else '1'}",
+                "stat": indicator_map[indicator][1],
+                "fields": indicator_map[indicator][2],
+                "rt": "52975239",
+                "_": int(time.time() * 1000),
+            }
+            response = requests.get(
+                url, params=params, headers=headers, timeout=15, verify=verify_ssl
+            )
+            response.raise_for_status()
+            data_json = response.json()
+            total_page = math.ceil(data_json["data"]["total"] / 100)
+            temp_list: list[pd.DataFrame] = []
+            for page in range(1, total_page + 1):
+                params.update({"pn": page})
+                response = requests.get(
+                    url, params=params, headers=headers, timeout=15, verify=verify_ssl
+                )
+                response.raise_for_status()
+                data_json = response.json()
+                inner_df = pd.DataFrame(data_json.get("data", {}).get("diff", []))
+                temp_list.append(inner_df)
+            if not temp_list:
+                raise LookupError("未获取到板块资金流数据")
+
+            temp_df = pd.concat(temp_list, ignore_index=True)
+
+            if indicator == "今日":
+                temp_df.columns = [
+                    "-",
+                    "今日涨跌幅",
+                    "_",
+                    "名称",
+                    "今日主力净流入-净额",
+                    "今日超大单净流入-净额",
+                    "今日超大单净流入-净占比",
+                    "今日大单净流入-净额",
+                    "今日大单净流入-净占比",
+                    "今日中单净流入-净额",
+                    "今日中单净流入-净占比",
+                    "今日小单净流入-净额",
+                    "今日小单净流入-净占比",
+                    "-",
+                    "今日主力净流入-净占比",
+                    "今日主力净流入最大股",
+                    "今日主力净流入最大股代码",
+                    "是否净流入",
+                ]
+
+                temp_df = temp_df[
+                    [
+                        "名称",
+                        "今日涨跌幅",
+                        "今日主力净流入-净额",
+                        "今日主力净流入-净占比",
+                        "今日超大单净流入-净额",
+                        "今日超大单净流入-净占比",
+                        "今日大单净流入-净额",
+                        "今日大单净流入-净占比",
+                        "今日中单净流入-净额",
+                        "今日中单净流入-净占比",
+                        "今日小单净流入-净额",
+                        "今日小单净流入-净占比",
+                        "今日主力净流入最大股",
+                    ]
+                ]
+                temp_df.sort_values(
+                    ["今日主力净流入-净额"], ascending=False, inplace=True
+                )
+            elif indicator == "5日":
+                temp_df.columns = [
+                    "-",
+                    "_",
+                    "名称",
+                    "5日涨跌幅",
+                    "_",
+                    "5日主力净流入-净额",
+                    "5日主力净流入-净占比",
+                    "5日超大单净流入-净额",
+                    "5日超大单净流入-净占比",
+                    "5日大单净流入-净额",
+                    "5日大单净流入-净占比",
+                    "5日中单净流入-净额",
+                    "5日中单净流入-净占比",
+                    "5日小单净流入-净额",
+                    "5日小单净流入-净占比",
+                    "5日主力净流入最大股",
+                    "_",
+                    "_",
+                ]
+
+                temp_df = temp_df[
+                    [
+                        "名称",
+                        "5日涨跌幅",
+                        "5日主力净流入-净额",
+                        "5日主力净流入-净占比",
+                        "5日超大单净流入-净额",
+                        "5日超大单净流入-净占比",
+                        "5日大单净流入-净额",
+                        "5日大单净流入-净占比",
+                        "5日中单净流入-净额",
+                        "5日中单净流入-净占比",
+                        "5日小单净流入-净额",
+                        "5日小单净流入-净占比",
+                        "5日主力净流入最大股",
+                    ]
+                ]
+                temp_df.sort_values(["5日主力净流入-净额"], ascending=False, inplace=True)
+            else:
+                temp_df.columns = [
+                    "-",
+                    "_",
+                    "名称",
+                    "_",
+                    "10日涨跌幅",
+                    "10日主力净流入-净额",
+                    "10日主力净流入-净占比",
+                    "10日超大单净流入-净额",
+                    "10日超大单净流入-净占比",
+                    "10日大单净流入-净额",
+                    "10日大单净流入-净占比",
+                    "10日中单净流入-净额",
+                    "10日中单净流入-净占比",
+                    "10日小单净流入-净额",
+                    "10日小单净流入-净占比",
+                    "10日主力净流入最大股",
+                    "_",
+                    "_",
+                ]
+
+                temp_df = temp_df[
+                    [
+                        "名称",
+                        "10日涨跌幅",
+                        "10日主力净流入-净额",
+                        "10日主力净流入-净占比",
+                        "10日超大单净流入-净额",
+                        "10日超大单净流入-净占比",
+                        "10日大单净流入-净额",
+                        "10日大单净流入-净占比",
+                        "10日中单净流入-净额",
+                        "10日中单净流入-净占比",
+                        "10日小单净流入-净额",
+                        "10日小单净流入-净占比",
+                        "10日主力净流入最大股",
+                    ]
+                ]
+                temp_df.sort_values(
+                    ["10日主力净流入-净额"], ascending=False, inplace=True
+                )
+
+            temp_df.reset_index(drop=True, inplace=True)
+            temp_df.index = range(1, len(temp_df) + 1)
+            temp_df.insert(0, "序号", temp_df.index)
+            return temp_df
+
+        raw_flows = self._run_with_proxy_and_ssl_fallback(
+            action_builder=action_builder,
+            error_message=f"板块资金流查询失败：{normalized_type}",
+        )
+
+        rename_prefix = indicator if indicator in {"今日", "5日", "10日"} else ""
+        rename_mapping = {
+            f"{rename_prefix}主力净流入-净额": "net_main_inflow",
+            f"{rename_prefix}主力净流入-净占比": "net_main_ratio",
+            f"{rename_prefix}超大单净流入-净额": "net_super_large_order",
+            f"{rename_prefix}超大单净流入-净占比": "net_super_large_ratio",
+            f"{rename_prefix}大单净流入-净额": "net_large_order",
+            f"{rename_prefix}大单净流入-净占比": "net_large_ratio",
+            f"{rename_prefix}中单净流入-净额": "net_medium_order",
+            f"{rename_prefix}中单净流入-净占比": "net_medium_ratio",
+            f"{rename_prefix}小单净流入-净额": "net_small_order",
+            f"{rename_prefix}小单净流入-净占比": "net_small_ratio",
+            f"{rename_prefix}涨跌幅": "change_ratio",
+            f"{rename_prefix}主力净流入最大股": "top_stock",
+            "名称": "board_name",
+        }
+
+        flows = raw_flows.rename(columns=rename_mapping)
+        numeric_columns = [
+            "net_main_inflow",
+            "net_main_ratio",
+            "net_super_large_order",
+            "net_super_large_ratio",
+            "net_large_order",
+            "net_large_ratio",
+            "net_medium_order",
+            "net_medium_ratio",
+            "net_small_order",
+            "net_small_ratio",
+            "change_ratio",
+        ]
+        self._ensure_float_columns(flows, numeric_columns)
+
+        flows.insert(0, "board_type", normalized_type)
+        flows["period"] = indicator
+        flows["date"] = date.today().isoformat()
+
+        ordered_columns = [
+            "board_type",
+            "board_name",
+            "date",
+            "period",
+            "net_main_inflow",
+            "net_main_ratio",
+            "net_super_large_order",
+            "net_super_large_ratio",
+            "net_large_order",
+            "net_large_ratio",
+            "net_medium_order",
+            "net_medium_ratio",
+            "net_small_order",
+            "net_small_ratio",
+            "change_ratio",
+            "top_stock",
+        ]
+
+        for column in ordered_columns:
+            if column not in flows:
+                flows[column] = pd.NA
+
+        flows = flows[ordered_columns]
+        flows.sort_values("net_main_inflow", ascending=False, inplace=True)
+        flows.reset_index(drop=True, inplace=True)
+        return flows
+
     def fetch_board_concepts(self) -> pd.DataFrame:
         """获取同花顺概念列表。"""
 
@@ -433,6 +752,146 @@ class AKShareClient:
             raise LookupError("未能获取到历史行情，请检查日期范围或股票代码")
 
         return pd.concat(records, ignore_index=True)
+
+    def fetch_stock_fund_flow(
+        self, code: str, start_date: str, end_date: str
+    ) -> pd.DataFrame:
+        """获取个股近区间的主力净流入与单笔资金流情况。"""
+
+        if not code:
+            raise ValueError("股票代码不能为空")
+
+        start_dt = pd.to_datetime(start_date, errors="coerce").date()
+        end_dt = pd.to_datetime(end_date, errors="coerce").date()
+        if start_dt > end_dt:
+            raise ValueError("开始日期不能晚于结束日期")
+
+        normalized_code = self._normalize_code(code)
+        market = self._detect_market(normalized_code)
+
+        def action_builder(verify_ssl: bool) -> pd.DataFrame:
+            url = "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
+            headers = {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/81.0.4044.138 Safari/537.36"
+                )
+            }
+            params = {
+                "lmt": "0",
+                "klt": "101",
+                "secid": f"{1 if market == 'sh' else 0}.{normalized_code}",
+                "fields1": "f1,f2,f3,f7",
+                "fields2": (
+                    "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63,f64,f65"
+                ),
+                "ut": "b2884a393a59ad64002292a3e90d46a5",
+                "_": int(time.time() * 1000),
+            }
+            response = requests.get(
+                url, params=params, headers=headers, timeout=15, verify=verify_ssl
+            )
+            response.raise_for_status()
+            data_json = response.json()
+            klines = data_json.get("data", {}).get("klines")
+            if not klines:
+                raise LookupError("未获取到个股资金流数据")
+
+            columns = [
+                "日期",
+                "主力净流入-净额",
+                "小单净流入-净额",
+                "中单净流入-净额",
+                "大单净流入-净额",
+                "超大单净流入-净额",
+                "主力净流入-净占比",
+                "小单净流入-净占比",
+                "中单净流入-净占比",
+                "大单净流入-净占比",
+                "超大单净流入-净占比",
+                "收盘价",
+                "涨跌幅",
+                "-",
+                "-",
+            ]
+            df = pd.DataFrame([item.split(",") for item in klines], columns=columns)
+            df = df[
+                [
+                    "日期",
+                    "收盘价",
+                    "涨跌幅",
+                    "主力净流入-净额",
+                    "主力净流入-净占比",
+                    "超大单净流入-净额",
+                    "超大单净流入-净占比",
+                    "大单净流入-净额",
+                    "大单净流入-净占比",
+                    "中单净流入-净额",
+                    "中单净流入-净占比",
+                    "小单净流入-净额",
+                    "小单净流入-净占比",
+                ]
+            ]
+            return df
+
+        flows = self._run_with_proxy_and_ssl_fallback(
+            action_builder=action_builder,
+            error_message=f"资金流向查询失败：{normalized_code}",
+        )
+
+        flows = flows.copy()
+        flows["日期"] = pd.to_datetime(flows["日期"], errors="coerce").dt.date
+        flows = flows[(flows["日期"] >= start_dt) & (flows["日期"] <= end_dt)]
+
+        if flows.empty:
+            raise LookupError("指定时间区间内无资金流向数据")
+
+        rename_mapping = {
+            "日期": "date",
+            "主力净流入-净额": "net_main_inflow",
+            "主力净流入-净占比": "net_main_ratio",
+            "超大单净流入-净额": "net_super_large_order",
+            "超大单净流入-净占比": "net_super_large_ratio",
+            "大单净流入-净额": "net_large_order",
+            "大单净流入-净占比": "net_large_ratio",
+            "中单净流入-净额": "net_medium_order",
+            "中单净流入-净占比": "net_medium_ratio",
+            "小单净流入-净额": "net_small_order",
+            "小单净流入-净占比": "net_small_ratio",
+            "收盘价": "close",  # noqa: RUF100
+            "涨跌幅": "pct_change",
+        }
+        flows.rename(columns=rename_mapping, inplace=True)
+
+        numeric_columns = list(rename_mapping.values())
+        numeric_columns.remove("date")
+        self._ensure_float_columns(flows, numeric_columns)
+
+        flows.insert(0, "code", normalized_code)
+        flows["date"] = flows["date"].astype(str)
+
+        ordered_columns = [
+            "code",
+            "date",
+            "close",
+            "pct_change",
+            "net_main_inflow",
+            "net_main_ratio",
+            "net_super_large_order",
+            "net_super_large_ratio",
+            "net_large_order",
+            "net_large_ratio",
+            "net_medium_order",
+            "net_medium_ratio",
+            "net_small_order",
+            "net_small_ratio",
+        ]
+
+        for column in ordered_columns:
+            if column not in flows:
+                flows[column] = pd.NA
+
+        return flows[ordered_columns]
 
     def _standardize_board_list(
         self, boards: pd.DataFrame, code_label: str, name_label: str
