@@ -8,6 +8,7 @@ from datetime import date, timedelta
 from typing import Callable, List, Optional, Sequence
 
 import akshare as ak
+from akshare.utils.demjson import JSONDecodeError
 import pandas as pd
 import requests
 
@@ -50,20 +51,31 @@ class AKShareClient:
     def _run_with_proxy_fallback(
         self, action: Callable[[], pd.DataFrame], error_message: str
     ) -> pd.DataFrame:
-        """执行请求，若代理异常则自动回退到直连。"""
+        """执行请求，若代理异常或接口解析异常则自动回退到直连。"""
 
-        try:
-            with self._temporary_proxy_env():
-                return action()
-        except requests.exceptions.ProxyError as exc:
-            if not self.use_proxies:
-                raise ConnectionError(error_message) from exc
+        attempts = [None]
+        if self.use_proxies:
+            attempts.append(False)
 
+        last_error: Exception | None = None
+
+        for enable_proxy in attempts:
             try:
-                with self._temporary_proxy_env(enable=False):
+                with self._temporary_proxy_env(enable=enable_proxy):
                     return action()
-            except requests.exceptions.ProxyError as retry_exc:
-                raise ConnectionError(error_message) from retry_exc
+            except requests.exceptions.ProxyError as exc:
+                last_error = exc
+                if enable_proxy is False or not self.use_proxies:
+                    break
+            except JSONDecodeError as exc:
+                last_error = exc
+                if enable_proxy is False or not self.use_proxies:
+                    break
+
+        raise ConnectionError(
+            error_message
+            + "（数据接口返回异常或被风控，请稍后重试，必要时更换网络环境）"
+        ) from last_error
 
     @staticmethod
     def _normalize_code(code: str) -> str:
