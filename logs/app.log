@@ -43,3 +43,29 @@ akshare.utils.demjson.JSONDecodeError: Can not decode value starting with charac
 2025-12-08 16:26:23,554 [INFO] 数据已保存至 output\history_recent_300_days.csv
 2025-12-08 16:26:23,555 [INFO] 实时行情已保存至: output\realtime_quotes.csv
 2025-12-08 16:26:23,555 [INFO] 历史行情已保存至: output\history_recent_300_days.csv
+2025-12-08 17:53:34,427 [INFO] 数据已保存至 output\realtime_quotes.csv
+2025-12-08 17:53:41,202 [INFO] 数据已保存至 output\history_recent_30_days.csv
+2025-12-08 17:53:41,835 [ERROR] 未预期的错误：module 'akshare' has no attribute 'stock_board_industry_cons_ths'
+Traceback (most recent call last):
+  File "D:\PythonProjects25-12\AShare\start.py", line 96, in run
+    board_snapshot_path, board_recent_path = analyze_board_strength(analyzer)
+                                             ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^
+  File "D:\PythonProjects25-12\AShare\start.py", line 118, in analyze_board_strength
+    boards = analyzer.fetch_board_components(DEFAULT_BOARD_TYPE)
+  File "D:\PythonProjects25-12\AShare\src\board_analyzer.py", line 55, in fetch_board_components
+    cons_df = self.client.fetch_board_industry_cons(board_code or board_name)
+  File "D:\PythonProjects25-12\AShare\src\akshare_client.py", line 327, in fetch_board_industry_cons
+    return self._run_with_proxy_fallback(
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^
+        action=lambda: ak.stock_board_industry_cons_ths(symbol=symbol),
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        error_message=f"行业成分股查询失败：{symbol}",
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "D:\PythonProjects25-12\AShare\src\akshare_client.py", line 65, in _run_with_proxy_fallback
+    return action()
+  File "D:\PythonProjects25-12\AShare\src\akshare_client.py", line 328, in <lambda>
+    action=lambda: ak.stock_board_industry_cons_ths(symbol=symbol),
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: module 'akshare' has no attribute 'stock_board_industry_cons_ths'
