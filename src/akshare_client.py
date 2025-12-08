@@ -147,6 +147,16 @@ class AKShareClient:
 
         return "" if adjust is None else adjust
 
+    @staticmethod
+    def _normalize_trade_date(trade_date: str | date) -> str:
+        """将日期参数统一转换为 ``YYYYMMDD`` 格式的字符串。"""
+
+        normalized = pd.to_datetime(trade_date, errors="coerce")
+        if pd.isna(normalized):
+            raise ValueError("无法解析提供的日期，请使用 YYYYMMDD 或 YYYY-MM-DD 格式")
+
+        return normalized.date().strftime("%Y%m%d")
+
     def fetch_realtime_quotes(self, codes: List[str]) -> pd.DataFrame:
         """Retrieve real-time quotes for the given stock codes.
 
@@ -288,6 +298,187 @@ class AKShareClient:
             raise LookupError("未能获取到任何指数成分股，请检查指数代码或网络连接")
 
         return pd.DataFrame(records)
+
+    def fetch_northbound_summary(self) -> pd.DataFrame:
+        """获取北向资金整体及沪深分项的净流入汇总。"""
+
+        def action_builder(verify_ssl: bool) -> pd.DataFrame:
+            url = "https://datacenter-web.eastmoney.com/api/data/v1/get"
+            params = {
+                "reportName": "RPT_MUTUAL_QUOTA",
+                "columns": (
+                    "TRADE_DATE,MUTUAL_TYPE,BOARD_TYPE,MUTUAL_TYPE_NAME,FUNDS_DIRECTION,"
+                    "INDEX_CODE,INDEX_NAME,BOARD_CODE"
+                ),
+                "quoteColumns": (
+                    "status~07~BOARD_CODE,dayNetAmtIn~07~BOARD_CODE,dayAmtRemain~07~BOARD_CODE,"
+                    "dayAmtThreshold~07~BOARD_CODE,f104~07~BOARD_CODE,f105~07~BOARD_CODE,"
+                    "f106~07~BOARD_CODE,f3~03~INDEX_CODE~INDEX_f3,netBuyAmt~07~BOARD_CODE"
+                ),
+                "quoteType": "0",
+                "pageNumber": "1",
+                "pageSize": "2000",
+                "sortTypes": "1",
+                "sortColumns": "MUTUAL_TYPE",
+                "source": "WEB",
+                "client": "WEB",
+            }
+            response = requests.get(
+                url, params=params, timeout=15, verify=verify_ssl
+            )
+            response.raise_for_status()
+            data_json = response.json()
+            records = data_json.get("result", {}).get("data", [])
+            if not records:
+                raise LookupError("未获取到北向资金净流入数据")
+
+            return pd.DataFrame(records)
+
+        raw_summary = self._run_with_proxy_and_ssl_fallback(
+            action_builder=action_builder, error_message="北向资金净流入查询失败"
+        )
+
+        normalized = raw_summary.copy()
+        normalized["date"] = pd.to_datetime(
+            normalized.get("TRADE_DATE"), errors="coerce"
+        ).dt.date
+        normalized["net_inflow"] = (
+            pd.to_numeric(normalized.get("dayNetAmtIn"), errors="coerce") / 10000
+        )
+        normalized["balance"] = (
+            pd.to_numeric(normalized.get("dayAmtRemain"), errors="coerce") / 10000
+        )
+        normalized["index_change_pct"] = pd.to_numeric(
+            normalized.get("INDEX_f3"), errors="coerce"
+        )
+
+        north_data = normalized[normalized.get("FUNDS_DIRECTION") == "北向"]
+        if north_data.empty:
+            raise LookupError("未获取到北向资金净流入数据")
+
+        summary: dict[str, object] = {
+            "date": north_data.iloc[0]["date"],
+            "north_net_inflow": north_data["net_inflow"].sum(min_count=1),
+            "north_balance": north_data["balance"].sum(min_count=1),
+        }
+
+        type_map = {"001": "sh", "003": "sz"}
+        for type_code, prefix in type_map.items():
+            row = north_data[north_data.get("MUTUAL_TYPE") == type_code]
+            summary[f"{prefix}_net_inflow"] = (
+                row.iloc[0]["net_inflow"] if not row.empty else pd.NA
+            )
+            summary[f"{prefix}_balance"] = (
+                row.iloc[0]["balance"] if not row.empty else pd.NA
+            )
+            summary[f"{prefix}_index_change_pct"] = (
+                row.iloc[0]["index_change_pct"] if not row.empty else pd.NA
+            )
+
+        return pd.DataFrame([summary])
+
+    def fetch_northbound_stock_stats(self, trade_date: str | date) -> pd.DataFrame:
+        """获取指定交易日的北向持股与增减统计。"""
+
+        normalized_date = self._normalize_trade_date(trade_date)
+        formatted_date = f"{normalized_date[:4]}-{normalized_date[4:6]}-{normalized_date[6:]}"
+
+        def action_builder(verify_ssl: bool) -> pd.DataFrame:
+            url = "https://datacenter-web.eastmoney.com/api/data/v1/get"
+            base_filter = (
+                f"(INTERVAL_TYPE=\"1\")(MUTUAL_TYPE in (\"001\",\"003\"))"
+                f"(TRADE_DATE>='{formatted_date}')(TRADE_DATE<='{formatted_date}')"
+            )
+            params = {
+                "sortColumns": "TRADE_DATE",
+                "sortTypes": "-1",
+                "pageSize": "1000",
+                "pageNumber": "1",
+                "columns": "ALL",
+                "source": "WEB",
+                "client": "WEB",
+                "filter": base_filter,
+                "rt": "53160469",
+                "reportName": "RPT_MUTUAL_STOCK_NORTHSTA",
+            }
+
+            response = requests.get(
+                url, params=params, timeout=15, verify=verify_ssl
+            )
+            response.raise_for_status()
+            data_json = response.json()
+            result = data_json.get("result")
+            if not result or not result.get("data"):
+                raise LookupError("未获取到北向持股统计数据")
+
+            pages = int(result.get("pages") or 1)
+            frames = [pd.DataFrame(result["data"])]
+
+            for page in range(2, pages + 1):
+                params.update({"pageNumber": page})
+                resp = requests.get(
+                    url, params=params, timeout=15, verify=verify_ssl
+                )
+                resp.raise_for_status()
+                page_data = resp.json().get("result", {}).get("data")
+                if not page_data:
+                    continue
+                frames.append(pd.DataFrame(page_data))
+
+            return pd.concat(frames, ignore_index=True)
+
+        stats = self._run_with_proxy_and_ssl_fallback(
+            action_builder=action_builder, error_message="北向持股统计查询失败"
+        )
+
+        if stats.empty:
+            raise LookupError("未获取到北向持股统计数据")
+
+        stats = stats.copy()
+        stats["date"] = pd.to_datetime(stats.get("TRADE_DATE"), errors="coerce").dt.date
+        stats["code"] = (
+            stats.get("SECURITY_CODE", pd.Series(dtype=str)).astype(str).str[-6:].str.zfill(6)
+        )
+        stats["name"] = stats.get("SECURITY_NAME")
+        stats["close_price"] = pd.to_numeric(stats.get("CLOSE_PRICE"), errors="coerce")
+        stats["price_change_pct"] = pd.to_numeric(
+            stats.get("CHANGE_RATE"), errors="coerce"
+        )
+        stats["hold_shares"] = pd.to_numeric(stats.get("HOLD_SHARES"), errors="coerce")
+        stats["hold_value"] = pd.to_numeric(
+            stats.get("HOLD_MARKET_CAP"), errors="coerce"
+        )
+        stats["hold_ratio"] = pd.to_numeric(
+            stats.get("HOLD_SHARES_RATIO"), errors="coerce"
+        )
+        stats["daily_change_value"] = pd.to_numeric(
+            stats.get("HOLD_MCAP_CHANGE"), errors="coerce"
+        )
+
+        previous_value = stats["hold_value"] - stats["daily_change_value"]
+        with pd.option_context("mode.use_inf_as_na", True):
+            stats["daily_change_ratio"] = (
+                stats["daily_change_value"] / previous_value.replace(0, pd.NA)
+            ) * 100
+
+        desired_columns = [
+            "date",
+            "code",
+            "name",
+            "close_price",
+            "price_change_pct",
+            "hold_shares",
+            "hold_value",
+            "hold_ratio",
+            "daily_change_value",
+            "daily_change_ratio",
+        ]
+
+        for column in desired_columns:
+            if column not in stats:
+                stats[column] = pd.NA
+
+        return stats[desired_columns]
 
     def _fetch_sina_daily(
         self, symbol: str, start_date: str, end_date: str, adjust: str
