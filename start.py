@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import pathlib
 from typing import List
+
+import pandas as pd
 
 from src.config import (
     DEFAULT_ADJUST,
@@ -15,6 +18,8 @@ from src.config import (
     USE_PROXIES,
 )
 
+from src.akshare_client import AKShareClient
+
 if USE_PROXIES:
     if HTTP_PROXY:
         os.environ["HTTP_PROXY"] = HTTP_PROXY
@@ -23,11 +28,26 @@ if USE_PROXIES:
         os.environ["HTTPS_PROXY"] = HTTPS_PROXY
         os.environ["https_proxy"] = HTTPS_PROXY
 
-import pandas as pd
-
-from src.akshare_client import AKShareClient
-
 OUTPUT_DIR = pathlib.Path("output")
+LOG_DIR = pathlib.Path("logs")
+LOG_FILE = LOG_DIR / "app.log"
+
+
+def _setup_logging() -> logging.Logger:
+    LOG_DIR.mkdir(exist_ok=True)
+    handlers = [
+        logging.StreamHandler(),
+        logging.FileHandler(LOG_FILE, encoding="utf-8"),
+    ]
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=handlers,
+    )
+    return logging.getLogger(__name__)
+
+
+LOGGER = _setup_logging()
 
 
 def save_dataframe(df: pd.DataFrame, filename: str) -> pathlib.Path:
@@ -35,6 +55,7 @@ def save_dataframe(df: pd.DataFrame, filename: str) -> pathlib.Path:
     OUTPUT_DIR.mkdir(exist_ok=True)
     output_path = OUTPUT_DIR / filename
     df.to_csv(output_path, index=False)
+    LOGGER.info("数据已保存至 %s", output_path)
     return output_path
 
 
@@ -59,17 +80,28 @@ def fetch_and_save_history(
 def run() -> None:
     """项目的统一入口，不依赖命令行参数。"""
     client = AKShareClient(use_proxies=USE_PROXIES)
-    realtime_path = fetch_and_save_realtime(client, DEFAULT_STOCK_CODES)
-
-    history_path = fetch_and_save_history(
-        client,
-        DEFAULT_STOCK_CODES,
-        DEFAULT_HISTORY_DAYS,
-        DEFAULT_ADJUST,
-    )
+    try:
+        realtime_path = fetch_and_save_realtime(client, DEFAULT_STOCK_CODES)
+        history_path = fetch_and_save_history(
+            client,
+            DEFAULT_STOCK_CODES,
+            DEFAULT_HISTORY_DAYS,
+            DEFAULT_ADJUST,
+        )
+    except (ConnectionError, LookupError, ValueError) as exc:
+        friendly_message = f"数据获取失败：{exc}"
+        print(friendly_message)
+        LOGGER.exception("数据获取失败")
+        return
+    except Exception as exc:  # noqa: BLE001
+        print("发生未知错误，请稍后重试。")
+        LOGGER.exception("未预期的错误：%s", exc)
+        return
 
     print("实时行情已保存至:", realtime_path)
     print("历史行情已保存至:", history_path)
+    LOGGER.info("实时行情已保存至: %s", realtime_path)
+    LOGGER.info("历史行情已保存至: %s", history_path)
 
 
 if __name__ == "__main__":

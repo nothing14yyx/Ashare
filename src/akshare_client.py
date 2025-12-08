@@ -110,13 +110,13 @@ class AKShareClient:
         quotes = quotes.copy()
         quotes["code_6"] = quotes["代码"].astype(str).str[-6:]
         selected = quotes[quotes["code_6"].isin(normalized_codes)].copy()
-        selected.insert(0, "code", selected.pop("code_6"))
+        selected.insert(0, "代码", selected.pop("code_6"))
 
         if selected.empty:
             raise LookupError("未能获取到对应股票的实时行情，请检查代码是否正确")
 
         desired_columns = [
-            "code",
+            "代码",
             "名称",
             "最新价",
             "涨跌额",
@@ -131,7 +131,7 @@ class AKShareClient:
         selected = selected[desired_columns]
 
         ordered = pd.CategoricalIndex(normalized_codes, ordered=True)
-        selected = selected.set_index("code").loc[ordered].reset_index()
+        selected = selected.set_index("代码").loc[ordered].reset_index()
         return selected
 
     def _fetch_sina_daily(
@@ -186,7 +186,7 @@ class AKShareClient:
         if history.empty:
             raise LookupError("未能获取到历史行情，请检查日期范围或股票代码")
 
-        return history
+        return self._prepare_history(history, normalized_code)
 
     def fetch_recent_history(
         self,
@@ -221,11 +221,109 @@ class AKShareClient:
             if history.empty:
                 continue
 
-            history = history.copy()
-            history.insert(0, "代码", normalized_code)
-            records.append(history)
+            prepared = self._prepare_history(history, normalized_code)
+            records.append(prepared)
 
         if not records:
             raise LookupError("未能获取到历史行情，请检查日期范围或股票代码")
 
         return pd.concat(records, ignore_index=True)
+
+    @staticmethod
+    def _ensure_float_columns(history: pd.DataFrame, columns: list[str]) -> None:
+        for column in columns:
+            if column in history:
+                history[column] = pd.to_numeric(history[column], errors="coerce")
+
+    def _prepare_history(self, history: pd.DataFrame, code: str) -> pd.DataFrame:
+        """标准化历史行情列名并补充衍生指标。"""
+
+        history = history.copy()
+        column_mapping = {
+            "date": "日期",
+            "open": "开盘",
+            "close": "收盘",
+            "high": "最高",
+            "low": "最低",
+            "volume": "成交量",
+            "amount": "成交额",
+            "turnover": "换手率",
+            "turnover_rate": "换手率",
+            "pct_chg": "涨跌幅",
+            "change": "涨跌额",
+            "amplitude": "振幅",
+        }
+        history.rename(columns=column_mapping, inplace=True)
+
+        if "代码" not in history:
+            history.insert(0, "代码", code)
+        else:
+            history["代码"] = history["代码"].apply(self._normalize_code)
+
+        if "日期" in history:
+            history["日期"] = pd.to_datetime(history["日期"], errors="coerce").dt.date
+            history.sort_values(["代码", "日期"], inplace=True)
+            history["日期"] = history["日期"].astype(str)
+
+        numeric_columns = [
+            "开盘",
+            "收盘",
+            "最高",
+            "最低",
+            "成交量",
+            "成交额",
+            "涨跌额",
+            "涨跌幅",
+            "振幅",
+            "换手率",
+        ]
+        self._ensure_float_columns(history, numeric_columns)
+
+        if "收盘" in history:
+            history["昨收"] = history.groupby("代码")["收盘"].shift(1)
+        else:
+            history["昨收"] = pd.NA
+
+        if "涨跌额" not in history:
+            if "收盘" in history:
+                history["涨跌额"] = history["收盘"] - history["昨收"]
+            else:
+                history["涨跌额"] = pd.NA
+
+        if "涨跌幅" not in history:
+            pct_change = history["涨跌额"] / history["昨收"]
+            history["涨跌幅"] = pct_change.replace(
+                [pd.NA, pd.NaT, float("inf"), float("-inf")], pd.NA
+            ) * 100
+
+        if "振幅" not in history:
+            if {"最高", "最低"}.issubset(history.columns):
+                amplitude = (history["最高"] - history["最低"]) / history["昨收"]
+                history["振幅"] = amplitude.replace(
+                    [pd.NA, pd.NaT, float("inf"), float("-inf")], pd.NA
+                ) * 100
+            else:
+                history["振幅"] = pd.NA
+
+        standard_columns = [
+            "代码",
+            "日期",
+            "开盘",
+            "收盘",
+            "昨收",
+            "最高",
+            "最低",
+            "成交量",
+            "成交额",
+            "涨跌额",
+            "涨跌幅",
+            "振幅",
+            "换手率",
+        ]
+
+        for column in standard_columns:
+            if column not in history:
+                history[column] = pd.NA
+
+        history = history[standard_columns]
+        return history
