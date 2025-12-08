@@ -1,12 +1,19 @@
 import os
 import requests
 
-HTTP_PROXY = "http://127.0.0.1:7890"  # 换成你的
-HTTPS_PROXY = "http://127.0.0.1:7890"
+PROXY = "http://127.0.0.1:7890"  # 用你 tesst.py 里测过的那个
 
-os.environ["HTTP_PROXY"] = HTTP_PROXY
-os.environ["HTTPS_PROXY"] = HTTPS_PROXY
+os.environ["HTTP_PROXY"] = PROXY
+os.environ["HTTPS_PROXY"] = PROXY
 
-print("当前代理：", HTTP_PROXY)
-r = requests.get("https://www.baidu.com", timeout=10)
-print("status:", r.status_code)
+print("当前代理:", PROXY)
+
+url = (
+    "https://82.push2.eastmoney.com/api/qt/clist/get"
+    "?pn=1&pz=1&po=1&np=1&ut=bd1d9ddb04089700cf9c27f6f7426281"
+    "&fltt=2&invt=2&fid=f12&fs=m:0+t:6&fields=f1,f2"
+)
+
+resp = requests.get(url, timeout=10)
+print("status:", resp.status_code)
+print("text:", resp.text[:100])
