@@ -69,3 +69,144 @@ Traceback (most recent call last):
     action=lambda: ak.stock_board_industry_cons_ths(symbol=symbol),
                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 AttributeError: module 'akshare' has no attribute 'stock_board_industry_cons_ths'
+2025-12-08 19:27:13,435 [INFO] 数据已保存至 output\realtime_quotes.csv
+2025-12-08 19:27:15,649 [ERROR] 未预期的错误：AKShareClient._ensure_float_columns() takes 2 positional arguments but 3 were given
+Traceback (most recent call last):
+  File "D:\PythonProjects25-12\AShare\start.py", line 90, in run
+    history_path = fetch_and_save_history(
+        client,
+    ...<2 lines>...
+        DEFAULT_ADJUST,
+    )
+  File "D:\PythonProjects25-12\AShare\start.py", line 79, in fetch_and_save_history
+    history_df = client.fetch_recent_history(codes=codes, n_days=n_days, adjust=adjust)
+  File "D:\PythonProjects25-12\AShare\src\akshare_client.py", line 805, in fetch_recent_history
+    prepared = self._prepare_history(history, normalized_code)
+  File "D:\PythonProjects25-12\AShare\src\akshare_client.py", line 940, in _prepare_history
+    self._ensure_float_columns(history, numeric_columns)
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: AKShareClient._ensure_float_columns() takes 2 positional arguments but 3 were given
+2025-12-08 21:12:11,015 [INFO] 数据已保存至 output\realtime_quotes.csv
+2025-12-08 21:12:18,392 [INFO] 数据已保存至 output\history_recent_30_days.csv
+2025-12-08 21:12:18,959 [ERROR] 未预期的错误：module 'akshare' has no attribute 'stock_board_industry_cons_ths'
+Traceback (most recent call last):
+  File "D:\PythonProjects25-12\AShare\start.py", line 96, in run
+    board_snapshot_path, board_recent_path = analyze_board_strength(analyzer)
+                                             ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^
+  File "D:\PythonProjects25-12\AShare\start.py", line 118, in analyze_board_strength
+    boards = analyzer.fetch_board_components(DEFAULT_BOARD_TYPE)
+  File "D:\PythonProjects25-12\AShare\src\board_analyzer.py", line 55, in fetch_board_components
+    cons_df = self.client.fetch_board_industry_cons(board_code or board_name)
+  File "D:\PythonProjects25-12\AShare\src\akshare_client.py", line 612, in fetch_board_industry_cons
+    return self._run_with_proxy_fallback(
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^
+        action=lambda: ak.stock_board_industry_cons_ths(symbol=symbol),
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        error_message=f"行业成分股查询失败：{symbol}",
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "D:\PythonProjects25-12\AShare\src\akshare_client.py", line 67, in _run_with_proxy_fallback
+    return action()
+  File "D:\PythonProjects25-12\AShare\src\akshare_client.py", line 613, in <lambda>
+    action=lambda: ak.stock_board_industry_cons_ths(symbol=symbol),
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: module 'akshare' has no attribute 'stock_board_industry_cons_ths'
+2025-12-08 21:25:42,519 [INFO] 数据已保存至 output\realtime_quotes.csv
+2025-12-08 21:25:49,398 [INFO] 数据已保存至 output\history_recent_30_days.csv
+2025-12-08 21:25:50,536 [ERROR] 数据获取失败
+Traceback (most recent call last):
+  File "D:\PythonProjects25-12\AShare\dbn_trading_auto\Lib\site-packages\urllib3\connectionpool.py", line 787, in urlopen
+    response = self._make_request(
+        conn,
+    ...<10 lines>...
+        **response_kw,
+    )
+  File "D:\PythonProjects25-12\AShare\dbn_trading_auto\Lib\site-packages\urllib3\connectionpool.py", line 534, in _make_request
+    response = conn.getresponse()
+  File "D:\PythonProjects25-12\AShare\dbn_trading_auto\Lib\site-packages\urllib3\connection.py", line 571, in getresponse
+    httplib_response = super().getresponse()
+  File "C:\Users\18738\AppData\Local\Programs\Python\Python313\Lib\http\client.py", line 1430, in getresponse
+    response.begin()
+    ~~~~~~~~~~~~~~^^
+  File "C:\Users\18738\AppData\Local\Programs\Python\Python313\Lib\http\client.py", line 331, in begin
+    version, status, reason = self._read_status()
+                              ~~~~~~~~~~~~~~~~~^^
+  File "C:\Users\18738\AppData\Local\Programs\Python\Python313\Lib\http\client.py", line 300, in _read_status
+    raise RemoteDisconnected("Remote end closed connection without"
+                             " response")
+http.client.RemoteDisconnected: Remote end closed connection without response
+
+The above exception was the direct cause of the following exception:
+
+urllib3.exceptions.ProxyError: ('Unable to connect to proxy', RemoteDisconnected('Remote end closed connection without response'))
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "D:\PythonProjects25-12\AShare\dbn_trading_auto\Lib\site-packages\requests\adapters.py", line 644, in send
+    resp = conn.urlopen(
+        method=request.method,
+    ...<9 lines>...
+        chunked=chunked,
+    )
+  File "D:\PythonProjects25-12\AShare\dbn_trading_auto\Lib\site-packages\urllib3\connectionpool.py", line 841, in urlopen
+    retries = retries.increment(
+        method, url, error=new_e, _pool=self, _stacktrace=sys.exc_info()[2]
+    )
+  File "D:\PythonProjects25-12\AShare\dbn_trading_auto\Lib\site-packages\urllib3\util\retry.py", line 519, in increment
+    raise MaxRetryError(_pool, url, reason) from reason  # type: ignore[arg-type]
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+urllib3.exceptions.MaxRetryError: HTTPSConnectionPool(host='17.push2.eastmoney.com', port=443): Max retries exceeded with url: /api/qt/clist/get?pn=1&pz=100&po=1&np=1&ut=bd1d9ddb04089700cf9c27f6f7426281&fltt=2&invt=2&fid=f3&fs=m%3A90+t%3A2+f%3A%2150&fields=f1%2Cf2%2Cf3%2Cf4%2Cf5%2Cf6%2Cf7%2Cf8%2Cf9%2Cf10%2Cf12%2Cf13%2Cf14%2Cf15%2Cf16%2Cf17%2Cf18%2Cf20%2Cf21%2Cf23%2Cf24%2Cf25%2Cf26%2Cf22%2Cf33%2Cf11%2Cf62%2Cf128%2Cf136%2Cf115%2Cf152%2Cf124%2Cf107%2Cf104%2Cf105%2Cf140%2Cf141%2Cf207%2Cf208%2Cf209%2Cf222 (Caused by ProxyError('Unable to connect to proxy', RemoteDisconnected('Remote end closed connection without response')))
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "D:\PythonProjects25-12\AShare\src\akshare_client.py", line 67, in _run_with_proxy_fallback
+    return action()
+  File "D:\PythonProjects25-12\AShare\src\akshare_client.py", line 613, in <lambda>
+    action=lambda: ak.stock_board_industry_cons_em(symbol=symbol),
+                   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^
+  File "D:\PythonProjects25-12\AShare\dbn_trading_auto\Lib\site-packages\akshare\stock\stock_board_industry_em.py", line 473, in stock_board_industry_cons_em
+    stock_board_concept_em_map = __stock_board_industry_name_em()
+  File "D:\PythonProjects25-12\AShare\dbn_trading_auto\Lib\site-packages\akshare\stock\stock_board_industry_em.py", line 41, in __stock_board_industry_name_em
+    temp_df = fetch_paginated_data(url, params)
+  File "D:\PythonProjects25-12\AShare\dbn_trading_auto\Lib\site-packages\akshare\utils\func.py", line 32, in fetch_paginated_data
+    r = requests.get(url, params=params, timeout=timeout)
+  File "D:\PythonProjects25-12\AShare\dbn_trading_auto\Lib\site-packages\requests\api.py", line 73, in get
+    return request("get", url, params=params, **kwargs)
+  File "D:\PythonProjects25-12\AShare\dbn_trading_auto\Lib\site-packages\requests\api.py", line 59, in request
+    return session.request(method=method, url=url, **kwargs)
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\PythonProjects25-12\AShare\dbn_trading_auto\Lib\site-packages\requests\sessions.py", line 589, in request
+    resp = self.send(prep, **send_kwargs)
+  File "D:\PythonProjects25-12\AShare\dbn_trading_auto\Lib\site-packages\requests\sessions.py", line 703, in send
+    r = adapter.send(request, **kwargs)
+  File "D:\PythonProjects25-12\AShare\dbn_trading_auto\Lib\site-packages\requests\adapters.py", line 671, in send
+    raise ProxyError(e, request=request)
+requests.exceptions.ProxyError: HTTPSConnectionPool(host='17.push2.eastmoney.com', port=443): Max retries exceeded with url: /api/qt/clist/get?pn=1&pz=100&po=1&np=1&ut=bd1d9ddb04089700cf9c27f6f7426281&fltt=2&invt=2&fid=f3&fs=m%3A90+t%3A2+f%3A%2150&fields=f1%2Cf2%2Cf3%2Cf4%2Cf5%2Cf6%2Cf7%2Cf8%2Cf9%2Cf10%2Cf12%2Cf13%2Cf14%2Cf15%2Cf16%2Cf17%2Cf18%2Cf20%2Cf21%2Cf23%2Cf24%2Cf25%2Cf26%2Cf22%2Cf33%2Cf11%2Cf62%2Cf128%2Cf136%2Cf115%2Cf152%2Cf124%2Cf107%2Cf104%2Cf105%2Cf140%2Cf141%2Cf207%2Cf208%2Cf209%2Cf222 (Caused by ProxyError('Unable to connect to proxy', RemoteDisconnected('Remote end closed connection without response')))
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "D:\PythonProjects25-12\AShare\start.py", line 96, in run
+    board_snapshot_path, board_recent_path = analyze_board_strength(analyzer)
+                                             ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^
+  File "D:\PythonProjects25-12\AShare\start.py", line 118, in analyze_board_strength
+    boards = analyzer.fetch_board_components(DEFAULT_BOARD_TYPE)
+  File "D:\PythonProjects25-12\AShare\src\board_analyzer.py", line 55, in fetch_board_components
+    cons_df = self.client.fetch_board_industry_cons(board_code or board_name)
+  File "D:\PythonProjects25-12\AShare\src\akshare_client.py", line 612, in fetch_board_industry_cons
+    return self._run_with_proxy_fallback(
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^
+        action=lambda: ak.stock_board_industry_cons_em(symbol=symbol),
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        error_message=f"行业成分股查询失败：{symbol}",
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "D:\PythonProjects25-12\AShare\src\akshare_client.py", line 77, in _run_with_proxy_fallback
+    raise ConnectionError(
+    ...<2 lines>...
+    ) from last_error
+ConnectionError: 行业成分股查询失败：881121（数据接口返回异常或被风控，请稍后重试，必要时更换网络环境）

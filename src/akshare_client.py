@@ -610,7 +610,7 @@ class AKShareClient:
         """获取同花顺行业成分股。"""
 
         return self._run_with_proxy_fallback(
-            action=lambda: ak.stock_board_industry_cons_ths(symbol=symbol),
+            action=lambda: ak.stock_board_industry_cons_em(symbol=symbol),
             error_message=f"行业成分股查询失败：{symbol}",
         )
 
@@ -753,7 +753,7 @@ class AKShareClient:
         """获取同花顺概念成分股。"""
 
         return self._run_with_proxy_fallback(
-            action=lambda: ak.stock_board_concept_cons_ths(symbol=symbol),
+            action=lambda: ak.stock_board_concept_cons_em(symbol=symbol),
             error_message=f"概念成分股查询失败：{symbol}",
         )
 
