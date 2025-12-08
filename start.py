@@ -11,6 +11,9 @@ import pandas as pd
 
 from src.config import (
     DEFAULT_ADJUST,
+    DEFAULT_BOARD_HISTORY_DAYS,
+    DEFAULT_BOARD_TOP_N,
+    DEFAULT_BOARD_TYPE,
     DEFAULT_HISTORY_DAYS,
     DEFAULT_STOCK_CODES,
     HTTP_PROXY,
@@ -19,6 +22,7 @@ from src.config import (
 )
 
 from src.akshare_client import AKShareClient
+from src.board_analyzer import BoardAnalyzer
 
 if USE_PROXIES:
     if HTTP_PROXY:
@@ -80,6 +84,7 @@ def fetch_and_save_history(
 def run() -> None:
     """项目的统一入口，不依赖命令行参数。"""
     client = AKShareClient(use_proxies=USE_PROXIES)
+    analyzer = BoardAnalyzer(client, LOGGER)
     try:
         realtime_path = fetch_and_save_realtime(client, DEFAULT_STOCK_CODES)
         history_path = fetch_and_save_history(
@@ -88,6 +93,7 @@ def run() -> None:
             DEFAULT_HISTORY_DAYS,
             DEFAULT_ADJUST,
         )
+        board_snapshot_path, board_recent_path = analyze_board_strength(analyzer)
     except (ConnectionError, LookupError, ValueError) as exc:
         friendly_message = f"数据获取失败：{exc}"
         print(friendly_message)
@@ -100,8 +106,32 @@ def run() -> None:
 
     print("实时行情已保存至:", realtime_path)
     print("历史行情已保存至:", history_path)
+    print("板块实时强弱已保存至:", board_snapshot_path)
+    print("板块成交放大情况已保存至:", board_recent_path)
     LOGGER.info("实时行情已保存至: %s", realtime_path)
     LOGGER.info("历史行情已保存至: %s", history_path)
+    LOGGER.info("板块实时强弱已保存至: %s", board_snapshot_path)
+    LOGGER.info("板块成交放大情况已保存至: %s", board_recent_path)
+
+
+def analyze_board_strength(analyzer: BoardAnalyzer) -> tuple[pathlib.Path, pathlib.Path]:
+    boards = analyzer.fetch_board_components(DEFAULT_BOARD_TYPE)
+    realtime_snapshot = analyzer.compute_realtime_snapshot(boards)
+    board_snapshot_path = save_dataframe(
+        realtime_snapshot, f"{DEFAULT_BOARD_TYPE}_boards_realtime.csv"
+    )
+
+    top_board_names = realtime_snapshot.head(DEFAULT_BOARD_TOP_N)["板块名称"].tolist()
+    target_boards = analyzer.filter_boards(boards, top_board_names)
+    recent_metrics = analyzer.compute_recent_history_metrics(
+        target_boards, n_days=DEFAULT_BOARD_HISTORY_DAYS, adjust=DEFAULT_ADJUST
+    )
+    board_recent_path = save_dataframe(
+        recent_metrics,
+        f"{DEFAULT_BOARD_TYPE}_boards_recent_{DEFAULT_BOARD_HISTORY_DAYS}_days.csv",
+    )
+
+    return board_snapshot_path, board_recent_path
 
 
 if __name__ == "__main__":

@@ -9,5 +9,7 @@
 运行后会在 `output/` 目录下生成：
 - `realtime_quotes.csv`：配置内股票的实时行情。
 - `history_recent_<days>_days.csv`：配置内所有股票最近一段时间的历史行情合并数据。
+- `{industry|concept}_boards_realtime.csv`：按行业/概念聚合的实时涨跌幅、成交额/成交量汇总。
+- `{industry|concept}_boards_recent_<days>_days.csv`：对实时涨幅靠前的板块计算最近行情的累计涨幅与成交放大倍数。
 
 如需修改股票列表或日期范围，可调整 `src/config.py` 中的默认配置。
