@@ -890,7 +890,7 @@ class AKShareClient:
 
         return flows[ordered_columns]
 
-    def _ensure_float_columns(history: pd.DataFrame, columns: list[str]) -> None:
+    def _ensure_float_columns(self, history: pd.DataFrame, columns: list[str]) -> None:
         for column in columns:
             if column in history:
                 history[column] = pd.to_numeric(history[column], errors="coerce")
