@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import warnings
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from typing import Callable, List, Optional, Sequence
@@ -11,6 +12,7 @@ import akshare as ak
 from akshare.utils.demjson import JSONDecodeError
 import pandas as pd
 import requests
+import urllib3
 
 
 class AKShareClient:
@@ -109,7 +111,7 @@ class AKShareClient:
 
     @contextmanager
     def _patched_requests_verify(self, verify: bool):
-        """临时覆盖 ``requests.get`` 的 ``verify`` 参数。"""
+        """临时覆盖 ``requests.get`` 的 ``verify`` 参数，并按需屏蔽 SSL 警告。"""
 
         original_get = requests.get
 
@@ -117,11 +119,15 @@ class AKShareClient:
             kwargs.setdefault("verify", verify)
             return original_get(*args, **kwargs)
 
-        try:
-            requests.get = patched_get
-            yield
-        finally:
-            requests.get = original_get
+        with warnings.catch_warnings():
+            if not verify:
+                warnings.simplefilter("ignore", urllib3.exceptions.InsecureRequestWarning)
+
+            try:
+                requests.get = patched_get
+                yield
+            finally:
+                requests.get = original_get
 
     def _run_akshare_with_resilience(
         self, action: Callable[[], pd.DataFrame], error_message: str
