@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 from contextlib import contextmanager
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 import akshare as ak
 import pandas as pd
@@ -26,24 +26,43 @@ class AKShareClient:
         self.use_proxies = use_proxies
 
     @contextmanager
-    def _temporary_proxy_env(self):
+    def _temporary_proxy_env(self, enable: bool | None = None):
         """根据 ``use_proxies`` 临时屏蔽或恢复代理环境变量。"""
 
+        use_proxy = self.use_proxies if enable is None else enable
         proxy_keys = [key for key in os.environ if key.lower().endswith("_proxy")]
         cached_values = {}
 
-        if not self.use_proxies:
+        if not use_proxy:
             for key in proxy_keys:
                 cached_values[key] = os.environ.pop(key, None)
 
         try:
             yield
         finally:
-            if not self.use_proxies:
+            if not use_proxy:
                 for key, value in cached_values.items():
                     if value is None:
                         continue
                     os.environ[key] = value
+
+    def _run_with_proxy_fallback(
+        self, action: Callable[[], pd.DataFrame], error_message: str
+    ) -> pd.DataFrame:
+        """执行请求，若代理异常则自动回退到直连。"""
+
+        try:
+            with self._temporary_proxy_env():
+                return action()
+        except requests.exceptions.ProxyError as exc:
+            if not self.use_proxies:
+                raise ConnectionError(error_message) from exc
+
+            try:
+                with self._temporary_proxy_env(enable=False):
+                    return action()
+            except requests.exceptions.ProxyError as retry_exc:
+                raise ConnectionError(error_message) from retry_exc
 
     def fetch_realtime_quotes(self, codes: List[str]) -> pd.DataFrame:
         """Retrieve real-time quotes for the given stock codes.
@@ -58,13 +77,10 @@ class AKShareClient:
         if not codes:
             raise ValueError("请至少提供一个股票代码进行查询")
 
-        try:
-            with self._temporary_proxy_env():
-                quotes = ak.stock_zh_a_spot_em()
-        except requests.exceptions.ProxyError as exc:
-            raise ConnectionError(
-                "实时行情查询失败：检测到代理配置不可用，请关闭或修正代理后重试"
-            ) from exc
+        quotes = self._run_with_proxy_fallback(
+            action=ak.stock_zh_a_spot_em,
+            error_message="实时行情查询失败：检测到代理配置不可用，请关闭或修正代理后重试",
+        )
 
         quotes = quotes.rename(columns={"代码": "code"})
         selected = quotes[quotes["code"].isin(codes)]
@@ -98,19 +114,16 @@ class AKShareClient:
         if not code:
             raise ValueError("股票代码不能为空")
 
-        try:
-            with self._temporary_proxy_env():
-                history = ak.stock_zh_a_hist(
-                    symbol=code,
-                    period="daily",
-                    start_date=start_date,
-                    end_date=end_date,
-                    adjust=adjust,
-                )
-        except requests.exceptions.ProxyError as exc:
-            raise ConnectionError(
-                "历史行情查询失败：检测到代理配置不可用，请关闭或修正代理后重试"
-            ) from exc
+        history = self._run_with_proxy_fallback(
+            action=lambda: ak.stock_zh_a_hist(
+                symbol=code,
+                period="daily",
+                start_date=start_date,
+                end_date=end_date,
+                adjust=adjust,
+            ),
+            error_message="历史行情查询失败：检测到代理配置不可用，请关闭或修正代理后重试",
+        )
 
         if history.empty:
             raise LookupError("未能获取到历史行情，请检查日期范围或股票代码")
