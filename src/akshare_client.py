@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import os
 from contextlib import contextmanager
-from typing import Callable, List, Optional
+from datetime import date, timedelta
+from typing import Callable, List, Optional, Sequence
 
 import akshare as ak
 import pandas as pd
@@ -64,6 +65,13 @@ class AKShareClient:
             except requests.exceptions.ProxyError as retry_exc:
                 raise ConnectionError(error_message) from retry_exc
 
+    @staticmethod
+    def _normalize_code(code: str) -> str:
+        """将股票代码规范化为 6 位数字字符串。"""
+
+        digits = "".join(ch for ch in str(code) if ch.isdigit())
+        return digits[-6:].zfill(6)
+
     def fetch_realtime_quotes(self, codes: List[str]) -> pd.DataFrame:
         """Retrieve real-time quotes for the given stock codes.
 
@@ -77,19 +85,40 @@ class AKShareClient:
         if not codes:
             raise ValueError("请至少提供一个股票代码进行查询")
 
+        normalized_codes = [self._normalize_code(code) for code in codes]
+
         quotes = self._run_with_proxy_fallback(
-            action=ak.stock_zh_a_spot_em,
-            error_message="实时行情查询失败：检测到代理配置不可用，请关闭或修正代理后重试",
+            action=ak.stock_zh_a_spot,
+            error_message=(
+                "实时行情查询失败：连接数据接口时被远端中断，可能是网络不稳定、网站风控或"
+                "代理配置问题，请稍后重试"
+            ),
         )
 
-        quotes = quotes.rename(columns={"代码": "code"})
-        selected = quotes[quotes["code"].isin(codes)]
+        quotes = quotes.copy()
+        quotes["code_6"] = quotes["代码"].astype(str).str[-6:]
+        selected = quotes[quotes["code_6"].isin(normalized_codes)].copy()
+        selected.insert(0, "code", selected.pop("code_6"))
 
         if selected.empty:
             raise LookupError("未能获取到对应股票的实时行情，请检查代码是否正确")
 
-        ordered = pd.CategoricalIndex(codes, ordered=True)
-        selected["code"] = selected["code"].astype(str)
+        desired_columns = [
+            "code",
+            "名称",
+            "最新价",
+            "涨跌额",
+            "涨跌幅",
+            "今开",
+            "昨收",
+            "最高",
+            "最低",
+            "成交量",
+            "成交额",
+        ]
+        selected = selected[desired_columns]
+
+        ordered = pd.CategoricalIndex(normalized_codes, ordered=True)
         selected = selected.set_index("code").loc[ordered].reset_index()
         return selected
 
@@ -114,18 +143,68 @@ class AKShareClient:
         if not code:
             raise ValueError("股票代码不能为空")
 
+        normalized_code = self._normalize_code(code)
         history = self._run_with_proxy_fallback(
             action=lambda: ak.stock_zh_a_hist(
-                symbol=code,
+                symbol=normalized_code,
                 period="daily",
                 start_date=start_date,
                 end_date=end_date,
                 adjust=adjust,
             ),
-            error_message="历史行情查询失败：检测到代理配置不可用，请关闭或修正代理后重试",
+            error_message=(
+                "历史行情查询失败：连接数据接口时被远端中断，可能是网络不稳定、网站风控或"
+                "代理配置问题，请稍后重试"
+            ),
         )
 
         if history.empty:
             raise LookupError("未能获取到历史行情，请检查日期范围或股票代码")
 
         return history
+
+    def fetch_recent_history(
+        self,
+        codes: Sequence[str],
+        n_days: int = 30,
+        adjust: str | None = "qfq",
+    ) -> pd.DataFrame:
+        """获取最近 ``n_days`` 天的历史行情数据。"""
+
+        if not codes:
+            raise ValueError("请至少提供一个股票代码进行查询")
+        if n_days <= 0:
+            raise ValueError("n_days 需要为正整数")
+
+        today = date.today()
+        start_date = (today - timedelta(days=n_days - 1)).strftime("%Y%m%d")
+        end_date = today.strftime("%Y%m%d")
+
+        records: list[pd.DataFrame] = []
+        for code in codes:
+            normalized_code = self._normalize_code(code)
+            history = self._run_with_proxy_fallback(
+                action=lambda c=normalized_code: ak.stock_zh_a_hist(
+                    symbol=c,
+                    period="daily",
+                    start_date=start_date,
+                    end_date=end_date,
+                    adjust=adjust,
+                ),
+                error_message=(
+                    "历史行情查询失败：连接数据接口时被远端中断，可能是网络不稳定、网站风控或"
+                    "代理配置问题，请稍后重试"
+                ),
+            )
+
+            if history.empty:
+                continue
+
+            history = history.copy()
+            history.insert(0, "代码", normalized_code)
+            records.append(history)
+
+        if not records:
+            raise LookupError("未能获取到历史行情，请检查日期范围或股票代码")
+
+        return pd.concat(records, ignore_index=True)

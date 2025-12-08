@@ -8,8 +8,7 @@ from typing import List
 
 from src.config import (
     DEFAULT_ADJUST,
-    DEFAULT_END_DATE,
-    DEFAULT_START_DATE,
+    DEFAULT_HISTORY_DAYS,
     DEFAULT_STOCK_CODES,
     HTTP_PROXY,
     HTTPS_PROXY,
@@ -47,19 +46,13 @@ def fetch_and_save_realtime(client: AKShareClient, codes: List[str]) -> pathlib.
 
 def fetch_and_save_history(
     client: AKShareClient,
-    code: str,
-    start_date: str,
-    end_date: str | None,
-    adjust: str,
+    codes: List[str],
+    n_days: int,
+    adjust: str | None,
 ) -> pathlib.Path:
     """Fetch historical quotes for a single code and save to CSV."""
-    history_df = client.fetch_history(
-        code=code,
-        start_date=start_date,
-        end_date=end_date,
-        adjust=adjust,
-    )
-    filename = f"history_{code}_{start_date}_{end_date or 'latest'}.csv"
+    history_df = client.fetch_recent_history(codes=codes, n_days=n_days, adjust=adjust)
+    filename = f"history_recent_{n_days}_days.csv"
     return save_dataframe(history_df, filename)
 
 
@@ -68,21 +61,15 @@ def run() -> None:
     client = AKShareClient(use_proxies=USE_PROXIES)
     realtime_path = fetch_and_save_realtime(client, DEFAULT_STOCK_CODES)
 
-    history_paths = [
-        fetch_and_save_history(
-            client,
-            code,
-            DEFAULT_START_DATE,
-            DEFAULT_END_DATE,
-            DEFAULT_ADJUST,
-        )
-        for code in DEFAULT_STOCK_CODES
-    ]
+    history_path = fetch_and_save_history(
+        client,
+        DEFAULT_STOCK_CODES,
+        DEFAULT_HISTORY_DAYS,
+        DEFAULT_ADJUST,
+    )
 
     print("实时行情已保存至:", realtime_path)
-    print("历史行情已保存至:")
-    for path in history_paths:
-        print(" -", path)
+    print("历史行情已保存至:", history_path)
 
 
 if __name__ == "__main__":
