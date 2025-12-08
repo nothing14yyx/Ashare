@@ -35,3 +35,11 @@ Traceback (most recent call last):
   File "D:\PythonProjects25-12\AShare\dbn_trading_auto\Lib\site-packages\akshare\utils\demjson.py", line 5501, in decode
     raise errors[0]
 akshare.utils.demjson.JSONDecodeError: Can not decode value starting with character '<'
+2025-12-08 15:50:08,107 [INFO] 数据已保存至 output\realtime_quotes.csv
+2025-12-08 15:50:14,125 [INFO] 数据已保存至 output\history_recent_30_days.csv
+2025-12-08 15:50:14,125 [INFO] 实时行情已保存至: output\realtime_quotes.csv
+2025-12-08 15:50:14,125 [INFO] 历史行情已保存至: output\history_recent_30_days.csv
+2025-12-08 16:26:16,726 [INFO] 数据已保存至 output\realtime_quotes.csv
+2025-12-08 16:26:23,554 [INFO] 数据已保存至 output\history_recent_300_days.csv
+2025-12-08 16:26:23,555 [INFO] 实时行情已保存至: output\realtime_quotes.csv
+2025-12-08 16:26:23,555 [INFO] 历史行情已保存至: output\history_recent_300_days.csv
