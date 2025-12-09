@@ -105,16 +105,14 @@ class AshareApp:
         )
 
     def export_realtime_quotes(self, output_dir: Path) -> Path:
-        """
-        使用 AshareCoreFetcher 导出全市场实时行情到 CSV。
-        文件名建议：realtime_quotes.csv
-        """
+        """使用 AshareCoreFetcher 导出全市场实时行情到 CSV。"""
         df = self.core_fetcher.get_realtime_all_a()
         if df.empty:
             raise RuntimeError("导出实时行情失败：A 股实时行情为空。")
 
         out_path = output_dir / "realtime_quotes.csv"
         df.to_csv(out_path, index=False, encoding="utf-8-sig")
+        print(f"已导出全市场实时行情至 {out_path}")
         return out_path
 
     def export_recent_daily_history(self, output_dir: Path, days: int = 30) -> Path:
