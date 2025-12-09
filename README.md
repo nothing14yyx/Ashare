@@ -1,12 +1,11 @@
-# A 股数据获取工具
+# A 股接口清单导出工具
 
-基于 [AKShare](https://akshare.akfamily.xyz/) 数据字典构建的简单 A 股数据获取示例, 重点演示接口发现与行情抓取。
+基于 [AKShare](https://akshare.akfamily.xyz/) 数据字典构建的简单 A 股接口清单导出示例, 只专注于接口发现与保存。
 
 ## 功能
 - 通过解析 AKShare 股票数据字典(`data/stock/stock.html`) 自动识别全部 A 股相关接口。
 - 自动将全部 A 股接口清单保存到 `output/a_share_interfaces.csv` 便于后续查阅。
-- 封装常用的行情接口, 包括实时行情、日线历史、分时数据。实时行情优先使用非 Eastmoney 来源的 `stock_zh_a_spot` 接口, 无法使用时再自动回退到 `stock_zh_a_spot_em`。
-- 提供脚本化入口 `start.py`, 直接运行后会输出接口清单、实时行情示例, 并把指定股票近 30 天历史行情保存到 `output/` 目录。
+- 提供脚本化入口 `start.py`, 直接运行后会输出接口清单并保存到 `output/` 目录。
 
 ## 使用方式
 1. 确保已安装依赖 (`pip install -r requirements.txt`)。
@@ -25,7 +24,7 @@ export ASHARE_HTTPS_PROXY="http://127.0.0.1:7890"
 python start.py
 ```
 
-脚本启动时会自动把上述配置应用到请求流程中, 包含数据字典抓取与 AKShare 接口调用。
+脚本启动时会自动把上述配置应用到数据字典抓取流程中。
 
 ## 说明
 - 由于部分环境的证书链不完整, 数据字典解析默认关闭证书校验; 如需开启, 可在 `DataDictionaryFetcher` 中把 `verify_ssl` 设置为 `True`。
