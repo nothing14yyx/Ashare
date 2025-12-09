@@ -13,11 +13,33 @@ class AshareCoreFetcher:
     - 出错时不抛异常，而是打印警告并返回空 DataFrame。
     """
 
+    def __init__(self) -> None:
+        # 全市场实时行情缓存（同一进程内复用）
+        self._spot_cache: pd.DataFrame | None = None
+
     # ========== 实时行情 ==========
 
-    def get_realtime_all_a(self, **kwargs) -> pd.DataFrame:
-        """全市场 A 股实时行情，对应 ak.stock_zh_a_spot(**kwargs)。"""
-        return self._safe_call_df(ak.stock_zh_a_spot, "stock_zh_a_spot", **kwargs)
+    def get_realtime_all_a(self, use_cache: bool = True, **kwargs) -> pd.DataFrame:
+        """
+        全市场 A 股实时行情（新浪）
+        对应 ak.stock_zh_a_spot(**kwargs)
+
+        use_cache:
+            True  - 优先使用本进程内缓存（推荐，大幅降低被风控几率）
+            False - 强制重新请求一次新浪接口
+        """
+        # 1) 优先使用缓存
+        if use_cache and self._spot_cache is not None:
+            return self._spot_cache
+
+        # 2) 真正发请求
+        df = self._safe_call_df(ak.stock_zh_a_spot, "stock_zh_a_spot", **kwargs)
+
+        # 3) 只有拿到非空数据才写缓存
+        if use_cache and not df.empty:
+            self._spot_cache = df
+
+        return df
 
     def get_realtime_kcb(self, **kwargs) -> pd.DataFrame:
         """科创板实时行情，对应 ak.stock_zh_kcb_spot(**kwargs)。"""
