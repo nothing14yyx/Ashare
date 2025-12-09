@@ -50,7 +50,9 @@ class AshareApp:
         """执行接口清单导出示例.
 
         1. 输出 A 股数据接口列表的摘要;
-        2. 将接口清单写入 CSV 便于查阅。
+        2. 将接口清单写入 CSV 便于查阅;
+        3. 导出全市场实时行情与最近 30 日历史日线数据;
+        4. 构建剔除 ST/停牌标的的候选池并筛选高流动性标的。
         """
 
         try:
@@ -63,6 +65,20 @@ class AshareApp:
         self._print_interfaces(interfaces)
         saved_interfaces = self._save_interfaces(interfaces)
         print(f"已将全部接口名称保存至 {saved_interfaces}")
+
+        try:
+            realtime_quotes_path = self.export_realtime_quotes(self.output_dir)
+        except RuntimeError as exc:
+            print(f"导出实时行情失败: {exc}")
+        else:
+            print(f"已导出全市场实时行情至 {realtime_quotes_path}")
+
+        try:
+            history_path = self.export_recent_daily_history(self.output_dir, days=30)
+        except RuntimeError as exc:
+            print(f"导出最近 30 个交易日的日线数据失败: {exc}")
+        else:
+            print(f"已导出最近 30 个交易日的历史数据至 {history_path}")
 
         try:
             universe_df = self.universe_builder.build_universe()
@@ -86,6 +102,65 @@ class AshareApp:
             "已将成交额排序结果写入 "
             f"{top_liquidity_path}, 可用于盘中选板块龙头或流动性筛选。"
         )
+
+    def export_realtime_quotes(self, output_dir: Path) -> Path:
+        """
+        使用 AshareCoreFetcher 导出全市场实时行情到 CSV。
+        文件名建议：realtime_quotes.csv
+        """
+        df = self.core_fetcher.get_realtime_all_a()
+        if df.empty:
+            raise RuntimeError("导出实时行情失败：A 股实时行情为空。")
+
+        out_path = output_dir / "realtime_quotes.csv"
+        df.to_csv(out_path, index=False, encoding="utf-8-sig")
+        return out_path
+
+    def export_recent_daily_history(self, output_dir: Path, days: int = 30) -> Path:
+        """
+        拉取最近 N 日（例如 30 日）的日线数据，并导出到 CSV。
+
+        简化版本建议：
+        - 先用 get_realtime_all_a() 拿到全市场代码列表；
+        - 对每个代码，使用 get_daily_a_sina(...) 拉取一段时间；
+        - 只取最近 `days` 个交易日的数据；
+        - 合并成一个大 DataFrame（增加一列代码），写出 CSV。
+        """
+        spot_df = self.core_fetcher.get_realtime_all_a()
+        if spot_df.empty or "代码" not in spot_df.columns:
+            raise RuntimeError("导出历史日线失败：无法获取全市场代码列表。")
+
+        history_frames = []
+        for code in spot_df["代码"].astype(str):
+            symbol = self._to_sina_symbol(code)
+            daily_df = self.core_fetcher.get_daily_a_sina(symbol=symbol, adjust="")
+            if daily_df.empty:
+                continue
+
+            trimmed = daily_df.tail(days).copy()
+            trimmed.insert(0, "代码", code)
+            history_frames.append(trimmed)
+
+        if not history_frames:
+            raise RuntimeError("导出历史日线失败：所有股票的日线数据均为空。")
+
+        combined = pd.concat(history_frames, ignore_index=True)
+        out_path = output_dir / f"history_recent_{days}_days.csv"
+        combined.to_csv(out_path, index=False, encoding="utf-8-sig")
+        return out_path
+
+    @staticmethod
+    def _to_sina_symbol(code: str) -> str:
+        """将六位代码转换为新浪日线接口需要的带交易所前缀的代码."""
+        normalized = code.strip()
+        if not normalized:
+            return normalized
+
+        if normalized.startswith(("5", "6", "9")):
+            prefix = "sh"
+        else:
+            prefix = "sz"
+        return f"{prefix}{normalized}"
 
 
 if __name__ == "__main__":
