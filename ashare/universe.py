@@ -10,7 +10,7 @@ from .core_fetcher import AshareCoreFetcher
 
 
 class AshareUniverseBuilder:
-    """基于 AKShare 实时行情构建当日交易标的候选池（仅使用新浪数据源）."""
+    """基于 AKShare 实时行情构建当日交易标的候选池（仅使用新浪数据源）。"""
 
     def __init__(
         self,
@@ -26,14 +26,14 @@ class AshareUniverseBuilder:
     # ======================== 核心底层方法 ========================
 
     def _fetch_spot(self) -> pd.DataFrame:
-        """从新浪获取全市场实时行情（stock_zh_a_spot）."""
+        """从新浪获取全市场实时行情（通过 AshareCoreFetcher 包装的 stock_zh_a_spot）。"""
         if self._spot_cache is not None:
             return self._spot_cache
 
         df = self.fetcher.get_realtime_all_a()
         if df.empty:
             raise RuntimeError(
-                "获取全市场实时行情失败：无法访问新浪 stock_zh_a_spot，请检查网络或代理设置。"
+                "获取全市场实时行情失败：AshareCoreFetcher.get_realtime_all_a 返回空 DataFrame。"
             )
 
         # df 默认已经有“代码、名称、最新价、涨跌幅、成交量、成交额”等字段
@@ -66,7 +66,11 @@ class AshareUniverseBuilder:
         return set(spot_df.loc[mask, "代码"])
 
     def _fetch_new_stock_codes(self) -> Set[str]:
-        """占位：受限于白名单接口，不再额外请求次新股列表."""
+        """
+        暂不依赖任何不稳定的新股接口，统一返回空集合。
+
+        后续如果找到稳定的新股来源，再完善这里的实现。
+        """
         return set()
 
     # ======================== 对外方法 ========================
