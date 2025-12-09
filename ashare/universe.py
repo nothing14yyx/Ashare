@@ -15,10 +15,13 @@ class AshareUniverseBuilder:
     def __init__(
         self,
         top_liquidity_count: int = 100,
-            fetcher: AshareCoreFetcher | None = None,
+        fetcher: AshareCoreFetcher | None = None,
     ) -> None:
         # 挑选成交额前多少名
         self.top_liquidity_count = top_liquidity_count
+        if fetcher is None:
+            raise ValueError("AshareUniverseBuilder 需要注入 AshareCoreFetcher 实例。")
+
         self.fetcher = fetcher
         # 缓存实时行情，避免多次请求
         self._spot_cache: pd.DataFrame | None = None
