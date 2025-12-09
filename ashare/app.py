@@ -125,12 +125,35 @@ class AshareApp:
         - 只取最近 `days` 个交易日的数据；
         - 合并成一个大 DataFrame（增加一列代码），写出 CSV。
         """
+        # 1) 优先使用 fetcher 内缓存（如果前面已经成功获取过全市场行情，会在这里命中）
         spot_df = self.core_fetcher.get_realtime_all_a()
+
+        # 2) 如果缓存为空，尝试从 realtime_quotes.csv 读取
+        if spot_df.empty or "代码" not in spot_df.columns:
+            realtime_path = output_dir / "realtime_quotes.csv"
+            if realtime_path.exists():
+                try:
+                    spot_df = pd.read_csv(realtime_path)
+                except Exception as e:  # noqa: BLE001
+                    print(f"[WARN] 读取 {realtime_path} 失败: {e}")
+                    spot_df = pd.DataFrame()
+
+        # 3) 兜底：再尝试一次强制调用接口（可能会被风控，但作为最后尝试）
+        if spot_df.empty or "代码" not in spot_df.columns:
+            spot_df = self.core_fetcher.get_realtime_all_a(use_cache=False)
+
         if spot_df.empty or "代码" not in spot_df.columns:
             raise RuntimeError("导出历史日线失败：无法获取全市场代码列表。")
 
+        codes = (
+            spot_df["代码"]
+            .dropna()
+            .astype(str)
+            .unique()
+        )
+
         history_frames = []
-        for code in spot_df["代码"].astype(str):
+        for code in codes:
             symbol = self._to_sina_symbol(code)
             daily_df = self.core_fetcher.get_daily_a_sina(symbol=symbol, adjust="")
             if daily_df.empty:
