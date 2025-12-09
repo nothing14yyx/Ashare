@@ -28,6 +28,10 @@ class AshareApp:
         for name in preview[:10]:
             print(f" - {name}")
 
+    def _save_interfaces(self, interfaces: Iterable[str]) -> Path:
+        interfaces_df = pd.DataFrame({"interface": list(interfaces)})
+        return self._save_sample(interfaces_df, "a_share_interfaces.csv")
+
     def _save_sample(self, df: pd.DataFrame, filename: str) -> Path:
         target = self.output_dir / filename
         df.to_csv(target, index=False)
@@ -49,6 +53,8 @@ class AshareApp:
             return
 
         self._print_interfaces(interfaces)
+        saved_interfaces = self._save_interfaces(interfaces)
+        print(f"已将全部接口名称保存至 {saved_interfaces}")
 
         try:
             symbols = self.fetcher.symbol_list().head(5)
