@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Iterable
 
+import datetime as dt
 import pandas as pd
 
 from .config import ProxyConfig
@@ -152,13 +153,27 @@ class AshareApp:
             .unique()
         )
 
+        # 为了只拉最近 N 个交易日附近的数据，
+        # 这里按自然日往前多给一点冗余（例如 N*3），避免遇到节假日导致天数不够。
+        today = dt.date.today()
+        # 例如 N=30，则取最近 90 个自然日的区间
+        start_date = today - dt.timedelta(days=days * 3)
+        start_str = start_date.strftime("%Y%m%d")
+        end_str = today.strftime("%Y%m%d")
+
         history_frames = []
         for code in codes:
             symbol = self._to_sina_symbol(code)
-            daily_df = self.core_fetcher.get_daily_a_sina(symbol=symbol, adjust="")
+            daily_df = self.core_fetcher.get_daily_a_sina(
+                symbol=symbol,
+                start_date=start_str,
+                end_date=end_str,
+                adjust="",
+            )
             if daily_df.empty:
                 continue
 
+            # 保险起见，仍然只保留最近 N 个交易日
             trimmed = daily_df.tail(days).copy()
             trimmed.insert(0, "代码", code)
             history_frames.append(trimmed)

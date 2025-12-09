@@ -52,8 +52,25 @@ class AshareCoreFetcher:
     # ========== 历史日线 / 分时 / 分笔 ==========
 
     def get_daily_a_sina(self, **kwargs) -> pd.DataFrame:
-        """A 股历史日线-新浪，对应 ak.stock_zh_a_daily(**kwargs)。"""
-        return self._safe_call_df(ak.stock_zh_a_daily, "stock_zh_a_daily", **kwargs)
+        """
+        A 股历史日线-新浪，对应 ak.stock_zh_a_daily(**kwargs)。
+        如果返回为空，并且有 symbol，则自动切换到腾讯日线接口 stock_zh_a_hist_tx。
+        """
+        df = self._safe_call_df(ak.stock_zh_a_daily, "stock_zh_a_daily", **kwargs)
+
+        symbol = kwargs.get("symbol")
+        if df.empty and symbol:
+            print(
+                f"[INFO] stock_zh_a_daily({symbol}) 返回空或失败，"
+                "自动切换为 stock_zh_a_hist_tx。"
+            )
+            return self._safe_call_df(
+                ak.stock_zh_a_hist_tx,
+                "stock_zh_a_hist_tx",
+                **kwargs,
+            )
+
+        return df
 
     def get_daily_a_tx(self, **kwargs) -> pd.DataFrame:
         """A 股历史日线-腾讯，对应 ak.stock_zh_a_hist_tx(**kwargs)。"""
