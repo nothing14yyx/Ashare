@@ -5,15 +5,21 @@ from __future__ import annotations
 from typing import Set
 
 import pandas as pd
-import akshare as ak
+
+from .core_fetcher import AshareCoreFetcher
 
 
 class AshareUniverseBuilder:
     """基于 AKShare 实时行情构建当日交易标的候选池（仅使用新浪数据源）."""
 
-    def __init__(self, top_liquidity_count: int = 100):
+    def __init__(
+        self,
+        top_liquidity_count: int = 100,
+        fetcher: AshareCoreFetcher | None = None,
+    ):
         # 挑选成交额前多少名
         self.top_liquidity_count = top_liquidity_count
+        self.fetcher = fetcher or AshareCoreFetcher()
         # 缓存实时行情，避免多次请求
         self._spot_cache: pd.DataFrame | None = None
 
@@ -24,12 +30,11 @@ class AshareUniverseBuilder:
         if self._spot_cache is not None:
             return self._spot_cache
 
-        try:
-            df = ak.stock_zh_a_spot()
-        except Exception as e:  # noqa: BLE001
+        df = self.fetcher.get_realtime_all_a()
+        if df.empty:
             raise RuntimeError(
                 "获取全市场实时行情失败：无法访问新浪 stock_zh_a_spot，请检查网络或代理设置。"
-            ) from e
+            )
 
         # df 默认已经有“代码、名称、最新价、涨跌幅、成交量、成交额”等字段
         self._spot_cache = df
@@ -61,20 +66,7 @@ class AshareUniverseBuilder:
         return set(spot_df.loc[mask, "代码"])
 
     def _fetch_new_stock_codes(self) -> Set[str]:
-        """用非 em 接口获取次新股代码，失败则返回空集合."""
-        # 只用不带 _em 的接口：stock_zh_a_new_df / stock_zh_a_new
-        for func_name in ("stock_zh_a_new_df", "stock_zh_a_new"):
-            fetcher = getattr(ak, func_name, None)
-            if fetcher is None:
-                continue
-            try:
-                new_df = fetcher()
-            except Exception:  # noqa: BLE001
-                continue
-            if new_df is not None and "代码" in new_df.columns:
-                return set(new_df["代码"])
-
-        # 实在拿不到就全部当成非次新
+        """占位：受限于白名单接口，不再额外请求次新股列表."""
         return set()
 
     # ======================== 对外方法 ========================

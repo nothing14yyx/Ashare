@@ -8,6 +8,7 @@ from typing import Iterable
 import pandas as pd
 
 from .config import ProxyConfig
+from .core_fetcher import AshareCoreFetcher
 from .fetcher import AshareDataFetcher
 from .universe import AshareUniverseBuilder
 
@@ -21,9 +22,11 @@ class AshareApp:
         proxy_config: ProxyConfig | None = None,
         top_liquidity_count: int = 100,
     ):
+        self.core_fetcher = AshareCoreFetcher()
         self.fetcher = AshareDataFetcher(proxy_config=proxy_config)
         self.universe_builder = AshareUniverseBuilder(
-            top_liquidity_count=top_liquidity_count
+            top_liquidity_count=top_liquidity_count,
+            fetcher=self.core_fetcher,
         )
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
