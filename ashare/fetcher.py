@@ -61,7 +61,17 @@ class AshareDataFetcher:
     def realtime_quotes(self) -> pd.DataFrame:
         """获取沪深京 A 股的实时行情."""
 
-        return self.fetch("stock_zh_a_spot_em")
+        try:
+            return self.fetch("stock_zh_a_spot")
+        except (RuntimeError, ValueError):
+            pass
+
+        try:
+            return self.fetch("stock_zh_a_spot_em")
+        except (RuntimeError, ValueError) as exc:
+            raise RuntimeError(
+                "实时行情接口不可用, 已尝试 stock_zh_a_spot 与 stock_zh_a_spot_em"
+            ) from exc
 
     def symbol_list(self) -> pd.DataFrame:
         """提取股票代码与名称便于后续查询."""

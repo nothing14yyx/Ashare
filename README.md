@@ -5,7 +5,7 @@
 ## 功能
 - 通过解析 AKShare 股票数据字典(`data/stock/stock.html`) 自动识别全部 A 股相关接口。
 - 自动将全部 A 股接口清单保存到 `output/a_share_interfaces.csv` 便于后续查阅。
-- 封装常用的行情接口, 包括实时行情、日线历史、分时数据。
+- 封装常用的行情接口, 包括实时行情、日线历史、分时数据。实时行情优先使用非 Eastmoney 来源的 `stock_zh_a_spot` 接口, 无法使用时再自动回退到 `stock_zh_a_spot_em`。
 - 提供脚本化入口 `start.py`, 直接运行后会输出接口清单、实时行情示例, 并把指定股票近 30 天历史行情保存到 `output/` 目录。
 
 ## 使用方式
