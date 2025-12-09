@@ -2,5 +2,6 @@
 
 from .dictionary import DataDictionaryFetcher
 from .fetcher import AshareDataFetcher
+from .universe import AshareUniverseBuilder
 
-__all__ = ["DataDictionaryFetcher", "AshareDataFetcher"]
+__all__ = ["DataDictionaryFetcher", "AshareDataFetcher", "AshareUniverseBuilder"]

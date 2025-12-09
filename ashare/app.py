@@ -9,15 +9,22 @@ import pandas as pd
 
 from .config import ProxyConfig
 from .fetcher import AshareDataFetcher
+from .universe import AshareUniverseBuilder
 
 
 class AshareApp:
     """通过脚本方式导出 A 股接口清单的应用."""
 
     def __init__(
-        self, output_dir: str | Path = "output", proxy_config: ProxyConfig | None = None
+        self,
+        output_dir: str | Path = "output",
+        proxy_config: ProxyConfig | None = None,
+        top_liquidity_count: int = 100,
     ):
         self.fetcher = AshareDataFetcher(proxy_config=proxy_config)
+        self.universe_builder = AshareUniverseBuilder(
+            top_liquidity_count=top_liquidity_count
+        )
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -53,6 +60,29 @@ class AshareApp:
         self._print_interfaces(interfaces)
         saved_interfaces = self._save_interfaces(interfaces)
         print(f"已将全部接口名称保存至 {saved_interfaces}")
+
+        try:
+            universe_df = self.universe_builder.build_universe()
+        except RuntimeError as exc:
+            print(f"生成当日候选池失败: {exc}")
+            return
+
+        universe_path = self._save_sample(universe_df, "a_share_universe.csv")
+        print(f"已生成剔除 ST/停牌的候选池: {universe_path}")
+
+        try:
+            top_liquidity = self.universe_builder.pick_top_liquidity(universe_df)
+        except RuntimeError as exc:
+            print(f"挑选成交额前 {self.universe_builder.top_liquidity_count} 名失败: {exc}")
+            return
+
+        top_liquidity_path = self._save_sample(
+            top_liquidity, "a_share_top_liquidity.csv"
+        )
+        print(
+            "已将成交额排序结果写入 "
+            f"{top_liquidity_path}, 可用于盘中选板块龙头或流动性筛选。"
+        )
 
 
 if __name__ == "__main__":

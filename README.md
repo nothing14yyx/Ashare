@@ -5,6 +5,8 @@
 ## 功能
 - 通过解析 AKShare 股票数据字典(`data/stock/stock.html`) 自动识别全部 A 股相关接口。
 - 自动将全部 A 股接口清单保存到 `output/a_share_interfaces.csv` 便于后续查阅。
+- 基于实时行情构建当日候选池, 自动剔除 ST、停牌标的并标注次新股。
+- 额外输出成交额排序, 便于盘中选板块龙头或流动性筛选。
 - 提供脚本化入口 `start.py`, 直接运行后会输出接口清单并保存到 `output/` 目录。
 
 ## 使用方式
@@ -14,6 +16,9 @@
    python start.py
    ```
 3. 输出文件默认保存在仓库根目录下的 `output/` 文件夹。
+   - `a_share_interfaces.csv`: A 股数据接口清单
+   - `a_share_universe.csv`: 剔除 ST、停牌并标注次新股后的实时行情
+   - `a_share_top_liquidity.csv`: 借助成交额排序的高流动性标的列表
 
 ### 使用代理网络
 如需通过代理访问网络资源 (例如本地代理端口为 `7890`), 可以在运行前设置环境变量:
