@@ -8,14 +8,17 @@ from typing import Iterable
 
 import pandas as pd
 
+from .config import ProxyConfig
 from .fetcher import AshareDataFetcher
 
 
 class AshareApp:
     """通过脚本方式运行的数据获取工具."""
 
-    def __init__(self, output_dir: str | Path = "output"):
-        self.fetcher = AshareDataFetcher()
+    def __init__(
+        self, output_dir: str | Path = "output", proxy_config: ProxyConfig | None = None
+    ):
+        self.fetcher = AshareDataFetcher(proxy_config=proxy_config)
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 

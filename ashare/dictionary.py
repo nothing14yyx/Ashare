@@ -5,7 +5,7 @@
 """
 
 from dataclasses import dataclass, field
-from typing import List, Set
+from typing import Dict, List, Set
 import re
 import warnings
 
@@ -31,6 +31,7 @@ class DataDictionaryFetcher:
     timeout: int = 10
     _cached_html: str | None = field(default=None, init=False, repr=False)
     _cached_endpoints: List[str] | None = field(default=None, init=False, repr=False)
+    proxies: Dict[str, str] | None = field(default=None, repr=False)
 
     def fetch_raw_html(self) -> str:
         """获取股票数据字典页面的 HTML 文本并缓存结果.
@@ -47,7 +48,10 @@ class DataDictionaryFetcher:
 
         try:
             response = requests.get(
-                self.stock_doc_url, timeout=self.timeout, verify=self.verify_ssl
+                self.stock_doc_url,
+                timeout=self.timeout,
+                verify=self.verify_ssl,
+                proxies=self.proxies,
             )
             response.raise_for_status()
         except RequestException as exc:

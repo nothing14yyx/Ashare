@@ -8,6 +8,7 @@ import akshare as ak
 import pandas as pd
 from requests.exceptions import RequestException
 
+from .config import ProxyConfig
 from .dictionary import DataDictionaryFetcher
 
 
@@ -17,8 +18,18 @@ class AshareDataFetcher:
     通过数据字典校验接口可用性, 再调用 AKShare 的真实接口。
     """
 
-    def __init__(self, dictionary_fetcher: DataDictionaryFetcher | None = None):
-        self.dictionary_fetcher = dictionary_fetcher or DataDictionaryFetcher()
+    def __init__(
+        self,
+        dictionary_fetcher: DataDictionaryFetcher | None = None,
+        proxy_config: ProxyConfig | None = None,
+    ):
+        self.proxy_config = proxy_config or ProxyConfig.from_env()
+        self.proxy_config.apply_to_environment()
+        if dictionary_fetcher is None:
+            dictionary_fetcher = DataDictionaryFetcher(
+                proxies=self.proxy_config.as_requests_proxies()
+            )
+        self.dictionary_fetcher = dictionary_fetcher
 
     def _resolve_interface(self, interface_name: str):
         if not self.dictionary_fetcher.is_supported(interface_name):
