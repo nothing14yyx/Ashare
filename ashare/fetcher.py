@@ -99,6 +99,19 @@ class AshareDataFetcher:
         }
         return self.fetch("stock_zh_a_hist", **params)
 
+    def daily_quotes(self, symbol: str, adjust: str | None = "qfq") -> pd.DataFrame:
+        """使用 ``stock_zh_a_daily`` 接口抓取日线行情数据.
+
+        Args:
+            symbol: 股票代码, 需包含交易所前缀, 例如 "sh600000" 或 "sz000001"。
+            adjust: 复权方式, 支持 "qfq", "hfq" 或 None。
+
+        Returns:
+            对应股票的日线行情数据。
+        """
+
+        return self.fetch("stock_zh_a_daily", symbol=symbol, adjust=adjust)
+
     def minute_quotes(
         self, symbol: str, period: str = "5", adjust: str | None = "qfq"
     ) -> pd.DataFrame:
