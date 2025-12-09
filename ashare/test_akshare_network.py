@@ -22,7 +22,7 @@ def print_env_info():
 def test_akshare_spot():
     print(">>> 测试 akshare.stock_zh_a_spot() 实时行情接口（新浪）")
     try:
-        df = ak.stock_zh_a_spot()
+        df = ak.stock_hk_spot()
         print("调用成功！DataFrame 形状:", df.shape)
         print("前 5 行预览：")
         print(df.head())
