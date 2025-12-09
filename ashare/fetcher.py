@@ -52,6 +52,10 @@ class AshareDataFetcher:
             raise RuntimeError(
                 "网络请求失败, 请检查是否被代理或防火墙拦截。"
             ) from exc
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(
+                f"调用 AKShare 接口 {interface_name} 失败, 返回数据格式异常。"
+            ) from exc
 
     def available_interfaces(self) -> List[str]:
         """列出数据字典中支持的全部 A 股接口."""
