@@ -11,7 +11,7 @@ from .dictionary import DataDictionaryFetcher
 
 
 class AshareDataFetcher:
-    """提供与 A 股接口数据字典相关的功能."""
+    """提供与 A 股接口数据字典相关的功能（仅用于文档探索与接口清单导出）。"""
 
     def __init__(
         self,

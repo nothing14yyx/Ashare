@@ -4,9 +4,10 @@
 
 ## 功能
 - 通过解析 AKShare 股票数据字典(`data/stock/stock.html`) 自动识别全部 A 股相关接口。
-- 自动将全部 A 股接口清单保存到 `output/a_share_interfaces.csv` 便于后续查阅。
+- 自动将全部 A 股接口清单保存到 `output/a_share_interfaces.csv` 便于后续查阅（数据字典只用于文档探索, 不参与交易数据拉取）。
 - 基于实时行情构建当日候选池, 自动剔除 ST、停牌标的并标注次新股。
 - 额外输出成交额排序, 便于盘中选板块龙头或流动性筛选。
+- 交易数据（实时行情 / 日线 / 因子等）全部通过 `AshareCoreFetcher` 直接调用稳定的 AKShare 接口, 不依赖数据字典校验。
 - 提供脚本化入口 `start.py`, 直接运行后会输出接口清单并保存到 `output/` 目录。
 
 ## 使用方式
@@ -33,4 +34,4 @@ python start.py
 
 ## 说明
 - 由于部分环境的证书链不完整, 数据字典解析默认关闭证书校验; 如需开启, 可在 `DataDictionaryFetcher` 中把 `verify_ssl` 设置为 `True`。
-- 接口调用均基于数据字典校验, 若 AKShare 版本变更导致接口缺失会抛出友好的异常提示。
+- 数据字典相关功能仅影响接口清单导出; 即使无法访问文档页面, 交易相关的数据导出依旧通过 `AshareCoreFetcher` 正常工作。

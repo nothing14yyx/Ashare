@@ -55,16 +55,17 @@ class AshareApp:
         4. 构建剔除 ST/停牌标的的候选池并筛选高流动性标的。
         """
 
+        interfaces: list[str] | None = None
         try:
             interfaces = self.fetcher.available_interfaces()
         except RuntimeError as exc:
             print(f"加载数据字典失败: {exc}")
-            print("无法校验接口列表, 请先解决网络问题后重试。")
-            return
+            print("数据字典仅用于接口清单导出，不影响交易数据流程。")
 
-        self._print_interfaces(interfaces)
-        saved_interfaces = self._save_interfaces(interfaces)
-        print(f"已将全部接口名称保存至 {saved_interfaces}")
+        if interfaces:
+            self._print_interfaces(interfaces)
+            saved_interfaces = self._save_interfaces(interfaces)
+            print(f"已将全部接口名称保存至 {saved_interfaces}")
 
         try:
             realtime_quotes_path = self.export_realtime_quotes(self.output_dir)
