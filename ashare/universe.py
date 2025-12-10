@@ -23,9 +23,11 @@ class AshareUniverseBuilder:
             return set()
 
         names = stock_df["code_name"].astype(str)
+
+        # 使用非捕获分组 (?:...)，避免 pandas 对捕获分组的 warning
         mask_name = (
-            names.str.contains(r"^(ST|\*ST)", regex=True, case=False)
-            | names.str.contains(r"(退|delist)", regex=True, case=False)
+            names.str.contains(r"^(?:ST|\*ST)", case=False)
+            | names.str.contains(r"(?:退|delist)", case=False)
         )
 
         st_candidates = set(stock_df.loc[mask_name, "code"])

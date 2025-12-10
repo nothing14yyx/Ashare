@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta
-from typing import Iterable
+from typing import Any, Iterable
 
 import baostock as bs
 import pandas as pd
@@ -24,11 +24,14 @@ class BaostockDataFetcher:
 
         self.session.connect()
 
-    def _resultset_to_df(self, rs: bs.ResultData) -> pd.DataFrame:
-        """将 Baostock ResultSet 转换为 DataFrame。"""
+    def _resultset_to_df(self, rs: Any) -> pd.DataFrame:
+        """将 Baostock ResultSet 转换为 DataFrame，并在失败时抛出错误。"""
+
+        if rs.error_code != "0":
+            raise RuntimeError(f"Baostock 调用失败: {rs.error_code}, {rs.error_msg}")
 
         rows: list[Iterable[str]] = []
-        while (rs.error_code == "0") & rs.next():
+        while rs.next():
             rows.append(rs.get_row_data())
         return pd.DataFrame(rows, columns=rs.fields)
 
@@ -59,19 +62,56 @@ class BaostockDataFetcher:
         )
         return str(latest_date)
 
-    def get_stock_list(self, trade_date: str) -> pd.DataFrame:
-        """按交易日获取 A 股列表。"""
+    def get_stock_list(self, trade_date: str, fallback_days: int = 15) -> pd.DataFrame:
+        """按交易日获取 A 股列表。
+
+        参数
+        ----------
+        trade_date : str
+            期望的交易日，格式为 "YYYY-MM-DD"。
+        fallback_days : int, 默认 15
+            如果该日期没有返回股票列表（例如当天数据尚未生成、
+            或遇到节假日），则自动向前回退最多 fallback_days 天，
+            返回最近一个有数据的交易日的股票列表。
+
+        返回
+        ----------
+        pd.DataFrame
+            含有 code, code_name, tradeStatus 列的股票列表。
+            若在 fallback_days 内仍未找到任何数据，则返回空 DataFrame。
+        """
 
         self._ensure_session()
-        rs = bs.query_all_stock(day=trade_date)
-        df = self._resultset_to_df(rs)
+
+        def _query(day: str) -> pd.DataFrame:
+            """内部封装一次 query_all_stock 调用。"""
+            rs = bs.query_all_stock(day=day)
+            df = self._resultset_to_df(rs)
+            return df
+
+        # 1) 先尝试用户指定的日期
+        df = _query(trade_date)
+
+        # 2) 如果没有数据，则向前回退，最多 fallback_days 天
+        if df.empty:
+            current = datetime.strptime(trade_date, "%Y-%m-%d").date()
+            for i in range(1, fallback_days + 1):
+                prev_day = (current - timedelta(days=i)).isoformat()
+                df = _query(prev_day)
+                if not df.empty:
+                    # 找到了就停止回退，使用这个日期的数据
+                    break
+
+        # 3) 如果依然没有数据，直接返回空 DataFrame，由上层决定如何处理
         if df.empty:
             return df
 
+        # 4) 过滤出 A 股主板并只保留常用字段
         prefixes = ("sh.60", "sz.00")
         filtered = df[
             df["code"].str.startswith(prefixes) & (df["tradeStatus"] == "1")
         ].reset_index(drop=True)
+
         columns = [
             col for col in ["code", "code_name", "tradeStatus"] if col in filtered
         ]
