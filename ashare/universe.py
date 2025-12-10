@@ -1,4 +1,4 @@
-"""实时行情与交易标的筛选工具."""
+"""基于 Baostock 日线数据的交易标的筛选工具."""
 
 from __future__ import annotations
 
@@ -6,94 +6,69 @@ from typing import Set
 
 import pandas as pd
 
-from .core_fetcher import AshareCoreFetcher
-
 
 class AshareUniverseBuilder:
-    """基于 AKShare 实时行情构建当日交易标的候选池（仅使用新浪数据源）。"""
+    """使用 Baostock 数据构建当日交易候选池。"""
 
     def __init__(
         self,
         top_liquidity_count: int = 100,
-        fetcher: AshareCoreFetcher | None = None,
     ) -> None:
-        # 挑选成交额前多少名
         self.top_liquidity_count = top_liquidity_count
-        # 如果外部没传，就自己 new；AshareApp 会传，因此正常情况下共用实例
-        self.fetcher = fetcher or AshareCoreFetcher()
-        # 缓存实时行情，避免多次请求（这层缓存可以保留）
-        self._spot_cache: pd.DataFrame | None = None
 
-    # ======================== 核心底层方法 ========================
-
-    def _fetch_spot(self) -> pd.DataFrame:
-        """从新浪获取全市场实时行情（通过 AshareCoreFetcher 包装的 stock_zh_a_spot）。"""
-        if self._spot_cache is not None:
-            return self._spot_cache
-
-        df = self.fetcher.get_realtime_all_a()  # 默认 use_cache=True
-        if df.empty:
-            raise RuntimeError(
-                "获取全市场实时行情失败：AshareCoreFetcher.get_realtime_all_a 返回空 DataFrame。"
-            )
-
-        # df 默认已经有“代码、名称、最新价、涨跌幅、成交量、成交额”等字段
-        self._spot_cache = df
-        return df
-
-    def _infer_st_codes(self, spot_df: pd.DataFrame) -> Set[str]:
-        """根据名称识别 ST / *ST / 含“退”的股票，近似替代 ST 接口."""
-        if "名称" not in spot_df.columns or "代码" not in spot_df.columns:
+    def _infer_st_codes(self, stock_df: pd.DataFrame) -> Set[str]:
+        if "code" not in stock_df.columns or "code_name" not in stock_df.columns:
             return set()
 
-        names = spot_df["名称"].astype(str)
+        names = stock_df["code_name"].astype(str)
         mask_st = names.str.startswith("ST") | names.str.startswith("*ST")
         mask_tui = names.str.contains("退")
-        return set(spot_df.loc[mask_st | mask_tui, "代码"])
+        return set(stock_df.loc[mask_st | mask_tui, "code"])
 
-    def _infer_stop_codes(self, spot_df: pd.DataFrame) -> Set[str]:
-        """根据成交量和价格近似识别停牌股票，替代停牌接口."""
-        cols = spot_df.columns
-        if "代码" not in cols or "成交量" not in cols:
+    def _infer_stop_codes(self, latest_kline: pd.DataFrame) -> Set[str]:
+        cols = latest_kline.columns
+        if "code" not in cols:
             return set()
 
-        vol_zero = spot_df["成交量"] == 0
-        if "最新价" in cols and "昨收" in cols:
-            same_price = spot_df["最新价"] == spot_df["昨收"]
-            mask = vol_zero & same_price
-        else:
-            mask = vol_zero
+        if "tradestatus" in cols:
+            stopped = latest_kline[latest_kline["tradestatus"] != "1"]
+            return set(stopped["code"])
 
-        return set(spot_df.loc[mask, "代码"])
-
-    def _fetch_new_stock_codes(self) -> Set[str]:
-        """
-        暂不依赖任何不稳定的新股接口，统一返回空集合。
-
-        后续如果找到稳定的新股来源，再完善这里的实现。
-        """
         return set()
 
-    # ======================== 对外方法 ========================
+    def build_universe(
+        self, stock_df: pd.DataFrame, history_df: pd.DataFrame
+    ) -> pd.DataFrame:
+        if stock_df.empty:
+            raise RuntimeError("候选池构建失败：股票列表为空。")
+        if history_df.empty:
+            raise RuntimeError("候选池构建失败：历史日线数据为空。")
 
-    def build_universe(self) -> pd.DataFrame:
-        """生成剔除 ST 与停牌标的后的实时行情清单."""
-        spot_df = self._fetch_spot()
+        # 提取每个标的最新一个交易日的日线数据
+        latest_rows = (
+            history_df.sort_values("date")
+            .groupby("code", as_index=False)
+            .tail(1)
+            .reset_index(drop=True)
+        )
 
-        st_codes = self._infer_st_codes(spot_df)
-        stop_codes = self._infer_stop_codes(spot_df)
-        new_codes = self._fetch_new_stock_codes()
-
+        st_codes = self._infer_st_codes(stock_df)
+        stop_codes = self._infer_stop_codes(latest_rows)
         bad_codes = st_codes | stop_codes
 
-        filtered = spot_df[~spot_df["代码"].isin(bad_codes)].copy()
-        filtered["是否次新股"] = filtered["代码"].isin(new_codes)
+        merged = stock_df.merge(latest_rows, on="code", how="left")
+        filtered = merged[~merged["code"].isin(bad_codes)].copy()
+
+        if "amount" in filtered.columns:
+            filtered["amount"] = pd.to_numeric(filtered["amount"], errors="coerce")
+
         return filtered
 
     def pick_top_liquidity(self, universe_df: pd.DataFrame) -> pd.DataFrame:
-        """从候选池中筛选成交额最高的标的."""
-        if "成交额" not in universe_df.columns:
-            raise RuntimeError("候选池缺少成交额字段，无法进行成交额排序。")
+        if universe_df.empty:
+            raise RuntimeError("候选池为空，无法筛选流动性。")
+        if "amount" not in universe_df.columns:
+            raise RuntimeError("候选池缺少成交额字段，无法进行排序。")
 
-        sorted_df = universe_df.sort_values("成交额", ascending=False)
+        sorted_df = universe_df.sort_values("amount", ascending=False)
         return sorted_df.head(self.top_liquidity_count)

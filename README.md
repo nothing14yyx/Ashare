@@ -1,37 +1,27 @@
-# A 股接口清单导出工具
+# A 股数据采集示例（Baostock 版）
 
-基于 [AKShare](https://akshare.akfamily.xyz/) 数据字典构建的简单 A 股接口清单导出示例, 只专注于接口发现与保存。
+基于 [Baostock](http://www.baostock.com/) 的示例项目，展示如何登录会话、批量拉取股票列表与近 30 日日线数据，并按成交额筛选高流动性标的。
 
 ## 功能
-- 通过解析 AKShare 股票数据字典(`data/stock/stock.html`) 自动识别全部 A 股相关接口。
-- 自动将全部 A 股接口清单保存到 `output/a_share_interfaces.csv` 便于后续查阅（数据字典只用于文档探索, 不参与交易数据拉取）。
-- 基于实时行情构建当日候选池, 自动剔除 ST、停牌标的并标注次新股。
-- 额外输出成交额排序, 便于盘中选板块龙头或流动性筛选。
-- 交易数据（实时行情 / 日线 / 因子等）全部通过 `AshareCoreFetcher` 直接调用稳定的 AKShare 接口, 不依赖数据字典校验。
-- 提供脚本化入口 `start.py`, 直接运行后会输出接口清单并保存到 `output/` 目录。
+- 自动登录 Baostock，获取最近一个交易日的股票列表并保存到 `output/a_share_stock_list.csv`。
+- 拉取全市场最近 30 个交易日的日线数据，统一保存为 `output/history_recent_30_days.csv`。
+- 根据日线成交额构建候选池，剔除 ST/退市标的与停牌记录。
+- 输出成交额排序，便于快速定位高流动性标的：`output/a_share_top_liquidity.csv`。
+- 提供脚本化入口 `start.py`，直接运行即可完成上述流程。
 
 ## 使用方式
-1. 确保已安装依赖 (`pip install -r requirements.txt`)。
-2. 直接运行启动脚本:
+1. 确保已安装依赖（`pip install -r requirements.txt`）。
+2. 在项目根目录直接运行启动脚本：
    ```bash
    python start.py
    ```
-3. 输出文件默认保存在仓库根目录下的 `output/` 文件夹。
-   - `a_share_interfaces.csv`: A 股数据接口清单
-   - `a_share_universe.csv`: 剔除 ST、停牌并标注次新股后的实时行情
-   - `a_share_top_liquidity.csv`: 借助成交额排序的高流动性标的列表
+3. 输出文件默认保存在仓库根目录下的 `output/` 文件夹：
+   - `a_share_stock_list.csv`: 最近交易日的股票列表
+   - `history_recent_30_days.csv`: 全市场最近 30 个交易日的日线数据
+   - `a_share_universe.csv`: 剔除 ST、退市与停牌标的后的候选池
+   - `a_share_top_liquidity.csv`: 按成交额排序的高流动性标的列表
 
-### 使用代理网络
-如需通过代理访问网络资源 (例如本地代理端口为 `7890`), 可以在运行前设置环境变量:
-
-```bash
-export ASHARE_HTTP_PROXY="http://127.0.0.1:7890"
-export ASHARE_HTTPS_PROXY="http://127.0.0.1:7890"
-python start.py
-```
-
-脚本启动时会自动把上述配置应用到数据字典抓取流程中。
-
-## 说明
-- 由于部分环境的证书链不完整, 数据字典解析默认关闭证书校验; 如需开启, 可在 `DataDictionaryFetcher` 中把 `verify_ssl` 设置为 `True`。
-- 数据字典相关功能仅影响接口清单导出; 即使无法访问文档页面, 交易相关的数据导出依旧通过 `AshareCoreFetcher` 正常工作。
+## 注意事项
+- Baostock 需要登录才能正常请求接口，项目内的 `BaostockSession` 会自动处理登录与登出。
+- 若网络环境不稳定导致个别标的的历史日线为空，脚本会自动跳过并继续处理其他标的。
+- 生成候选池与流动性排序均依赖日线中的 `amount` 字段，如需调整排序逻辑可修改 `AshareUniverseBuilder`。

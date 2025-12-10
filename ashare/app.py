@@ -1,95 +1,137 @@
-"""A 股接口清单导出脚本入口."""
+"""基于 Baostock 的示例脚本入口."""
 
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Iterable
-
 import datetime as dt
+from pathlib import Path
+from typing import Iterable, Tuple
+
 import pandas as pd
 
-from .config import ProxyConfig
-from .core_fetcher import AshareCoreFetcher
-from .fetcher import AshareDataFetcher
+from .baostock_core import BaostockDataFetcher
+from .baostock_session import BaostockSession
 from .universe import AshareUniverseBuilder
 
 
 class AshareApp:
-    """通过脚本方式导出 A 股接口清单的应用."""
+    """通过脚本方式导出 Baostock 数据的应用."""
 
     def __init__(
         self,
         output_dir: str | Path = "output",
-        proxy_config: ProxyConfig | None = None,
         top_liquidity_count: int = 100,
-    ):
-        self.core_fetcher = AshareCoreFetcher()
-        self.fetcher = AshareDataFetcher(proxy_config=proxy_config)
+    ) -> None:
+        self.session = BaostockSession()
+        self.fetcher = BaostockDataFetcher(self.session)
         self.universe_builder = AshareUniverseBuilder(
             top_liquidity_count=top_liquidity_count,
-            fetcher=self.core_fetcher,
         )
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
-
-    def _print_interfaces(self, interfaces: Iterable[str]) -> None:
-        preview = list(interfaces)
-        print(f"数据字典共发现 {len(preview)} 个 A 股接口, 前 10 个预览:")
-        for name in preview[:10]:
-            print(f" - {name}")
-
-    def _save_interfaces(self, interfaces: Iterable[str]) -> Path:
-        interfaces_df = pd.DataFrame({"interface": list(interfaces)})
-        return self._save_sample(interfaces_df, "a_share_interfaces.csv")
 
     def _save_sample(self, df: pd.DataFrame, filename: str) -> Path:
         target = self.output_dir / filename
         df.to_csv(target, index=False)
         return target
 
+    def _export_stock_list(self, trade_date: str) -> Path:
+        stock_df = self.fetcher.get_stock_list(trade_date)
+        if stock_df.empty:
+            raise RuntimeError("获取股票列表失败：返回为空。")
+
+        path = self._save_sample(stock_df, "a_share_stock_list.csv")
+        print(f"已保存 {len(stock_df)} 只股票的列表至 {path}")
+        return path
+
+    def _export_recent_daily_history(
+        self, stock_df: pd.DataFrame, end_date: str, days: int = 30
+    ) -> Tuple[pd.DataFrame, Path]:
+        if stock_df.empty or "code" not in stock_df.columns:
+            raise RuntimeError("导出历史日线失败：股票列表为空或缺少 code 列。")
+
+        end_day = dt.datetime.strptime(end_date, "%Y-%m-%d").date()
+        start_day = (end_day - dt.timedelta(days=days * 3)).isoformat()
+
+        history_frames: list[pd.DataFrame] = []
+        for code in stock_df["code"]:
+            daily_df = self.fetcher.get_kline(
+                code=code,
+                start_date=start_day,
+                end_date=end_date,
+                freq="d",
+                adjustflag="1",
+            )
+            if daily_df.empty:
+                continue
+
+            numeric_cols = ["amount", "volume", "close", "open", "high", "low"]
+            for col in numeric_cols:
+                if col in daily_df.columns:
+                    daily_df[col] = pd.to_numeric(daily_df[col], errors="coerce")
+
+            history_frames.append(daily_df)
+
+        if not history_frames:
+            raise RuntimeError("导出历史日线失败：全部股票均未返回数据。")
+
+        combined = pd.concat(history_frames, ignore_index=True)
+        combined_path = self._save_sample(
+            combined, f"history_recent_{days}_days.csv"
+        )
+        print(
+            "已导出最近 {days} 个交易日的历史数据，共 {rows} 行，路径：{path}".format(
+                days=days, rows=len(combined), path=combined_path
+            )
+        )
+        return combined, combined_path
+
+    def _print_preview(self, interfaces: Iterable[str]) -> None:
+        preview = list(interfaces)
+        print(f"已发现 {len(preview)} 个项目组件，前 10 个预览：")
+        for name in preview[:10]:
+            print(f" - {name}")
+
     def run(self) -> None:
-        """执行接口清单导出示例.
+        """执行 Baostock 数据导出与候选池筛选示例。"""
 
-        1. 输出 A 股数据接口列表的摘要;
-        2. 将接口清单写入 CSV 便于查阅;
-        3. 导出全市场实时行情与最近 30 日历史日线数据;
-        4. 构建剔除 ST/停牌标的的候选池并筛选高流动性标的。
-        """
+        # 1) 预览当前模块内可用组件（示例信息输出）
+        self._print_preview(
+            [
+                "BaostockSession",
+                "BaostockDataFetcher",
+                "AshareUniverseBuilder",
+            ]
+        )
 
-        interfaces: list[str] | None = None
+        # 2) 获取最近交易日并导出股票列表
+        latest_trade_day = self.fetcher.get_latest_trading_date()
+        print(f"最近交易日：{latest_trade_day}")
         try:
-            interfaces = self.fetcher.available_interfaces()
+            stock_list_path = self._export_stock_list(latest_trade_day)
         except RuntimeError as exc:
-            print(f"加载数据字典失败: {exc}")
-            print("数据字典仅用于接口清单导出，不影响交易数据流程。")
+            print(f"导出股票列表失败: {exc}")
+            return
 
-        if interfaces:
-            self._print_interfaces(interfaces)
-            saved_interfaces = self._save_interfaces(interfaces)
-            print(f"已将全部接口名称保存至 {saved_interfaces}")
+        stock_df = pd.read_csv(stock_list_path)
 
+        # 3) 导出最近 30 日历史日线
         try:
-            realtime_quotes_path = self.export_realtime_quotes(self.output_dir)
-        except RuntimeError as exc:
-            print(f"导出实时行情失败: {exc}")
-        else:
-            print(f"已导出全市场实时行情至 {realtime_quotes_path}")
-
-        try:
-            history_path = self.export_recent_daily_history(self.output_dir, days=30)
+            history_df, history_path = self._export_recent_daily_history(
+                stock_df, latest_trade_day, days=30
+            )
         except RuntimeError as exc:
             print(f"导出最近 30 个交易日的日线数据失败: {exc}")
-        else:
-            print(f"已导出最近 30 个交易日的历史数据至 {history_path}")
+            return
 
+        # 4) 构建候选池并挑选成交额前 N 名
         try:
-            universe_df = self.universe_builder.build_universe()
+            universe_df = self.universe_builder.build_universe(stock_df, history_df)
         except RuntimeError as exc:
             print(f"生成当日候选池失败: {exc}")
             return
 
         universe_path = self._save_sample(universe_df, "a_share_universe.csv")
-        print(f"已生成剔除 ST/停牌的候选池: {universe_path}")
+        print(f"已生成候选池：{universe_path}")
 
         try:
             top_liquidity = self.universe_builder.pick_top_liquidity(universe_df)
@@ -101,103 +143,13 @@ class AshareApp:
             top_liquidity, "a_share_top_liquidity.csv"
         )
         print(
-            "已将成交额排序结果写入 "
-            f"{top_liquidity_path}, 可用于盘中选板块龙头或流动性筛选。"
-        )
-
-    def export_realtime_quotes(self, output_dir: Path) -> Path:
-        """使用 AshareCoreFetcher 导出全市场实时行情到 CSV。"""
-        df = self.core_fetcher.get_realtime_all_a()
-        if df.empty:
-            raise RuntimeError("导出实时行情失败：A 股实时行情为空。")
-
-        out_path = output_dir / "realtime_quotes.csv"
-        df.to_csv(out_path, index=False, encoding="utf-8-sig")
-        print(f"已导出全市场实时行情至 {out_path}")
-        return out_path
-
-    def export_recent_daily_history(self, output_dir: Path, days: int = 30) -> Path:
-        """
-        拉取最近 N 日（例如 30 日）的日线数据，并导出到 CSV。
-
-        简化版本建议：
-        - 先用 get_realtime_all_a() 拿到全市场代码列表；
-        - 对每个代码，使用 get_daily_a_sina(...) 拉取一段时间；
-        - 只取最近 `days` 个交易日的数据；
-        - 合并成一个大 DataFrame（增加一列代码），写出 CSV。
-        """
-        # 1) 优先使用 fetcher 内缓存（如果前面已经成功获取过全市场行情，会在这里命中）
-        spot_df = self.core_fetcher.get_realtime_all_a()
-
-        # 2) 如果缓存为空，尝试从 realtime_quotes.csv 读取
-        if spot_df.empty or "代码" not in spot_df.columns:
-            realtime_path = output_dir / "realtime_quotes.csv"
-            if realtime_path.exists():
-                try:
-                    spot_df = pd.read_csv(realtime_path)
-                except Exception as e:  # noqa: BLE001
-                    print(f"[WARN] 读取 {realtime_path} 失败: {e}")
-                    spot_df = pd.DataFrame()
-
-        # 3) 兜底：再尝试一次强制调用接口（可能会被风控，但作为最后尝试）
-        if spot_df.empty or "代码" not in spot_df.columns:
-            spot_df = self.core_fetcher.get_realtime_all_a(use_cache=False)
-
-        if spot_df.empty or "代码" not in spot_df.columns:
-            raise RuntimeError("导出历史日线失败：无法获取全市场代码列表。")
-
-        codes = (
-            spot_df["代码"]
-            .dropna()
-            .astype(str)
-            .unique()
-        )
-
-        # 为了只拉最近 N 个交易日附近的数据，
-        # 这里按自然日往前多给一点冗余（例如 N*3），避免遇到节假日导致天数不够。
-        today = dt.date.today()
-        # 例如 N=30，则取最近 90 个自然日的区间
-        start_date = today - dt.timedelta(days=days * 3)
-        start_str = start_date.strftime("%Y%m%d")
-        end_str = today.strftime("%Y%m%d")
-
-        history_frames = []
-        for code in codes:
-            symbol = self._to_sina_symbol(code)
-            daily_df = self.core_fetcher.get_daily_a_sina(
-                symbol=symbol,
-                start_date=start_str,
-                end_date=end_str,
-                adjust="",
+            "已将成交额排序结果写入 {path}，可用于筛选高流动性标的。".format(
+                path=top_liquidity_path
             )
-            if daily_df.empty:
-                continue
+        )
 
-            # 保险起见，仍然只保留最近 N 个交易日
-            trimmed = daily_df.tail(days).copy()
-            trimmed.insert(0, "代码", code)
-            history_frames.append(trimmed)
-
-        if not history_frames:
-            raise RuntimeError("导出历史日线失败：所有股票的日线数据均为空。")
-
-        combined = pd.concat(history_frames, ignore_index=True)
-        out_path = output_dir / f"history_recent_{days}_days.csv"
-        combined.to_csv(out_path, index=False, encoding="utf-8-sig")
-        return out_path
-
-    @staticmethod
-    def _to_sina_symbol(code: str) -> str:
-        """将六位代码转换为新浪日线接口需要的带交易所前缀的代码."""
-        normalized = code.strip()
-        if not normalized:
-            return normalized
-
-        if normalized.startswith(("5", "6", "9")):
-            prefix = "sh"
-        else:
-            prefix = "sz"
-        return f"{prefix}{normalized}"
+        # 5) 提示历史日线路径
+        print(f"历史日线数据已保存：{history_path}")
 
 
 if __name__ == "__main__":
