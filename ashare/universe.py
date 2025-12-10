@@ -16,14 +16,37 @@ class AshareUniverseBuilder:
     ) -> None:
         self.top_liquidity_count = top_liquidity_count
 
-    def _infer_st_codes(self, stock_df: pd.DataFrame) -> Set[str]:
+    def _infer_st_codes(
+        self, stock_df: pd.DataFrame, history_df: pd.DataFrame
+    ) -> Set[str]:
         if "code" not in stock_df.columns or "code_name" not in stock_df.columns:
             return set()
 
         names = stock_df["code_name"].astype(str)
-        mask_st = names.str.startswith("ST") | names.str.startswith("*ST")
-        mask_tui = names.str.contains("退")
-        return set(stock_df.loc[mask_st | mask_tui, "code"])
+        mask_name = (
+            names.str.contains(r"^(ST|\*ST)", regex=True, case=False)
+            | names.str.contains(r"(退|delist)", regex=True, case=False)
+        )
+
+        st_candidates = set(stock_df.loc[mask_name, "code"])
+
+        if history_df.empty:
+            return st_candidates
+
+        required_cols = {"code", "date", "isST"}
+        if not required_cols.issubset(history_df.columns):
+            return st_candidates
+
+        latest_kline = (
+            history_df.sort_values("date")
+            .groupby("code", as_index=False)
+            .tail(1)
+            .reset_index(drop=True)
+        )
+        mask_official = latest_kline["isST"].astype(str) == "1"
+        st_candidates.update(set(latest_kline.loc[mask_official, "code"]))
+
+        return st_candidates
 
     def _infer_stop_codes(self, latest_kline: pd.DataFrame) -> Set[str]:
         cols = latest_kline.columns
@@ -52,7 +75,7 @@ class AshareUniverseBuilder:
             .reset_index(drop=True)
         )
 
-        st_codes = self._infer_st_codes(stock_df)
+        st_codes = self._infer_st_codes(stock_df, history_df)
         stop_codes = self._infer_stop_codes(latest_rows)
         bad_codes = st_codes | stop_codes
 
