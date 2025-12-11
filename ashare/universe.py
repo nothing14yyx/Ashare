@@ -13,8 +13,10 @@ class AshareUniverseBuilder:
     def __init__(
         self,
         top_liquidity_count: int = 100,
+        min_listing_days: int = 60,
     ) -> None:
         self.top_liquidity_count = top_liquidity_count
+        self.min_listing_days = min_listing_days
 
     def _infer_st_codes(
         self, stock_df: pd.DataFrame, latest_kline: pd.DataFrame
@@ -55,12 +57,51 @@ class AshareUniverseBuilder:
         return set()
 
     def build_universe(
-        self, stock_df: pd.DataFrame, history_df: pd.DataFrame
+        self,
+        stock_df: pd.DataFrame,
+        history_df: pd.DataFrame,
+        stock_basic_df: pd.DataFrame | None = None,
+        industry_df: pd.DataFrame | None = None,
+        index_membership: dict[str, set[str]] | None = None,
     ) -> pd.DataFrame:
         if stock_df.empty:
             raise RuntimeError("候选池构建失败：股票列表为空。")
         if history_df.empty:
             raise RuntimeError("候选池构建失败：历史日线数据为空。")
+
+        latest_trade_date = None
+        if "date" in history_df.columns:
+            latest_trade_date = (
+                pd.to_datetime(history_df["date"], errors="coerce")
+                .dropna()
+                .max()
+            )
+
+        filtered_stock_df = stock_df.copy()
+        if stock_basic_df is not None and not stock_basic_df.empty:
+            filtered_stock_df = filtered_stock_df.merge(
+                stock_basic_df,
+                on="code",
+                how="left",
+                suffixes=(None, "_basic"),
+            )
+
+            type_col = filtered_stock_df.get("type")
+            status_col = filtered_stock_df.get("status")
+            if type_col is not None and status_col is not None:
+                filtered_stock_df = filtered_stock_df[
+                    (pd.to_numeric(type_col, errors="coerce") == 1)
+                    & (pd.to_numeric(status_col, errors="coerce") == 1)
+                ]
+
+            if latest_trade_date is not None and "ipoDate" in filtered_stock_df.columns:
+                ipo_dates = pd.to_datetime(
+                    filtered_stock_df["ipoDate"], errors="coerce"
+                )
+                age_days = (latest_trade_date - ipo_dates).dt.days
+                filtered_stock_df = filtered_stock_df[
+                    (age_days >= self.min_listing_days) | age_days.isna()
+                ]
 
         # 提取每个标的最新一个交易日的日线数据
         latest_rows = (
@@ -70,11 +111,11 @@ class AshareUniverseBuilder:
             .reset_index(drop=True)
         )
 
-        st_codes = self._infer_st_codes(stock_df, latest_rows)
+        st_codes = self._infer_st_codes(filtered_stock_df, latest_rows)
         stop_codes = self._infer_stop_codes(latest_rows)
         bad_codes = st_codes | stop_codes
 
-        merged = stock_df.merge(latest_rows, on="code", how="left")
+        merged = filtered_stock_df.merge(latest_rows, on="code", how="left")
         filtered = merged[~merged["code"].isin(bad_codes)].copy()
 
         # --- 新增：解决 MySQL 大小写不敏感导致的重复列名问题 ---
@@ -84,6 +125,19 @@ class AshareUniverseBuilder:
             # 这里保留日线里的 `tradestatus`，删除股票列表里的 `tradeStatus`
             filtered = filtered.drop(columns=["tradeStatus"])
         # --- 新增结束 ---
+
+        if industry_df is not None and not industry_df.empty:
+            filtered = filtered.merge(
+                industry_df,
+                on="code",
+                how="left",
+                suffixes=(None, "_industry"),
+            )
+
+        if index_membership:
+            for index_name, members in index_membership.items():
+                flag_col = f"in_{index_name}"
+                filtered[flag_col] = filtered["code"].isin(members)
 
         if "amount" in filtered.columns:
             filtered["amount"] = pd.to_numeric(filtered["amount"], errors="coerce")

@@ -62,6 +62,63 @@ class BaostockDataFetcher:
         )
         return str(latest_date)
 
+    def get_stock_basic(
+        self, code: str | None = None, code_name: str | None = None
+    ) -> pd.DataFrame:
+        """查询证券基本资料。"""
+
+        self._ensure_session()
+        rs = bs.query_stock_basic(code=code, code_name=code_name)
+        df = self._resultset_to_df(rs)
+        if df.empty:
+            return df
+
+        date_cols = ["ipoDate", "outDate", "endDate"]
+        for col in date_cols:
+            if col in df.columns:
+                df[col] = pd.to_datetime(df[col], errors="coerce")
+        for col in ["type", "status"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        return df
+
+    def get_stock_industry(self, code: str | None = None) -> pd.DataFrame:
+        """查询行业分类信息。"""
+
+        self._ensure_session()
+        rs = bs.query_stock_industry(code=code)
+        df = self._resultset_to_df(rs)
+        if df.empty:
+            return df
+
+        if "updateDate" in df.columns:
+            df["updateDate"] = pd.to_datetime(df["updateDate"], errors="coerce")
+        return df
+
+    def get_index_members(self, index: str, date: str | None = None) -> pd.DataFrame:
+        """查询指定指数的成分股列表。"""
+
+        self._ensure_session()
+        index_map = {
+            "hs300": bs.query_hs300_stocks,
+            "zz500": bs.query_zz500_stocks,
+            "sz50": bs.query_sz50_stocks,
+        }
+        index_key = index.lower()
+        if index_key not in index_map:
+            raise ValueError("暂不支持的指数标识：{value}".format(value=index))
+
+        query_fn = index_map[index_key]
+        rs = query_fn(date=date) if date else query_fn()
+        df = self._resultset_to_df(rs)
+        if df.empty:
+            return df
+
+        df.insert(0, "index", index_key)
+        if "updateDate" in df.columns:
+            df["updateDate"] = pd.to_datetime(df["updateDate"], errors="coerce")
+        return df
+
     def get_stock_list(self, trade_date: str, fallback_days: int = 15) -> pd.DataFrame:
         """按交易日获取 A 股列表。
 

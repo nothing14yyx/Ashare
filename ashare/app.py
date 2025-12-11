@@ -26,6 +26,7 @@ class AshareApp:
         output_dir: str | Path = "output",
         top_liquidity_count: int | None = None,
         history_days: int | None = None,
+        min_listing_days: int | None = None,
     ) -> None:
         # 保持入口参数兼容性
         self.output_dir = Path(output_dir)
@@ -43,10 +44,16 @@ class AshareApp:
             if top_liquidity_count is not None
             else self._read_int_from_env("ASHARE_TOP_LIQUIDITY_COUNT", 100)
         )
+        resolved_min_listing_days = (
+            min_listing_days
+            if min_listing_days is not None
+            else self._read_int_from_env("ASHARE_MIN_LISTING_DAYS", 60)
+        )
         self.logger.info(
-            "参数配置：history_days=%s, top_liquidity_count=%s",
+            "参数配置：history_days=%s, top_liquidity_count=%s, min_listing_days=%s",
             self.history_days,
             resolved_top_liquidity,
+            resolved_min_listing_days,
         )
 
         self.db_config = DatabaseConfig.from_env()
@@ -62,6 +69,7 @@ class AshareApp:
         self.fetcher = BaostockDataFetcher(self.session)
         self.universe_builder = AshareUniverseBuilder(
             top_liquidity_count=resolved_top_liquidity,
+            min_listing_days=resolved_min_listing_days,
         )
 
     def _save_sample(self, df: pd.DataFrame, table_name: str) -> str:
@@ -132,6 +140,45 @@ class AshareApp:
         table_name = self._save_sample(stock_df, "a_share_stock_list")
         self.logger.info("已保存 %s 只股票的列表至表 %s", len(stock_df), table_name)
         return stock_df
+
+    def _export_stock_basic(self) -> pd.DataFrame:
+        stock_basic_df = self.fetcher.get_stock_basic()
+        if stock_basic_df.empty:
+            raise RuntimeError("获取证券基本资料失败：返回为空。")
+
+        table_name = self._save_sample(stock_basic_df, "a_share_stock_basic")
+        self.logger.info("已保存证券基本资料至表 %s", table_name)
+        return stock_basic_df
+
+    def _export_stock_industry(self) -> pd.DataFrame:
+        industry_df = self.fetcher.get_stock_industry()
+        if industry_df.empty:
+            raise RuntimeError("获取行业分类信息失败：返回为空。")
+
+        table_name = self._save_sample(industry_df, "a_share_stock_industry")
+        self.logger.info("已保存行业分类信息至表 %s", table_name)
+        return industry_df
+
+    def _export_index_members(self, latest_trade_day: str) -> dict[str, set[str]]:
+        index_membership: dict[str, set[str]] = {}
+        for index_name in ("hs300", "zz500", "sz50"):
+            try:
+                members_df = self.fetcher.get_index_members(index_name, latest_trade_day)
+            except Exception as exc:  # noqa: BLE001
+                self.logger.warning("获取 %s 成分股失败: %s", index_name, exc)
+                continue
+
+            if members_df.empty:
+                self.logger.warning("指数 %s 成分股返回为空，已跳过。", index_name)
+                continue
+
+            table_name = self._save_sample(
+                members_df, f"index_{index_name}_members"
+            )
+            self.logger.info("已保存 %s 成分股至表 %s", index_name, table_name)
+            index_membership[index_name] = set(members_df.get("code", []))
+
+        return index_membership
 
     def _export_recent_daily_history(
         self, stock_df: pd.DataFrame, end_date: str, days: int = 30
@@ -408,6 +455,21 @@ class AshareApp:
                 self.logger.error("导出股票列表失败: %s", exc)
                 return
 
+            try:
+                stock_basic_df = self._export_stock_basic()
+            except RuntimeError as exc:
+                self.logger.warning(
+                    "导出证券基本资料失败: %s，将跳过上市状态与上市天数过滤。",
+                    exc,
+                )
+                stock_basic_df = None
+
+            try:
+                industry_df = self._export_stock_industry()
+            except RuntimeError as exc:
+                self.logger.error("导出行业分类数据失败: %s", exc)
+                return
+
             # 3) 导出最近 N 日历史日线（增量模式）
             try:
                 history_df, history_table = self._export_daily_history_incremental(
@@ -427,7 +489,11 @@ class AshareApp:
             # 4) 构建候选池并挑选成交额前 N 名
             try:
                 universe_df = self.universe_builder.build_universe(
-                    stock_df, history_df
+                    stock_df,
+                    history_df,
+                    stock_basic_df=stock_basic_df,
+                    industry_df=industry_df,
+                    index_membership=self._export_index_members(latest_trade_day),
                 )
             except RuntimeError as exc:
                 self.logger.error("生成当日候选池失败: %s", exc)
