@@ -12,6 +12,7 @@ from tqdm import tqdm
 from .baostock_core import BaostockDataFetcher
 from .baostock_session import BaostockSession
 from .config import ProxyConfig
+from .db import DatabaseConfig, MySQLWriter
 from .universe import AshareUniverseBuilder
 from .utils import setup_logger
 
@@ -24,12 +25,14 @@ class AshareApp:
         output_dir: str | Path = "output",
         top_liquidity_count: int = 100,
     ) -> None:
-        # 所有导出的 CSV 之类的数据，仍然放在 output 目录
+        # 保持入口参数兼容性
         self.output_dir = Path(output_dir)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
 
         # 日志改为写到项目根目录的 ashare.log，不再跟 output 绑在一起
         self.logger = setup_logger()
+
+        self.db_config = DatabaseConfig.from_env()
+        self.db_writer = MySQLWriter(self.db_config)
 
         proxy_config = ProxyConfig.from_env()
         proxy_config.apply_to_environment()
@@ -43,23 +46,22 @@ class AshareApp:
             top_liquidity_count=top_liquidity_count,
         )
 
-    def _save_sample(self, df: pd.DataFrame, filename: str) -> Path:
-        target = self.output_dir / filename
-        df.to_csv(target, index=False)
-        return target
+    def _save_sample(self, df: pd.DataFrame, table_name: str) -> str:
+        self.db_writer.write_dataframe(df, table_name)
+        return table_name
 
-    def _export_stock_list(self, trade_date: str) -> Path:
+    def _export_stock_list(self, trade_date: str) -> pd.DataFrame:
         stock_df = self.fetcher.get_stock_list(trade_date)
         if stock_df.empty:
             raise RuntimeError("获取股票列表失败：返回为空。")
 
-        path = self._save_sample(stock_df, "a_share_stock_list.csv")
-        self.logger.info("已保存 %s 只股票的列表至 %s", len(stock_df), path)
-        return path
+        table_name = self._save_sample(stock_df, "a_share_stock_list")
+        self.logger.info("已保存 %s 只股票的列表至表 %s", len(stock_df), table_name)
+        return stock_df
 
     def _export_recent_daily_history(
         self, stock_df: pd.DataFrame, end_date: str, days: int = 30
-    ) -> Tuple[pd.DataFrame, Path]:
+    ) -> Tuple[pd.DataFrame, str]:
         if stock_df.empty or "code" not in stock_df.columns:
             raise RuntimeError("导出历史日线失败：股票列表为空或缺少 code 列。")
 
@@ -102,16 +104,14 @@ class AshareApp:
             raise RuntimeError("导出历史日线失败：全部股票均未返回数据。")
 
         combined = pd.concat(history_frames, ignore_index=True)
-        combined_path = self._save_sample(
-            combined, f"history_recent_{days}_days.csv"
-        )
+        combined_table = self._save_sample(combined, f"history_recent_{days}_days")
         self.logger.info(
-            "已导出最近 %s 个交易日的历史数据，共 %s 行，路径：%s",
+            "已导出最近 %s 个交易日的历史数据，共 %s 行，表名：%s",
             days,
             len(combined),
-            combined_path,
+            combined_table,
         )
-        return combined, combined_path
+        return combined, combined_table
 
     def _print_preview(self, interfaces: Iterable[str]) -> None:
         preview = list(interfaces)
@@ -122,65 +122,68 @@ class AshareApp:
     def run(self) -> None:
         """执行 Baostock 数据导出与候选池筛选示例。"""
 
-        # 1) 预览当前模块内可用组件（示例信息输出）
-        self._print_preview(
-            [
-                "BaostockSession",
-                "BaostockDataFetcher",
-                "AshareUniverseBuilder",
-            ]
-        )
-
-        # 2) 获取最近交易日并导出股票列表
-        latest_trade_day = self.fetcher.get_latest_trading_date()
-        self.logger.info("最近交易日：%s", latest_trade_day)
         try:
-            stock_list_path = self._export_stock_list(latest_trade_day)
-        except RuntimeError as exc:
-            self.logger.error("导出股票列表失败: %s", exc)
-            return
-
-        stock_df = pd.read_csv(stock_list_path)
-
-        # 3) 导出最近 30 日历史日线
-        try:
-            history_df, history_path = self._export_recent_daily_history(
-                stock_df, latest_trade_day, days=30
+            # 1) 预览当前模块内可用组件（示例信息输出）
+            self._print_preview(
+                [
+                    "BaostockSession",
+                    "BaostockDataFetcher",
+                    "AshareUniverseBuilder",
+                ]
             )
-        except RuntimeError as exc:
-            self.logger.error("导出最近 30 个交易日的日线数据失败: %s", exc)
-            return
 
-        # 4) 构建候选池并挑选成交额前 N 名
-        try:
-            universe_df = self.universe_builder.build_universe(stock_df, history_df)
-        except RuntimeError as exc:
-            self.logger.error("生成当日候选池失败: %s", exc)
-            return
+            # 2) 获取最近交易日并导出股票列表
+            latest_trade_day = self.fetcher.get_latest_trading_date()
+            self.logger.info("最近交易日：%s", latest_trade_day)
+            try:
+                stock_df = self._export_stock_list(latest_trade_day)
+            except RuntimeError as exc:
+                self.logger.error("导出股票列表失败: %s", exc)
+                return
 
-        universe_path = self._save_sample(universe_df, "a_share_universe.csv")
-        self.logger.info("已生成候选池：%s", universe_path)
+            # 3) 导出最近 30 日历史日线
+            try:
+                history_df, history_table = self._export_recent_daily_history(
+                    stock_df, latest_trade_day, days=30
+                )
+            except RuntimeError as exc:
+                self.logger.error("导出最近 30 个交易日的日线数据失败: %s", exc)
+                return
 
-        try:
-            top_liquidity = self.universe_builder.pick_top_liquidity(universe_df)
-        except RuntimeError as exc:
-            self.logger.error(
-                "挑选成交额前 %s 名失败: %s",
-                self.universe_builder.top_liquidity_count,
-                exc,
+            # 4) 构建候选池并挑选成交额前 N 名
+            try:
+                universe_df = self.universe_builder.build_universe(
+                    stock_df, history_df
+                )
+            except RuntimeError as exc:
+                self.logger.error("生成当日候选池失败: %s", exc)
+                return
+
+            universe_table = self._save_sample(universe_df, "a_share_universe")
+            self.logger.info("已生成候选池：表 %s", universe_table)
+
+            try:
+                top_liquidity = self.universe_builder.pick_top_liquidity(universe_df)
+            except RuntimeError as exc:
+                self.logger.error(
+                    "挑选成交额前 %s 名失败: %s",
+                    self.universe_builder.top_liquidity_count,
+                    exc,
+                )
+                return
+
+            top_liquidity_table = self._save_sample(
+                top_liquidity, "a_share_top_liquidity"
             )
-            return
+            self.logger.info(
+                "已将成交额排序结果写入表 %s，可用于筛选高流动性标的。",
+                top_liquidity_table,
+            )
 
-        top_liquidity_path = self._save_sample(
-            top_liquidity, "a_share_top_liquidity.csv"
-        )
-        self.logger.info(
-            "已将成交额排序结果写入 %s，可用于筛选高流动性标的。",
-            top_liquidity_path,
-        )
-
-        # 5) 提示历史日线路径
-        self.logger.info("历史日线数据已保存：%s", history_path)
+            # 5) 提示历史日线路径
+            self.logger.info("历史日线数据已保存至表：%s", history_table)
+        finally:
+            self.db_writer.dispose()
 
 
 if __name__ == "__main__":
