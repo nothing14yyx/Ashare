@@ -244,6 +244,117 @@ class BaostockDataFetcher:
         rs = bs.query_cash_flow_data(code=code, year=year, quarter=quarter)
         return self._resultset_to_df(rs)
 
+    def get_operation_data(self, code: str, year: int, quarter: int) -> pd.DataFrame:
+        """获取营运能力数据。"""
+
+        self._ensure_session()
+        rs = bs.query_operation_data(code=code, year=year, quarter=quarter)
+        return self._resultset_to_df(rs)
+
+    def get_dupont_data(self, code: str, year: int, quarter: int) -> pd.DataFrame:
+        """获取杜邦指标数据。"""
+
+        self._ensure_session()
+        rs = bs.query_dupont_data(code=code, year=year, quarter=quarter)
+        return self._resultset_to_df(rs)
+
+    def get_performance_express_report(
+        self, code: str, start_date: str | None = None, end_date: str | None = None
+    ) -> pd.DataFrame:
+        """获取业绩快报。"""
+
+        self._ensure_session()
+        rs = bs.query_performance_express_report(
+            code=code, start_date=start_date, end_date=end_date
+        )
+        return self._resultset_to_df(rs)
+
+    def get_forecast_report(
+        self, code: str, start_date: str | None = None, end_date: str | None = None
+    ) -> pd.DataFrame:
+        """获取业绩预告。"""
+
+        self._ensure_session()
+        rs = bs.query_forecast_report(code=code, start_date=start_date, end_date=end_date)
+        return self._resultset_to_df(rs)
+
+    def get_dividend_data(
+        self, code: str, year: int, year_type: str = "report"
+    ) -> pd.DataFrame:
+        """获取分红送配信息。"""
+
+        self._ensure_session()
+        rs = bs.query_dividend_data(code=code, year=year, yearType=year_type)
+        return self._resultset_to_df(rs)
+
+    def get_adjust_factor(
+        self, code: str, start_date: str | None = None, end_date: str | None = None
+    ) -> pd.DataFrame:
+        """获取复权因子信息。"""
+
+        self._ensure_session()
+        rs = bs.query_adjust_factor(code=code, start_date=start_date, end_date=end_date)
+        return self._resultset_to_df(rs)
+
+    def get_deposit_rate_data(
+        self, start_date: str = "", end_date: str = ""
+    ) -> pd.DataFrame:
+        """获取存款利率数据。"""
+
+        self._ensure_session()
+        rs = bs.query_deposit_rate_data(start_date=start_date, end_date=end_date)
+        return self._resultset_to_df(rs)
+
+    def get_loan_rate_data(
+        self, start_date: str = "", end_date: str = ""
+    ) -> pd.DataFrame:
+        """获取贷款利率数据。"""
+
+        self._ensure_session()
+        rs = bs.query_loan_rate_data(start_date=start_date, end_date=end_date)
+        return self._resultset_to_df(rs)
+
+    def get_required_reserve_ratio_data(
+        self, start_date: str = "", end_date: str = "", year_type: str = "0"
+    ) -> pd.DataFrame:
+        """获取存款准备金率数据。"""
+
+        self._ensure_session()
+        rs = bs.query_required_reserve_ratio_data(
+            start_date=start_date, end_date=end_date, yearType=year_type
+        )
+        return self._resultset_to_df(rs)
+
+    def get_money_supply_data_month(
+        self, start_date: str = "", end_date: str = ""
+    ) -> pd.DataFrame:
+        """获取月度货币供应量数据。"""
+
+        self._ensure_session()
+        rs = bs.query_money_supply_data_month(start_date=start_date, end_date=end_date)
+        return self._resultset_to_df(rs)
+
+    def get_money_supply_data_year(
+        self, start_date: str = "", end_date: str = ""
+    ) -> pd.DataFrame:
+        """获取年度货币供应量数据。"""
+
+        self._ensure_session()
+        rs = bs.query_money_supply_data_year(start_date=start_date, end_date=end_date)
+        return self._resultset_to_df(rs)
+
+    def get_shibor_data(
+        self, start_date: str = "", end_date: str = ""
+    ) -> pd.DataFrame:
+        """获取银行间同业拆借利率（Shibor）。"""
+
+        if not hasattr(bs, "query_shibor_data"):
+            raise RuntimeError("当前 Baostock 版本不支持 Shibor 接口。")
+
+        self._ensure_session()
+        rs = bs.query_shibor_data(start_date=start_date, end_date=end_date)
+        return self._resultset_to_df(rs)
+
 
 if __name__ == "__main__":
     session = BaostockSession()

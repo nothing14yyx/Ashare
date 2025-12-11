@@ -14,6 +14,7 @@ from .baostock_core import BaostockDataFetcher
 from .baostock_session import BaostockSession
 from .config import ProxyConfig
 from .db import DatabaseConfig, MySQLWriter
+from .fundamental_manager import FundamentalDataManager
 from .universe import AshareUniverseBuilder
 from .utils import setup_logger
 
@@ -70,6 +71,9 @@ class AshareApp:
         self.universe_builder = AshareUniverseBuilder(
             top_liquidity_count=resolved_top_liquidity,
             min_listing_days=resolved_min_listing_days,
+        )
+        self.fundamental_manager = FundamentalDataManager(
+            self.fetcher, self.db_writer, self.logger
         )
 
     def _save_sample(self, df: pd.DataFrame, table_name: str) -> str:
@@ -433,6 +437,62 @@ class AshareApp:
         for name in preview[:10]:
             self.logger.info(" - %s", name)
 
+    def _apply_fundamental_filters(
+        self, universe_df: pd.DataFrame, fundamentals_df: pd.DataFrame
+    ) -> pd.DataFrame:
+        if fundamentals_df.empty:
+            self.logger.info("未生成财务宽表，跳过基本面过滤。")
+            return universe_df
+
+        merged = universe_df.merge(fundamentals_df, on="code", how="left")
+
+        def _select_column(df: pd.DataFrame, candidates: list[str]) -> str | None:
+            for col in candidates:
+                if col in df.columns:
+                    return col
+            return None
+
+        def _filter_numeric(
+            df: pd.DataFrame, candidates: list[str], predicate, desc: str
+        ) -> pd.DataFrame:
+            target_col = _select_column(df, candidates)
+            if target_col is None:
+                self.logger.info("缺少 %s 指标列，跳过该条件。", desc)
+                return df
+
+            series = pd.to_numeric(df[target_col], errors="coerce")
+            before = len(df)
+            df = df[predicate(series)]
+            self.logger.info("%s 过滤：%s -> %s", desc, before, len(df))
+            return df
+
+        merged = _filter_numeric(
+            merged,
+            ["profit_roeAvg", "profit_roe", "dupont_dupontROE"],
+            lambda s: s > 0,
+            "ROE 为正",
+        )
+        merged = _filter_numeric(
+            merged,
+            ["balance_liabilityToAsset", "balance_assetLiabRatio"],
+            lambda s: s < 0.75,
+            "资产负债率 < 75%",
+        )
+        merged = _filter_numeric(
+            merged,
+            ["cash_flow_CFOToNP", "cash_flow_CFOToOR", "cash_flow_CFOToGr"],
+            lambda s: s > 0,
+            "经营现金流为正（按 CFO 比率代理）",
+        )
+        merged = _filter_numeric(
+            merged,
+            ["growth_YOYNI", "growth_YOYPNI", "growth_YOYEPSBasic"],
+            lambda s: s > 0,
+            "净利润或 EPS 同比为正",
+        )
+
+        return merged
+
     def run(self) -> None:
         """执行 Baostock 数据导出与候选池筛选示例。"""
 
@@ -443,6 +503,7 @@ class AshareApp:
                     "BaostockSession",
                     "BaostockDataFetcher",
                     "AshareUniverseBuilder",
+                    "FundamentalDataManager",
                 ]
             )
 
@@ -470,6 +531,31 @@ class AshareApp:
                 self.logger.error("导出行业分类数据失败: %s", exc)
                 return
 
+            index_membership = self._export_index_members(latest_trade_day)
+            fundamentals_wide = pd.DataFrame()
+            try:
+                fundamental_codes: set[str] = set().union(*index_membership.values())
+                if not fundamental_codes:
+                    fallback_count = min(
+                        self.universe_builder.top_liquidity_count, len(stock_df)
+                    )
+                    fundamental_codes = set(stock_df["code"].head(fallback_count))
+
+                fundamentals_wide = self.fundamental_manager.refresh_all(
+                    sorted(fundamental_codes),
+                    latest_trade_day,
+                    quarterly_lookback=4,
+                    report_lookback_years=0,
+                    adjust_lookback_years=0,
+                    update_reports=False,
+                    update_corporate_actions=False,
+                    update_macro=False,
+                )
+            except Exception as exc:  # noqa: BLE001
+                self.logger.warning(
+                    "基础面与宏观数据刷新出现异常，将继续主流程: %s", exc
+                )
+
             # 3) 导出最近 N 日历史日线（增量模式）
             try:
                 history_df, history_table = self._export_daily_history_incremental(
@@ -493,11 +579,18 @@ class AshareApp:
                     history_df,
                     stock_basic_df=stock_basic_df,
                     industry_df=industry_df,
-                    index_membership=self._export_index_members(latest_trade_day),
+                    index_membership=index_membership,
                 )
             except RuntimeError as exc:
                 self.logger.error("生成当日候选池失败: %s", exc)
                 return
+
+            try:
+                universe_df = self._apply_fundamental_filters(
+                    universe_df, fundamentals_wide
+                )
+            except Exception as exc:  # noqa: BLE001
+                self.logger.warning("基本面过滤阶段出现异常，保留未过滤结果: %s", exc)
 
             universe_table = self._save_sample(universe_df, "a_share_universe")
             self.logger.info("已生成候选池：表 %s", universe_table)
