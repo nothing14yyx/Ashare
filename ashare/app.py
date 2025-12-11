@@ -50,6 +50,14 @@ class AshareApp:
         self.db_writer.write_dataframe(df, table_name)
         return table_name
 
+    @staticmethod
+    def _normalize_daily_numeric(df: pd.DataFrame) -> pd.DataFrame:
+        numeric_cols = ["amount", "volume", "close", "open", "high", "low"]
+        for col in numeric_cols:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        return df
+
     def _export_stock_list(self, trade_date: str) -> pd.DataFrame:
         stock_df = self.fetcher.get_stock_list(trade_date)
         if stock_df.empty:
@@ -90,12 +98,7 @@ class AshareApp:
             if daily_df.empty:
                 continue
 
-            numeric_cols = ["amount", "volume", "close", "open", "high", "low"]
-            for col in numeric_cols:
-                if col in daily_df.columns:
-                    daily_df[col] = pd.to_numeric(daily_df[col], errors="coerce")
-
-            history_frames.append(daily_df)
+            history_frames.append(self._normalize_daily_numeric(daily_df))
 
             if idx % 500 == 0 or idx == total:
                 self.logger.info("已完成 %s/%s 支股票的数据拉取", idx, total)
@@ -112,6 +115,144 @@ class AshareApp:
             combined_table,
         )
         return combined, combined_table
+
+    def _export_daily_history_incremental(
+        self,
+        stock_df: pd.DataFrame,
+        end_date: str,
+        base_table: str = "history_daily_kline",
+        window_days: int = 30,
+    ) -> Tuple[pd.DataFrame, str]:
+        """
+        增量更新日线数据，并返回最近 window_days 天的切片。
+
+        - 首次运行或表为空时：调用冷启动逻辑拉取 window_days 天并写入基础表。
+        - 后续运行：仅拉取缺失的交易日数据并追加到基础表，然后从基础表切片。
+        """
+
+        if stock_df.empty or "code" not in stock_df.columns:
+            raise RuntimeError("导出历史日线失败：股票列表为空或缺少 code 列。")
+
+        end_day = dt.datetime.strptime(end_date, "%Y-%m-%d").date()
+
+        with self.db_writer.engine.begin() as conn:
+            try:
+                existing = pd.read_sql(
+                    f"SELECT MAX(`date`) AS max_date FROM `{base_table}`",
+                    conn,
+                )
+                last_date_raw = existing["max_date"].iloc[0]
+            except Exception:  # noqa: BLE001
+                last_date_raw = None
+
+        last_date_value: dt.date | None = None
+        if isinstance(last_date_raw, pd.Timestamp):
+            last_date_value = last_date_raw.date()
+        elif isinstance(last_date_raw, dt.date):
+            last_date_value = last_date_raw
+        elif isinstance(last_date_raw, str) and last_date_raw:
+            last_date_value = dt.datetime.strptime(last_date_raw, "%Y-%m-%d").date()
+
+        if last_date_value is None:
+            self.logger.info(
+                "历史表 %s 不存在或为空，执行冷启动：拉取最近 %s 天日线。",
+                base_table,
+                window_days,
+            )
+            history_df, _ = self._export_recent_daily_history(
+                stock_df, end_date, days=window_days
+            )
+            self.db_writer.write_dataframe(
+                history_df,
+                base_table,
+                if_exists="replace",
+            )
+        elif last_date_value >= end_day:
+            self.logger.info(
+                "历史日线表 %s 已包含截至 %s 的数据，跳过增量拉取。",
+                base_table,
+                end_date,
+            )
+        else:
+            start_day = (last_date_value + dt.timedelta(days=1)).isoformat()
+            self.logger.info(
+                "开始增量拉取 %s 至 %s 的日线数据（原有截至 %s）。",
+                start_day,
+                end_date,
+                last_date_value.isoformat(),
+            )
+
+            history_frames: list[pd.DataFrame] = []
+            total = len(stock_df)
+
+            for idx, code in enumerate(
+                tqdm(stock_df["code"], desc="增量数据拉取进度"),
+                start=1,
+            ):
+                try:
+                    daily_df = self.fetcher.get_kline(
+                        code=code,
+                        start_date=start_day,
+                        end_date=end_date,
+                        freq="d",
+                        adjustflag="1",
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    self.logger.warning("股票 %s 增量数据拉取失败: %s", code, exc)
+                    continue
+
+                if daily_df.empty:
+                    continue
+
+                history_frames.append(self._normalize_daily_numeric(daily_df))
+
+                if idx % 500 == 0 or idx == total:
+                    self.logger.info(
+                        "增量已完成 %s/%s 支股票的数据拉取",
+                        idx,
+                        total,
+                    )
+
+            if history_frames:
+                new_rows = pd.concat(history_frames, ignore_index=True)
+                self.db_writer.write_dataframe(
+                    new_rows,
+                    base_table,
+                    if_exists="append",
+                )
+            else:
+                self.logger.info("本次没有任何新的日线数据可写入。")
+
+        cutoff_day = (end_day - dt.timedelta(days=window_days + 5)).isoformat()
+        query = f"SELECT * FROM `{base_table}` WHERE `date` >= '{cutoff_day}'"
+
+        with self.db_writer.engine.begin() as conn:
+            recent_df = pd.read_sql(query, conn)
+
+        if recent_df.empty:
+            raise RuntimeError(
+                f"从表 {base_table} 切出最近 {window_days} 天数据失败：结果为空。"
+            )
+
+        if "date" not in recent_df.columns:
+            raise RuntimeError(
+                f"表 {base_table} 缺少 date 列，无法进行时间窗口切片。"
+            )
+
+        recent_df["date"] = pd.to_datetime(recent_df["date"])
+        max_date = recent_df["date"].max()
+        cutoff = max_date - pd.Timedelta(days=window_days + 5)
+        recent_df = recent_df[recent_df["date"] >= cutoff].copy()
+
+        if recent_df.empty:
+            raise RuntimeError(
+                "从表 {table} 中切出最近 {days} 天数据失败：结果为空。".format(
+                    table=base_table,
+                    days=window_days,
+                )
+            )
+
+        return recent_df, base_table
 
     def _print_preview(self, interfaces: Iterable[str]) -> None:
         preview = list(interfaces)
@@ -141,10 +282,13 @@ class AshareApp:
                 self.logger.error("导出股票列表失败: %s", exc)
                 return
 
-            # 3) 导出最近 30 日历史日线
+            # 3) 导出最近 30 日历史日线（增量模式）
             try:
-                history_df, history_table = self._export_recent_daily_history(
-                    stock_df, latest_trade_day, days=30
+                history_df, history_table = self._export_daily_history_incremental(
+                    stock_df,
+                    latest_trade_day,
+                    base_table="history_daily_kline",
+                    window_days=30,
                 )
             except RuntimeError as exc:
                 self.logger.error("导出最近 30 个交易日的日线数据失败: %s", exc)
@@ -184,7 +328,6 @@ class AshareApp:
             self.logger.info("历史日线数据已保存至表：%s", history_table)
         finally:
             self.db_writer.dispose()
-
 
 if __name__ == "__main__":
     AshareApp().run()

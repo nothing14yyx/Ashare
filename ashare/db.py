@@ -68,7 +68,9 @@ class MySQLWriter:
 
         return create_engine(self.config.database_url(), future=True)
 
-    def write_dataframe(self, df: pd.DataFrame, table_name: str) -> None:
+    def write_dataframe(
+        self, df: pd.DataFrame, table_name: str, if_exists: str = "replace"
+    ) -> None:
         if df.empty:
             raise RuntimeError("待写入的数据为空，已跳过数据库写入。")
 
@@ -80,7 +82,7 @@ class MySQLWriter:
             )
 
         with self.engine.begin() as conn:
-            df.to_sql(table_name, conn, if_exists="replace", index=False)
+            df.to_sql(table_name, conn, if_exists=if_exists, index=False)
 
     def dispose(self) -> None:
         """释放数据库连接池资源。"""
