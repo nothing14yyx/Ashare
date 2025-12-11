@@ -84,6 +84,14 @@ class AshareUniverseBuilder:
         merged = stock_df.merge(latest_rows, on="code", how="left")
         filtered = merged[~merged["code"].isin(bad_codes)].copy()
 
+        # --- 新增：解决 MySQL 大小写不敏感导致的重复列名问题 ---
+        # stock_df 里有 `tradeStatus`，latest_rows 里有 `tradestatus`
+        # 在 MySQL 里会被视为同一个列名，导致 1060 Duplicate column name 错误。
+        if "tradeStatus" in filtered.columns and "tradestatus" in filtered.columns:
+            # 这里保留日线里的 `tradestatus`，删除股票列表里的 `tradeStatus`
+            filtered = filtered.drop(columns=["tradeStatus"])
+        # --- 新增结束 ---
+
         if "amount" in filtered.columns:
             filtered["amount"] = pd.to_numeric(filtered["amount"], errors="coerce")
 

@@ -69,10 +69,15 @@ class MySQLWriter:
         return create_engine(self.config.database_url(), future=True)
 
     def write_dataframe(self, df: pd.DataFrame, table_name: str) -> None:
-        """将 DataFrame 写入指定表，存在则替换。"""
-
         if df.empty:
             raise RuntimeError("待写入的数据为空，已跳过数据库写入。")
+
+        # 可选：提前检查列名大小写冲突
+        cols_lower = [c.lower() for c in df.columns]
+        if len(cols_lower) != len(set(cols_lower)):
+            raise RuntimeError(
+                f"DataFrame 列名存在仅大小写不同的重复：{list(df.columns)}"
+            )
 
         with self.engine.begin() as conn:
             df.to_sql(table_name, conn, if_exists="replace", index=False)
