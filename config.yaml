@@ -1,0 +1,26 @@
+app:
+  # 输出目录（AshareApp.output_dir）
+  output_dir: output
+  # 最近 N 个交易日窗口
+  history_days: 30
+  # 流动性排序时保留的股票数量
+  top_liquidity_count: 100
+  # 最少上市天数过滤阈值
+  min_listing_days: 60
+
+database:
+  host: 127.0.0.1
+  port: 3306
+  user: root
+  password: ""
+  db_name: ashare
+
+proxy:
+  http: http://127.0.0.1:7890
+  https: http://127.0.0.1:7890
+
+baostock:
+  # Baostock 登录失败时的重试次数与间隔（秒）
+  retry: 3
+  retry_sleep: 3.0
+

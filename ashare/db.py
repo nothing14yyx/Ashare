@@ -10,6 +10,8 @@ import pandas as pd
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
+from .config import get_section
+
 
 @dataclass
 class DatabaseConfig:
@@ -23,14 +25,35 @@ class DatabaseConfig:
 
     @classmethod
     def from_env(cls) -> "DatabaseConfig":
-        """从环境变量读取数据库配置."""
+        """从环境变量与 config.yaml 读取数据库配置。
+
+        优先顺序：
+        1. 环境变量 MYSQL_*；
+        2. config.yaml 中 database.*；
+        3. 类默认值。
+        """
+        section = get_section("database")
+
+        host = os.getenv("MYSQL_HOST", section.get("host", cls.host))
+        port_raw = os.getenv("MYSQL_PORT", section.get("port", cls.port))
+        user = os.getenv("MYSQL_USER", section.get("user", cls.user))
+        password = os.getenv(
+            "MYSQL_PASSWORD",
+            section.get("password", cls.password),
+        )
+        db_name = os.getenv("MYSQL_DB_NAME", section.get("db_name", cls.db_name))
+
+        try:
+            port = int(port_raw)
+        except (TypeError, ValueError):
+            port = cls.port
 
         return cls(
-            host=os.getenv("MYSQL_HOST", "127.0.0.1"),
-            port=int(os.getenv("MYSQL_PORT", "3306")),
-            user=os.getenv("MYSQL_USER", "root"),
-            password=os.getenv("MYSQL_PASSWORD", ""),
-            db_name=os.getenv("MYSQL_DB_NAME", "ashare"),
+            host=host,
+            port=port,
+            user=user,
+            password=password,
+            db_name=db_name,
         )
 
     def _credential(self) -> str:
@@ -48,7 +71,7 @@ class DatabaseConfig:
     def database_url(self) -> str:
         """构造带库名的连接 URL。"""
 
-        return f"{self.server_url()}/{self.db_name}"
+        return f"{self.server_url()}/{self.db_name}?charset=utf8mb4"
 
 
 class MySQLWriter:
@@ -63,7 +86,12 @@ class MySQLWriter:
 
         server_engine = create_engine(self.config.server_url(), future=True)
         with server_engine.connect() as conn:
-            conn.execute(text(f"CREATE DATABASE IF NOT EXISTS `{self.config.db_name}`"))
+            conn.execute(
+                text(
+                    f"CREATE DATABASE IF NOT EXISTS `{self.config.db_name}` "
+                    "DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
+                )
+            )
         server_engine.dispose()
 
         return create_engine(self.config.database_url(), future=True)

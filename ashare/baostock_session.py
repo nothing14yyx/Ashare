@@ -11,6 +11,8 @@ import time
 
 import baostock as bs
 
+from .config import get_section
+
 
 class BaostockSession:
     """管理 Baostock 登录状态的简单封装。"""
@@ -25,10 +27,22 @@ class BaostockSession:
 
         参数允许被覆盖，以便在特殊场景下调整重试策略。
         """
-        if retry is not None:
-            self.retry = retry
-        if retry_sleep is not None:
-            self.retry_sleep = retry_sleep
+        cfg = get_section("baostock")
+
+        if retry is None:
+            retry = cfg.get("retry", self.retry)
+        if retry_sleep is None:
+            retry_sleep = cfg.get("retry_sleep", self.retry_sleep)
+
+        try:
+            self.retry = int(retry)
+        except (TypeError, ValueError):
+            self.retry = 3
+
+        try:
+            self.retry_sleep = float(retry_sleep)
+        except (TypeError, ValueError):
+            self.retry_sleep = 3.0
 
         atexit.register(self.logout)
 
