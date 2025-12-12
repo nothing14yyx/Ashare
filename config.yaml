@@ -1,8 +1,13 @@
 app:
   # 输出目录（AshareApp.output_dir）
   output_dir: output
+  # 是否拉取/增量更新日线K线数据（history_daily_kline）
+  # true：会调用 Baostock K 线接口进行冷启动/增量更新
+  # false：不请求 Baostock K 线接口，只从数据库表切片读取
+  #       （要求 history_daily_kline 表已存在且非空）
+  fetch_daily_kline: false
   # 最近 N 个交易日窗口
-  history_days: 30
+  history_days: 300
   # 流动性排序时保留的股票数量
   top_liquidity_count: 100
   # 最少上市天数过滤阈值
@@ -29,7 +34,7 @@ baostock:
   retry_sleep: 3.0
 
 akshare:
-  enabled: false
+  enabled: true
   lhb:
     enabled: true
   margin:

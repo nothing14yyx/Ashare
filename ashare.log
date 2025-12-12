@@ -115,3 +115,59 @@
 2025-12-11 21:56:18,096 [INFO] 已生成候选池：表 a_share_universe
 2025-12-11 21:56:18,274 [INFO] 已将成交额排序结果写入表 a_share_top_liquidity，可用于筛选高流动性标的。
 2025-12-11 21:56:18,274 [INFO] 历史日线数据已保存至表：history_daily_kline
+2025-12-12 12:10:40,159 [INFO] 参数配置：history_days=30, top_liquidity_count=100, min_listing_days=60
+2025-12-12 12:10:40,313 [INFO] 代理配置: HTTP=None, HTTPS=None
+2025-12-12 12:10:40,313 [INFO] 已发现 4 个项目组件，前 10 个预览：
+2025-12-12 12:10:40,313 [INFO]  - BaostockSession
+2025-12-12 12:10:40,313 [INFO]  - BaostockDataFetcher
+2025-12-12 12:10:40,313 [INFO]  - AshareUniverseBuilder
+2025-12-12 12:10:40,314 [INFO]  - FundamentalDataManager
+2025-12-12 12:10:41,436 [INFO] 最近交易日：2025-12-12
+2025-12-12 12:10:43,988 [INFO] 已保存 3175 只股票的列表至表 a_share_stock_list
+2025-12-12 12:10:49,359 [INFO] 已保存证券基本资料至表 a_share_stock_basic
+2025-12-12 12:10:55,833 [INFO] 已保存行业分类信息至表 a_share_stock_industry
+2025-12-12 12:10:59,276 [INFO] 已保存 hs300 成分股至表 index_hs300_members
+2025-12-12 12:11:00,027 [INFO] 已保存 zz500 成分股至表 index_zz500_members
+2025-12-12 12:11:00,663 [INFO] 已保存 sz50 成分股至表 index_sz50_members
+2025-12-12 12:11:00,664 [INFO] 基础面刷新开关已关闭，本次仅使用数据库中已有的财务表构建宽表。
+2025-12-12 12:11:01,406 [INFO] 已生成宽表 fundamentals_latest_wide，共 800 行。
+2025-12-12 12:11:02,194 [INFO] 开始增量拉取 2025-12-12 至 2025-12-12 的日线数据（原有截至 2025-12-11）。
+2025-12-12 12:16:38,527 [INFO] 本次没有任何新的日线数据可写入。
+2025-12-12 12:16:41,140 [INFO] ROE 为正 过滤：3042 -> 592
+2025-12-12 12:16:41,143 [INFO] 资产负债率 < 75% 过滤：592 -> 592
+2025-12-12 12:16:41,145 [INFO] 经营现金流为正（按 CFO 比率代理） 过滤：592 -> 491
+2025-12-12 12:16:41,147 [INFO] 净利润或 EPS 同比为正 过滤：491 -> 323
+2025-12-12 12:16:41,425 [INFO] 已生成候选池：表 a_share_universe
+2025-12-12 12:16:41,588 [INFO] 已将成交额排序结果写入表 a_share_top_liquidity，可用于筛选高流动性标的。
+2025-12-12 12:16:42,339 [WARNING] 龙虎榜详情获取失败: 'NoneType' object is not subscriptable
+2025-12-12 12:16:43,320 [WARNING] 两融明细 sse 获取失败: Length mismatch: Expected axis has 0 elements, new values have 13 elements
+2025-12-12 12:16:45,157 [INFO] 两融明细 szse 在 2025-12-12 返回为空。
+2025-12-12 12:16:54,525 [WARNING] 删除表 a_share_hsgt_hold_rank 分区时出现异常（可能表不存在），已跳过删除：(pymysql.err.ProgrammingError) (1146, "Table 'ashare.a_share_hsgt_hold_rank' doesn't exist")
+[SQL: DELETE FROM `a_share_hsgt_hold_rank` WHERE trade_date = %(trade_date)s AND indicator = %(indicator)s AND market = %(market)s]
+[parameters: {'trade_date': '20240816', 'indicator': '5日排行', 'market': '沪股通'}]
+(Background on this error at: https://sqlalche.me/e/20/f405)
+2025-12-12 12:16:54,846 [INFO] 表 a_share_hsgt_hold_rank 已写入 2767 行。
+2025-12-12 12:17:08,118 [WARNING] 删除表 a_share_gdhs 分区时出现异常（可能表不存在），已跳过删除：(pymysql.err.ProgrammingError) (1146, "Table 'ashare.a_share_gdhs' doesn't exist")
+[SQL: DELETE FROM `a_share_gdhs` WHERE period = %(period)s]
+[parameters: {'period': '20251210'}]
+(Background on this error at: https://sqlalche.me/e/20/f405)
+2025-12-12 12:17:08,763 [INFO] 表 a_share_gdhs 已写入 5445 行。
+2025-12-12 12:17:09,491 [WARNING] 行为证据同步阶段出现异常: 'NoneType' object is not subscriptable
+2025-12-12 12:17:09,493 [INFO] 历史日线数据已保存至表：history_daily_kline
+2025-12-12 13:10:53,593 [INFO] 参数配置：history_days=30, top_liquidity_count=100, min_listing_days=60
+2025-12-12 13:10:53,728 [INFO] 代理配置: HTTP=None, HTTPS=None
+2025-12-12 13:10:53,729 [INFO] 已发现 4 个项目组件，前 10 个预览：
+2025-12-12 13:10:53,729 [INFO]  - BaostockSession
+2025-12-12 13:10:53,729 [INFO]  - BaostockDataFetcher
+2025-12-12 13:10:53,730 [INFO]  - AshareUniverseBuilder
+2025-12-12 13:10:53,730 [INFO]  - FundamentalDataManager
+2025-12-12 13:10:54,455 [INFO] 最近交易日：2025-12-12
+2025-12-12 13:10:58,048 [INFO] 已保存 3175 只股票的列表至表 a_share_stock_list
+2025-12-12 13:11:00,438 [INFO] 已保存证券基本资料至表 a_share_stock_basic
+2025-12-12 13:11:02,523 [INFO] 已保存行业分类信息至表 a_share_stock_industry
+2025-12-12 13:11:02,854 [INFO] 已保存 hs300 成分股至表 index_hs300_members
+2025-12-12 13:11:03,097 [INFO] 已保存 zz500 成分股至表 index_zz500_members
+2025-12-12 13:11:03,547 [INFO] 已保存 sz50 成分股至表 index_sz50_members
+2025-12-12 13:11:03,548 [INFO] 基础面刷新开关已关闭，本次仅使用数据库中已有的财务表构建宽表。
+2025-12-12 13:11:04,642 [INFO] 已生成宽表 fundamentals_latest_wide，共 800 行。
+2025-12-12 13:11:05,301 [INFO] 开始增量拉取 2025-12-12 至 2025-12-12 的日线数据（原有截至 2025-12-11）。
