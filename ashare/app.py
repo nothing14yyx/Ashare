@@ -10,10 +10,12 @@ from typing import Iterable, Tuple
 import pandas as pd
 from tqdm import tqdm
 
+from .akshare_fetcher import AkshareDataFetcher
 from .baostock_core import BaostockDataFetcher
 from .baostock_session import BaostockSession
 from .config import ProxyConfig, get_section
 from .db import DatabaseConfig, MySQLWriter
+from .external_signal_manager import ExternalSignalManager
 from .fundamental_manager import FundamentalDataManager
 from .universe import AshareUniverseBuilder
 from .utils import setup_logger
@@ -88,6 +90,22 @@ class AshareApp:
         self.fundamental_manager = FundamentalDataManager(
             self.fetcher, self.db_writer, self.logger
         )
+        akshare_cfg = get_section("akshare")
+        self.akshare_enabled = akshare_cfg.get("enabled", False)
+        self.external_signal_manager: ExternalSignalManager | None = None
+        if self.akshare_enabled:
+            try:
+                akshare_fetcher = AkshareDataFetcher()
+                self.external_signal_manager = ExternalSignalManager(
+                    akshare_fetcher, self.db_writer, self.logger, akshare_cfg
+                )
+            except ImportError as exc:  # noqa: BLE001
+                self.akshare_enabled = False
+                self.logger.warning(
+                    "Akshare 行为证据层初始化失败，已自动关闭：%s", exc
+                )
+        else:
+            self.logger.info("Akshare 行为证据层已关闭，跳过相关初始化。")
 
     def _save_sample(self, df: pd.DataFrame, table_name: str) -> str:
         self.db_writer.write_dataframe(df, table_name)
@@ -444,6 +462,29 @@ class AshareApp:
 
         return recent_df, base_table
 
+    def _extract_focus_codes(self, df: pd.DataFrame) -> list[str]:
+        if df.empty:
+            return []
+        if "code" not in df.columns:
+            return []
+        codes = df["code"].astype(str).dropna().tolist()
+        return codes
+
+    def _sync_external_signals(
+        self, latest_trade_day: str, focus_df: pd.DataFrame
+    ) -> None:
+        if self.external_signal_manager is None:
+            self.logger.info("Akshare 行为证据层未启用，跳过外部信号同步。")
+            return
+
+        focus_codes = self._extract_focus_codes(focus_df)
+        try:
+            self.external_signal_manager.sync_daily_signals(
+                latest_trade_day, focus_codes
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.logger.warning("行为证据同步阶段出现异常: %s", exc)
+
     def _print_preview(self, interfaces: Iterable[str]) -> None:
         preview = list(interfaces)
         self.logger.info("已发现 %s 个项目组件，前 10 个预览：", len(preview))
@@ -640,6 +681,8 @@ class AshareApp:
                 "已将成交额排序结果写入表 %s，可用于筛选高流动性标的。",
                 top_liquidity_table,
             )
+
+            self._sync_external_signals(latest_trade_day, top_liquidity)
 
             # 5) 提示历史日线路径
             self.logger.info("历史日线数据已保存至表：%s", history_table)

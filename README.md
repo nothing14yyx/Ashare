@@ -7,6 +7,11 @@
 - 拉取全市场最近 30 个交易日的日线数据，统一写入表 `history_recent_30_days`。
 - 根据日线成交额构建候选池，剔除 ST/退市标的与停牌记录。
 - 输出成交额排序，便于快速定位高流动性标的：写入表 `a_share_top_liquidity`。
+- 可选启用 Akshare 行为证据采集：
+  - 龙虎榜详情写入 `a_share_lhb_detail`
+  - 两融明细写入 `a_share_margin_detail`
+  - 北向持股排行写入 `a_share_hsgt_hold_rank`
+  - 股东户数汇总与明细写入 `a_share_gdhs` 与 `a_share_gdhs_detail`
 - 提供脚本化入口 `start.py`，直接运行即可完成上述流程。
 
 ## 使用方式

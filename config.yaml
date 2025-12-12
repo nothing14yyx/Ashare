@@ -28,3 +28,24 @@ baostock:
   retry: 3
   retry_sleep: 3.0
 
+akshare:
+  enabled: false
+  lhb:
+    enabled: true
+  margin:
+    enabled: true
+    exchanges:
+      - sse
+      - szse
+  hsgt:
+    enabled: true
+    markets:
+      - "沪股通"
+      - "深股通"
+    indicator: "5日排行"
+  gdhs:
+    enabled: true
+    period: ""
+    detail_enabled: true
+    detail_top_n: 100
+
