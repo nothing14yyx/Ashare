@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Iterable, Dict, Any
+from typing import Any, Callable, Dict, Iterable
 
 import pandas as pd
 from sqlalchemy import bindparam, text
@@ -26,6 +26,9 @@ class ExternalSignalManager:
         self.logger = logger
         self.config = config or {}
 
+    # =========================
+    # Utils
+    # =========================
     def _to_yyyymmdd(self, value: Any) -> str | None:  # noqa: ANN401
         if pd.isna(value):
             return None
@@ -44,6 +47,22 @@ class ExternalSignalManager:
             return None
         return parsed.strftime("%Y%m%d")
 
+    def _yyyymmdd_to_iso(self, yyyymmdd: str) -> str:
+        if not yyyymmdd or len(yyyymmdd) != 8:
+            return str(yyyymmdd)
+        return f"{yyyymmdd[:4]}-{yyyymmdd[4:6]}-{yyyymmdd[6:8]}"
+
+    def _iso_to_yyyymmdd(self, iso_date: str) -> str:
+        ymd = self._to_yyyymmdd(iso_date)
+        return ymd or str(iso_date).replace("-", "")
+
+    def _shift_yyyymmdd(self, yyyymmdd: str, delta_days: int) -> str:
+        base = pd.to_datetime(yyyymmdd, format="%Y%m%d", errors="coerce")
+        if pd.isna(base):
+            return yyyymmdd
+        shifted = base + pd.Timedelta(days=delta_days)
+        return shifted.strftime("%Y%m%d")
+
     def _rename_first(self, df: pd.DataFrame, candidates: list[str], target: str) -> None:
         for col in candidates:
             if col in df.columns and col != target:
@@ -54,6 +73,19 @@ class ExternalSignalManager:
         if column not in df.columns:
             df[column] = value
 
+    def _ensure_df(self, value: Any) -> pd.DataFrame:  # noqa: ANN401
+        if value is None:
+            return pd.DataFrame()
+        if isinstance(value, pd.DataFrame):
+            return value
+        try:
+            return pd.DataFrame(value)
+        except Exception:  # noqa: BLE001
+            return pd.DataFrame()
+
+    # =========================
+    # DB
+    # =========================
     def _upsert(
         self,
         df: pd.DataFrame,
@@ -88,9 +120,7 @@ class ExternalSignalManager:
                     .drop_duplicates()
                 )
                 for _, row in period_code.iterrows():
-                    delete_filters.append(
-                        {"period": str(row["period"]), "code": str(row["code"])}
-                    )
+                    delete_filters.append({"period": str(row["period"]), "code": str(row["code"])})
             else:
                 for period in deduped["period"].dropna().astype(str).unique():
                     delete_filters.append({"period": period})
@@ -102,9 +132,7 @@ class ExternalSignalManager:
                         conditions = [f"{col} = :{col}" for col in filter_values]
                         stmt = text(
                             f"DELETE FROM `{table}` WHERE " + " AND ".join(conditions)
-                        ).bindparams(
-                            *(bindparam(col) for col in filter_values)
-                        )
+                        ).bindparams(*(bindparam(col) for col in filter_values))
                         conn.execute(stmt, filter_values)
             except Exception as exc:  # noqa: BLE001
                 self.logger.warning(
@@ -116,6 +144,9 @@ class ExternalSignalManager:
         self.db_writer.write_dataframe(deduped, table, if_exists="append")
         self.logger.info("表 %s 已写入 %s 行。", table, len(deduped))
 
+    # =========================
+    # Normalization
+    # =========================
     def _normalize_code_column(self, df: pd.DataFrame) -> None:
         self._rename_first(
             df,
@@ -133,10 +164,7 @@ class ExternalSignalManager:
         )
         if "code" in df.columns:
             df["code"] = (
-                df["code"]
-                .astype(str)
-                .str.strip()
-                .apply(self._format_code_with_prefix)
+                df["code"].astype(str).str.strip().apply(self._format_code_with_prefix)
             )
 
     def _format_code_with_prefix(self, code: str) -> str:
@@ -229,46 +257,138 @@ class ExternalSignalManager:
     def _normalize_symbol(self, code: str) -> str:
         if pd.isna(code):
             return ""
+        code = str(code)
         if "." in code:
             return code.split(".", 1)[1]
         return code
 
+    # =========================
+    # Trade-date backoff (核心：取最近一次可用数据)
+    # =========================
+    def _iter_recent_dates(
+        self,
+        requested_trade_date: str,
+        max_backoff_days: int,
+        skip_today: bool,
+    ) -> list[str]:
+        """
+        返回 ISO 日期列表（YYYY-MM-DD），按“最近 -> 更早”顺序。
+        默认 skip_today=True：从上一天开始尝试，直到回退 max_backoff_days 天。
+        """
+        req_ymd = self._to_yyyymmdd(requested_trade_date)
+        if not req_ymd:
+            return []
+
+        start_offset = 1 if skip_today else 0
+        dates: list[str] = []
+        for offset in range(start_offset, max_backoff_days + 1 + start_offset):
+            ymd = self._shift_yyyymmdd(req_ymd, -offset)
+            dates.append(self._yyyymmdd_to_iso(ymd))
+        return dates
+
+    def _fetch_trade_date_df(
+        self,
+        fetch_fn: Callable[[str], Any],
+        requested_trade_date: str,
+        max_backoff_days: int,
+        skip_today: bool,
+        case_name: str,
+    ) -> tuple[pd.DataFrame, str | None]:
+        """
+        尝试获取“最近一次可用”的 trade-date 数据：
+        - 只要不是 exception，就认为接口可用（success_empty 也可用）
+        - 返回 (df, used_date_iso)
+        """
+        candidates = self._iter_recent_dates(
+            requested_trade_date=requested_trade_date,
+            max_backoff_days=max_backoff_days,
+            skip_today=skip_today,
+        )
+        if not candidates:
+            return pd.DataFrame(), None
+
+        last_exc: Exception | None = None
+        for idx, used_iso in enumerate(candidates, start=1):
+            try:
+                raw = fetch_fn(used_iso)
+                df = self._ensure_df(raw)
+                if df is None:
+                    raise TypeError("akshare returned None")
+                if idx == 1:
+                    # 第一候选就是“最近一次”（通常是昨天）
+                    pass
+                return df, used_iso
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                self.logger.warning(
+                    "%s 获取失败（date=%s, try=%s/%s）: %s",
+                    case_name,
+                    used_iso,
+                    idx,
+                    len(candidates),
+                    exc,
+                )
+
+        # 全部失败
+        if last_exc is not None:
+            self.logger.warning("%s 回退尝试全部失败: %s", case_name, last_exc)
+        return pd.DataFrame(), None
+
+    # =========================
+    # Sync tasks
+    # =========================
     def sync_lhb_detail(self, trade_date: str) -> pd.DataFrame:
-        try:
-            df = self.fetcher.get_lhb_detail(trade_date)
-        except Exception as exc:  # noqa: BLE001
-            self.logger.warning("龙虎榜详情获取失败: %s", exc)
-            return pd.DataFrame()
+        ak_cfg = self.config
+        lhb_cfg = ak_cfg.get("lhb", {}) if isinstance(ak_cfg.get("lhb", {}), dict) else {}
+
+        # 关键：默认不取当天，直接取“最近一次可用”（通常是上一交易日）
+        skip_today = bool(lhb_cfg.get("skip_today", ak_cfg.get("skip_today", True)))
+        max_backoff_days = int(lhb_cfg.get("max_backoff_days", ak_cfg.get("max_backoff_days", 5)))
+
+        df, used_iso = self._fetch_trade_date_df(
+            fetch_fn=lambda d: self.fetcher.get_lhb_detail(d),
+            requested_trade_date=trade_date,
+            max_backoff_days=max_backoff_days,
+            skip_today=skip_today,
+            case_name="龙虎榜详情",
+        )
 
         if df.empty:
-            self.logger.info("龙虎榜 %s 返回为空。", trade_date)
+            self.logger.info("龙虎榜返回为空（used_date=%s）。", used_iso or trade_date)
             return df
 
+        used_date_for_norm = used_iso or trade_date
         self._normalize_code_column(df)
-        self._normalize_trade_date(df, trade_date)
-        subset = [
-            col
-            for col in ["code", "trade_date", "上榜日", "上榜原因"]
-            if col in df.columns
-        ]
+        self._normalize_trade_date(df, used_date_for_norm)
+        subset = [col for col in ["code", "trade_date", "上榜日", "上榜原因"] if col in df.columns]
         self._upsert(df, "a_share_lhb_detail", subset=subset or None)
         return df
 
     def sync_margin_detail(self, trade_date: str, exchanges: Iterable[str]) -> pd.DataFrame:
+        ak_cfg = self.config
+        margin_cfg = ak_cfg.get("margin", {}) if isinstance(ak_cfg.get("margin", {}), dict) else {}
+
+        skip_today = bool(margin_cfg.get("skip_today", ak_cfg.get("skip_today", True)))
+        max_backoff_days = int(margin_cfg.get("max_backoff_days", ak_cfg.get("max_backoff_days", 5)))
+
         frames: list[pd.DataFrame] = []
+
         for exchange in exchanges:
-            try:
-                df = self.fetcher.get_margin_detail(trade_date, exchange)
-            except Exception as exc:  # noqa: BLE001
-                self.logger.warning("两融明细 %s 获取失败: %s", exchange, exc)
-                continue
+            df, used_iso = self._fetch_trade_date_df(
+                fetch_fn=lambda d, ex=exchange: self.fetcher.get_margin_detail(d, ex),
+                requested_trade_date=trade_date,
+                max_backoff_days=max_backoff_days,
+                skip_today=skip_today,
+                case_name=f"两融明细 {exchange}",
+            )
 
             if df.empty:
-                self.logger.info("两融明细 %s 在 %s 返回为空。", exchange, trade_date)
+                self.logger.info("两融明细 %s 返回为空（used_date=%s）。", exchange, used_iso or trade_date)
                 continue
 
+            used_date_for_norm = used_iso or trade_date
             self._normalize_code_column(df)
-            self._normalize_trade_date(df, trade_date)
+            self._normalize_trade_date(df, used_date_for_norm)
             self._normalize_exchange(df, exchange)
             frames.append(df)
 
@@ -280,9 +400,7 @@ class ExternalSignalManager:
         self._upsert(combined, "a_share_margin_detail", subset=subset or None)
         return combined
 
-    def sync_hsgt_hold_rank(
-        self, market_list: Iterable[str], indicator: str, trade_date: str
-    ) -> pd.DataFrame:
+    def sync_hsgt_hold_rank(self, market_list: Iterable[str], indicator: str, trade_date: str) -> pd.DataFrame:
         frames: list[pd.DataFrame] = []
         for market in market_list:
             try:
@@ -291,7 +409,7 @@ class ExternalSignalManager:
                 self.logger.warning("北向持股排行 %s 获取失败: %s", market, exc)
                 continue
 
-            if df.empty:
+            if df is None or df.empty:
                 self.logger.info("北向持股排行 %s 返回为空。", market)
                 continue
 
@@ -305,28 +423,25 @@ class ExternalSignalManager:
             return pd.DataFrame()
 
         combined = pd.concat(frames, ignore_index=True)
-        subset = [
-            col
-            for col in ["market", "indicator", "trade_date", "code"]
-            if col in combined.columns
-        ]
+        subset = [col for col in ["market", "indicator", "trade_date", "code"] if col in combined.columns]
         self._upsert(combined, "a_share_hsgt_hold_rank", subset=subset or None)
         return combined
 
-    def sync_shareholder_counts(
-        self, trade_date: str, focus_codes: list[str] | None = None
-    ) -> pd.DataFrame:
-        gdhs_cfg = self.config.get("gdhs", {})
+    def sync_shareholder_counts(self, trade_date: str, focus_codes: list[str] | None = None) -> pd.DataFrame:
+        gdhs_cfg = self.config.get("gdhs", {}) if isinstance(self.config.get("gdhs", {}), dict) else {}
         period = gdhs_cfg.get("period") or "最新"
+
         try:
             summary_df = self.fetcher.get_shareholder_count(period)
         except Exception as exc:  # noqa: BLE001
             self.logger.warning("股东户数汇总获取失败: %s", exc)
             summary_df = pd.DataFrame()
 
+        summary_df = self._ensure_df(summary_df)
+
         if not summary_df.empty:
             period_from_data = summary_df.get("股东户数统计截止日-本次")
-            if period_from_data is not None:
+            if period_from_data is not None and not period_from_data.empty:
                 period = str(period_from_data.iloc[0])
             self._normalize_code_column(summary_df)
             self._normalize_period(summary_df, period)
@@ -340,19 +455,28 @@ class ExternalSignalManager:
 
         if not focus_codes:
             focus_codes = []
-        top_n = gdhs_cfg.get("detail_top_n", 100)
-        normalized_codes = [self._normalize_symbol(code) for code in focus_codes]
-        normalized_codes = normalized_codes[:top_n]
+        top_n = int(gdhs_cfg.get("detail_top_n", 100))
+        normalized_codes = [self._normalize_symbol(code) for code in focus_codes][:top_n]
 
-        frames = self.fetcher.batch_get_shareholder_count_detail(normalized_codes)
+        try:
+            frames = self.fetcher.batch_get_shareholder_count_detail(normalized_codes)
+        except Exception as exc:  # noqa: BLE001
+            self.logger.warning("股东户数明细批量获取失败: %s", exc)
+            return summary_df
+
         if not frames:
             self.logger.info("股东户数明细在指定代码范围内无返回。")
             return summary_df
 
-        detail_df = pd.concat(frames, ignore_index=True)
+        detail_df = pd.concat([self._ensure_df(x) for x in frames if x is not None], ignore_index=True)
+        if detail_df.empty:
+            self.logger.info("股东户数明细拼接后为空。")
+            return summary_df
+
         period_from_detail = detail_df.get("股东户数统计截止日")
-        if period_from_detail is not None:
+        if period_from_detail is not None and not period_from_detail.empty:
             period = str(period_from_detail.iloc[0])
+
         self._normalize_period(detail_df, period)
         self._normalize_code_column(detail_df)
         subset = [col for col in ["code", "period"] if col in detail_df.columns]
@@ -364,37 +488,48 @@ class ExternalSignalManager:
         )
         return summary_df
 
-    def sync_daily_signals(
-        self, trade_date: str, focus_codes: list[str] | None = None
-    ) -> None:
+    def sync_daily_signals(self, trade_date: str, focus_codes: list[str] | None = None) -> None:
         ak_cfg = self.config
         if not ak_cfg.get("enabled", False):
             self.logger.info("Akshare 行为证据开关关闭，已跳过所有相关采集。")
             return
 
+        # 这里保证：任何一个子任务失败，都不会把“行为证据同步阶段”整体打断
         lhb_cfg = ak_cfg.get("lhb", {})
-        if lhb_cfg.get("enabled", True):
-            self.sync_lhb_detail(trade_date)
+        if isinstance(lhb_cfg, dict) and lhb_cfg.get("enabled", True):
+            try:
+                self.sync_lhb_detail(trade_date)
+            except Exception as exc:  # noqa: BLE001
+                self.logger.warning("龙虎榜同步阶段出现异常: %s", exc)
         else:
             self.logger.info("龙虎榜采集已关闭。")
 
         margin_cfg = ak_cfg.get("margin", {})
-        if margin_cfg.get("enabled", True):
+        if isinstance(margin_cfg, dict) and margin_cfg.get("enabled", True):
             exchanges = margin_cfg.get("exchanges", ["sse", "szse"])
-            self.sync_margin_detail(trade_date, exchanges)
+            try:
+                self.sync_margin_detail(trade_date, exchanges)
+            except Exception as exc:  # noqa: BLE001
+                self.logger.warning("两融同步阶段出现异常: %s", exc)
         else:
             self.logger.info("两融采集已关闭。")
 
         hsgt_cfg = ak_cfg.get("hsgt", {})
-        if hsgt_cfg.get("enabled", True):
+        if isinstance(hsgt_cfg, dict) and hsgt_cfg.get("enabled", True):
             markets = hsgt_cfg.get("markets", ["沪股通", "深股通"])
             indicator = hsgt_cfg.get("indicator", "5日排行")
-            self.sync_hsgt_hold_rank(markets, indicator, trade_date)
+            try:
+                self.sync_hsgt_hold_rank(markets, indicator, trade_date)
+            except Exception as exc:  # noqa: BLE001
+                self.logger.warning("北向持股同步阶段出现异常: %s", exc)
         else:
             self.logger.info("北向持股采集已关闭。")
 
         gdhs_cfg = ak_cfg.get("gdhs", {})
-        if gdhs_cfg.get("enabled", True):
-            self.sync_shareholder_counts(trade_date, focus_codes)
+        if isinstance(gdhs_cfg, dict) and gdhs_cfg.get("enabled", True):
+            try:
+                self.sync_shareholder_counts(trade_date, focus_codes)
+            except Exception as exc:  # noqa: BLE001
+                self.logger.warning("股东户数同步阶段出现异常: %s", exc)
         else:
             self.logger.info("股东户数采集已关闭。")
