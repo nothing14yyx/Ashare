@@ -62,9 +62,10 @@ def _worker_fetch_kline(args: tuple[str, str, str, str, str, int]) -> tuple[str,
         except Exception as exc:  # noqa: BLE001
             if attempt >= max_retries:
                 return "error", code, str(exc)
+
             time.sleep(_calc_backoff(attempt))
             try:
-                _worker_session.reconnect()
+                _worker_session.ensure_alive(force_refresh=attempt > 1)
             except Exception:  # noqa: BLE001
                 _worker_session = BaostockSession()
                 _worker_session.connect()

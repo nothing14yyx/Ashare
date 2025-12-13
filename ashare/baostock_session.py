@@ -102,6 +102,28 @@ class BaostockSession:
         finally:
             self.logged_in = False
 
+    def ensure_alive(self, force_refresh: bool = False) -> None:
+        """确保会话可用，必要时重新登录。
+
+        - `force_refresh` 为 ``True`` 时直接重新登录；
+        - 否则会先探测当前会话是否有效，避免不必要的频繁登出/登录。
+        """
+
+        if force_refresh:
+            self.reconnect()
+            return
+
+        if not self.logged_in:
+            self.connect()
+            return
+
+        try:
+            rs = bs.query_server_version()
+            if getattr(rs, "error_code", None) != "0":
+                raise RuntimeError("Baostock 会话失效，需要重新登录。")
+        except Exception:
+            self.reconnect()
+
     def reconnect(self) -> None:
         """重新建立 Baostock 连接。"""
 
