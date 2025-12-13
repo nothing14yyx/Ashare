@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import atexit
+import logging
 import os
 import socket
 import time
@@ -31,6 +32,7 @@ class BaostockSession:
 
         参数允许被覆盖，以便在特殊场景下调整重试策略。
         """
+        self.logger = logging.getLogger(self.__class__.__name__)
         cfg = get_section("baostock")
 
         if retry is None:
@@ -64,7 +66,7 @@ class BaostockSession:
             alive_interval = float(alive_interval_raw)
         except (TypeError, ValueError):
             alive_interval = self.alive_check_interval
-        self.alive_check_interval = max(5.0, alive_interval)
+        self.alive_check_interval = max(60.0, alive_interval)
         self._last_alive_ts: float = 0.0
         if self.socket_timeout and self.socket_timeout > 0:
             socket.setdefaulttimeout(self.socket_timeout)
@@ -124,10 +126,12 @@ class BaostockSession:
         """
 
         if force_refresh:
+            self.logger.info("强制刷新会话，重新登录。")
             self.reconnect()
             return
 
         if not self.logged_in:
+            self.logger.info("会话未登录，执行登录。")
             self.connect()
             return
 
@@ -138,6 +142,7 @@ class BaostockSession:
         try:
             self._probe_alive()
         except Exception:
+            self.logger.warning("会话验证失败，尝试重连。")
             self.reconnect()
         else:
             self._last_alive_ts = time.time()
@@ -145,19 +150,37 @@ class BaostockSession:
     def _probe_alive(self) -> None:
         """通过轻量查询验证会话可用性。"""
 
-        rs = bs.query_sz50_stocks()
-        if getattr(rs, "error_code", None) != "0":
-            raise RuntimeError("Baostock 会话失效，需要重新登录。")
-
-    def reconnect(self) -> None:
-        """重新建立 Baostock 连接。"""
-
         try:
-            self.logout()
-        finally:
-            self.logged_in = False
-            self._last_alive_ts = 0.0
-        self.connect()
+            rs = bs.query_sz50_stocks()
+            if getattr(rs, "error_code", None) != "0":
+                raise RuntimeError(
+                    f"Baostock 会话失效，错误代码：{getattr(rs, 'error_code', '未知')}，"
+                    f"错误信息：{getattr(rs, 'error_msg', '未知')}"
+                )
+        except Exception as exc:
+            self.logger.error("会话验证失败: %s", exc)
+            raise RuntimeError(f"Baostock 会话失效，错误详情：{exc}") from exc
+
+    def reconnect(self, max_retries: int = 3) -> None:
+        """重新建立 Baostock 连接，并限制最大重试次数。"""
+
+        retries = 0
+        while retries < max_retries:
+            try:
+                self.logger.info("正在尝试重连 Baostock，会话重试次数：%s", retries + 1)
+                self.logout()
+                self.connect()
+                self.logger.info("Baostock 会话重连成功。")
+                return
+            except Exception as exc:
+                retries += 1
+                self.logged_in = False
+                self._last_alive_ts = 0.0
+                self.logger.warning("Baostock 会话重连失败（第 %s 次）：%s", retries, exc)
+                if retries < max_retries:
+                    time.sleep(2)
+
+        raise RuntimeError("Baostock 会话重连失败，已达到最大重试次数。")
 
 
 def _demo() -> None:
