@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import datetime as dt
+import logging
 import multiprocessing as mp
 import os
 import time
 from pathlib import Path
-from typing import Iterable, Tuple
+from typing import Callable, Iterable, Tuple
 
 import pandas as pd
 from sqlalchemy import bindparam, inspect, text
@@ -36,6 +37,65 @@ def _init_kline_worker() -> None:
     _worker_fetcher = BaostockDataFetcher(_worker_session)
 
 
+def _reset_worker_session() -> None:
+    """在子进程内重新建立 Baostock 会话。"""
+
+    global _worker_session, _worker_fetcher
+    _worker_session = BaostockSession()
+    _worker_session.connect()
+    _worker_fetcher = BaostockDataFetcher(_worker_session)
+
+
+def _fetch_kline_with_retry(
+    fetcher: BaostockDataFetcher,
+    session: BaostockSession,
+    code: str,
+    start_date: str,
+    end_date: str,
+    freq: str,
+    adjustflag: str,
+    max_retries: int,
+    reset_callback: Callable[[], None] | None = None,
+    logger: logging.Logger | None = None,
+) -> tuple[str, pd.DataFrame | str]:
+    """统一的 K 线重试逻辑，可在主进程与子进程复用。"""
+
+    def _calc_backoff(attempt_index: int) -> float:
+        base = 1.0
+        max_backoff = 15.0
+        return min(max_backoff, base * (2 ** (attempt_index - 1)))
+
+    session.ensure_alive()
+    for attempt in range(1, max_retries + 1):
+        try:
+            df = fetcher.get_kline(
+                code=code,
+                start_date=start_date,
+                end_date=end_date,
+                freq=freq,
+                adjustflag=adjustflag,
+            )
+            return "ok", df
+        except Exception as exc:  # noqa: BLE001
+            if attempt >= max_retries:
+                return "error", str(exc)
+
+            if logger is not None:
+                logger.warning("%s 第 %s/%s 次拉取失败：%s", code, attempt, max_retries, exc)
+            time.sleep(_calc_backoff(attempt))
+            try:
+                message = str(exc)
+                force_refresh = attempt > 1 or "10054" in message
+                session.ensure_alive(force_refresh=force_refresh)
+            except Exception:  # noqa: BLE001
+                if reset_callback is not None:
+                    reset_callback()
+                else:
+                    session.reconnect()
+
+    return "error", "达到最大重试次数"
+
+
 def _worker_fetch_kline(args: tuple[str, str, str, str, str, int]) -> tuple[str, str, pd.DataFrame | str]:
     """子进程中拉取单只股票 K 线，复用会话减少登录开销。"""
 
@@ -44,35 +104,19 @@ def _worker_fetch_kline(args: tuple[str, str, str, str, str, int]) -> tuple[str,
     if _worker_session is None or _worker_fetcher is None:
         raise RuntimeError("Baostock 会话未初始化。")
 
-    def _calc_backoff(attempt_index: int) -> float:
-        base = 1.0
-        max_backoff = 15.0
-        return min(max_backoff, base * (2 ** (attempt_index - 1)))
+    status, payload = _fetch_kline_with_retry(
+        fetcher=_worker_fetcher,
+        session=_worker_session,
+        code=code,
+        start_date=start_date,
+        end_date=end_date,
+        freq=freq,
+        adjustflag=adjustflag,
+        max_retries=max_retries,
+        reset_callback=_reset_worker_session,
+    )
 
-    _worker_session.ensure_alive()
-    for attempt in range(1, max_retries + 1):
-        try:
-            df = _worker_fetcher.get_kline(
-                code=code,
-                start_date=start_date,
-                end_date=end_date,
-                freq=freq,
-                adjustflag=adjustflag,
-            )
-            return "ok", code, df
-        except Exception as exc:  # noqa: BLE001
-            if attempt >= max_retries:
-                return "error", code, str(exc)
-
-            time.sleep(_calc_backoff(attempt))
-            try:
-                message = str(exc)
-                force_refresh = attempt > 1 or "10054" in message
-                _worker_session.ensure_alive(force_refresh=force_refresh)
-            except Exception:  # noqa: BLE001
-                _worker_session = BaostockSession()
-                _worker_session.connect()
-                _worker_fetcher = BaostockDataFetcher(_worker_session)
+    return status, code, payload
 
 
 class AshareApp:
@@ -518,23 +562,36 @@ class AshareApp:
             len(codes_to_fetch),
         )
 
-        with ctx.Pool(
-            processes=worker_processes,
-            initializer=_init_kline_worker,
-            maxtasksperchild=200,
-        ) as pool:
-            for idx, result in enumerate(
-                pool.imap_unordered(_worker_fetch_kline, worker_args), start=1
-            ):
-                status, code, payload = result
-                if status == "ok" and isinstance(payload, pd.DataFrame):
-                    if payload.empty:
-                        empty_codes.append(code)
-                    else:
-                        history_frames.append(payload)
-                        success_count += 1
+        def _handle_result(
+            status: str, code_value: str, payload: pd.DataFrame | str
+        ) -> None:
+            nonlocal success_count
+
+            if status == "ok" and isinstance(payload, pd.DataFrame):
+                if payload.empty:
+                    empty_codes.append(code_value)
                 else:
-                    failed_codes.append(code)
+                    history_frames.append(payload)
+                    success_count += 1
+            else:
+                failed_codes.append(code_value)
+
+        if worker_processes == 1:
+            self.session.ensure_alive()
+            for idx, code in enumerate(codes_to_fetch, start=1):
+                status, payload = _fetch_kline_with_retry(
+                    fetcher=self.fetcher,
+                    session=self.session,
+                    code=code,
+                    start_date=start_day,
+                    end_date=end_date,
+                    freq="d",
+                    adjustflag=adjustflag,
+                    max_retries=self.baostock_max_retries,
+                    reset_callback=self.session.reconnect,
+                    logger=self.logger,
+                )
+                _handle_result(status, code, payload)
 
                 if history_frames and (
                     len(history_frames) >= self.history_flush_batch
@@ -547,8 +604,39 @@ class AshareApp:
 
                 if idx % self.progress_log_every == 0 or idx == len(codes_to_fetch):
                     self.logger.info(
-                        "已完成 %s/%s 支股票的拉取，最近处理 %s", idx, len(codes_to_fetch), code
+                        "已完成 %s/%s 支股票的拉取，最近处理 %s",
+                        idx,
+                        len(codes_to_fetch),
+                        code,
                     )
+        else:
+            with ctx.Pool(
+                processes=worker_processes,
+                initializer=_init_kline_worker,
+                maxtasksperchild=200,
+            ) as pool:
+                for idx, result in enumerate(
+                    pool.imap_unordered(_worker_fetch_kline, worker_args), start=1
+                ):
+                    status, code, payload = result
+                    _handle_result(status, code, payload)
+
+                    if history_frames and (
+                        len(history_frames) >= self.history_flush_batch
+                        or idx == len(codes_to_fetch)
+                    ):
+                        self._flush_history_batch(
+                            history_frames, base_table, if_exists="append"
+                        )
+                        history_frames.clear()
+
+                    if idx % self.progress_log_every == 0 or idx == len(codes_to_fetch):
+                        self.logger.info(
+                            "已完成 %s/%s 支股票的拉取，最近处理 %s",
+                            idx,
+                            len(codes_to_fetch),
+                            code,
+                        )
 
         if history_frames:
             self._flush_history_batch(history_frames, base_table, if_exists="append")
