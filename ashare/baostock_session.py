@@ -115,11 +115,12 @@ class BaostockSession:
             self.logged_in = False
             self._last_alive_ts = 0.0
 
-    def ensure_alive(self, force_refresh: bool = False) -> None:
-        """确保会话可用，必要时重新登录。
+    def ensure_alive(self, force_refresh: bool = False, force_check: bool = False) -> None:
+        """确保会话可用，必要时重新登录或主动探测。
 
         - `force_refresh` 为 ``True`` 时直接重新登录；
-        - 否则会先探测当前会话是否有效，避免不必要的频繁登出/登录。
+        - `force_check` 为 ``True`` 时跳过探测节流，立即执行一次有效性检查，
+          但不会主动登出再登录，避免频繁重置会话。
         """
 
         if force_refresh:
@@ -131,7 +132,7 @@ class BaostockSession:
             return
 
         now = time.time()
-        if now - self._last_alive_ts < self.alive_check_interval:
+        if not force_check and now - self._last_alive_ts < self.alive_check_interval:
             return
 
         try:

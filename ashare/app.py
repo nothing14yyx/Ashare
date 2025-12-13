@@ -65,7 +65,7 @@ def _fetch_kline_with_retry(
         max_backoff = 15.0
         return min(max_backoff, base * (2 ** (attempt_index - 1)))
 
-    session.ensure_alive()
+    session.ensure_alive(force_check=True)
     for attempt in range(1, max_retries + 1):
         try:
             df = fetcher.get_kline(
@@ -86,7 +86,9 @@ def _fetch_kline_with_retry(
             try:
                 message = str(exc)
                 force_refresh = attempt > 1 or "10054" in message
-                session.ensure_alive(force_refresh=force_refresh)
+                session.ensure_alive(
+                    force_refresh=force_refresh, force_check=not force_refresh
+                )
             except Exception:  # noqa: BLE001
                 if reset_callback is not None:
                     reset_callback()

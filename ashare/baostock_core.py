@@ -56,6 +56,24 @@ class BaostockDataFetcher:
         max_sleep = 20.0
         return min(max_sleep, base * (2 ** (attempt_index - 1)))
 
+    def _should_force_refresh(self, error: Exception | None, attempt_index: int) -> bool:
+        """判断异常是否需要强制重连，避免无谓的频繁登录。"""
+
+        if error is None:
+            return False
+
+        message = str(error)
+        auth_markers = ["10001001", "未登录", "not logged", "登录失败"]
+        network_markers = ["10054", "reset", "断开", "Connection reset"]
+
+        if any(flag in message for flag in auth_markers):
+            return True
+
+        if attempt_index >= self.api_max_retries:
+            return True
+
+        return any(flag in message for flag in network_markers)
+
     def _call_with_retry(self, func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         """对 Baostock 查询执行重试与会话自愈。"""
 
@@ -81,7 +99,10 @@ class BaostockDataFetcher:
                 last_error,
             )
             try:
-                self.session.ensure_alive(force_refresh=True)
+                force_refresh = self._should_force_refresh(last_error, attempt)
+                self.session.ensure_alive(
+                    force_refresh=force_refresh, force_check=not force_refresh
+                )
             except Exception:  # noqa: BLE001
                 self.session.logged_in = False
             time.sleep(self._calc_backoff(attempt))
