@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime as dt
 import multiprocessing as mp
 import os
+import time
 from pathlib import Path
 from queue import Empty
 from typing import Iterable, Tuple
@@ -344,7 +345,7 @@ class AshareApp:
         failed_path.write_text("\n".join(merged))
 
     def _fetch_single_code_with_timeout(
-        self, code: str, start_date: str, end_date: str, freq: str, adjustflag: str
+            self, code: str, start_date: str, end_date: str, freq: str, adjustflag: str
     ) -> pd.DataFrame | None:
         for attempt in range(1, self.baostock_max_retries + 1):
             ctx = mp.get_context("spawn")
@@ -356,36 +357,28 @@ class AshareApp:
             process.start()
             status: str | None = None
             payload: pd.DataFrame | str | None = None
-            try:
-                status, payload = queue.get(timeout=self.baostock_per_code_timeout)
-            except Empty:
-                status = "timeout"
-                payload = None
-                self.logger.warning(
-                    "股票 %s 拉取超时（>%s 秒），已终止子进程，第 %s/%s 次重试",
-                    code,
-                    self.baostock_per_code_timeout,
-                    attempt,
-                    self.baostock_max_retries,
-                )
-            finally:
-                process.join(timeout=1)
-                if process.is_alive():
-                    process.terminate()
-                    process.join()
-                queue.close()
+            timeout_start = time.time()  # 记录开始时间
+
+            while True:
+                try:
+                    # 设置超时
+                    if time.time() - timeout_start > self.baostock_per_code_timeout:
+                        raise TimeoutError(f"股票 {code} 拉取超时。")
+                    status, payload = queue.get(timeout=1)  # 设置1秒超时
+                    break
+                except Empty:
+                    time.sleep(0.1)  # 如果队列为空，休眠一下
 
             if status == "ok":
                 return payload
 
-            if status != "timeout":
-                self.logger.warning(
-                    "股票 %s 拉取失败（第 %s/%s 次）: %s",
-                    code,
-                    attempt,
-                    self.baostock_max_retries,
-                    payload,
-                )
+            self.logger.warning(
+                "股票 %s 拉取失败（第 %s/%s 次）: %s",
+                code,
+                attempt,
+                self.baostock_max_retries,
+                payload,
+            )
 
         return None
 
