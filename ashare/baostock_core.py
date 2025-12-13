@@ -2,27 +2,93 @@
 
 from __future__ import annotations
 
+import logging
+import time
 from datetime import date, datetime, timedelta
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 import baostock as bs
 import pandas as pd
 
 from .baostock_session import BaostockSession
+from .config import get_section
 
 
 class BaostockDataFetcher:
     """封装常用 Baostock 数据访问接口。"""
 
-    def __init__(self, session: BaostockSession) -> None:
-        """保存会话引用，供后续请求使用。"""
+    def __init__(
+        self,
+        session: BaostockSession,
+        max_retries: int | None = None,
+        retry_backoff: float | None = None,
+    ) -> None:
+        """保存会话引用并加载接口重试配置。"""
 
         self.session = session
+        cfg = get_section("baostock")
+        raw_retry = max_retries if max_retries is not None else cfg.get("max_retries")
+        raw_backoff = (
+            retry_backoff if retry_backoff is not None else cfg.get("retry_sleep")
+        )
+
+        try:
+            parsed_retry = int(raw_retry) if raw_retry is not None else 3
+        except (TypeError, ValueError):
+            parsed_retry = 3
+
+        try:
+            parsed_backoff = float(raw_backoff) if raw_backoff is not None else 2.0
+        except (TypeError, ValueError):
+            parsed_backoff = 2.0
+
+        self.api_max_retries = max(1, parsed_retry)
+        self.api_retry_backoff = max(0.5, parsed_backoff)
+        self.logger = logging.getLogger(__name__)
 
     def _ensure_session(self) -> None:
         """确保会话已登录。"""
 
-        self.session.connect()
+        self.session.ensure_alive()
+
+    def _calc_backoff(self, attempt_index: int) -> float:
+        base = self.api_retry_backoff
+        max_sleep = 20.0
+        return min(max_sleep, base * (2 ** (attempt_index - 1)))
+
+    def _call_with_retry(self, func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        """对 Baostock 查询执行重试与会话自愈。"""
+
+        last_error: Exception | None = None
+        for attempt in range(1, self.api_max_retries + 1):
+            self._ensure_session()
+            try:
+                result = func(*args, **kwargs)
+                if getattr(result, "error_code", "0") == "0":
+                    return result
+                last_error = RuntimeError(
+                    f"Baostock 调用失败: {result.error_code}, {result.error_msg}"
+                )
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+
+            if attempt >= self.api_max_retries:
+                break
+
+            self.logger.warning(
+                "Baostock 调用异常（第 %s 次），即将重试：%s",
+                attempt,
+                last_error,
+            )
+            try:
+                self.session.ensure_alive(force_refresh=True)
+            except Exception:  # noqa: BLE001
+                self.session.logged_in = False
+            time.sleep(self._calc_backoff(attempt))
+
+        if last_error:
+            raise last_error
+        raise RuntimeError("未知的 Baostock 调用异常。")
 
     def _resultset_to_df(self, rs: Any) -> pd.DataFrame:
         """将 Baostock ResultSet 转换为 DataFrame，并在失败时抛出错误。"""
@@ -38,8 +104,7 @@ class BaostockDataFetcher:
     def get_trade_calendar(self, start_date: str, end_date: str) -> pd.DataFrame:
         """查询交易日历并过滤出交易日。"""
 
-        self._ensure_session()
-        rs = bs.query_trade_dates(start_date, end_date)
+        rs = self._call_with_retry(bs.query_trade_dates, start_date, end_date)
         df = self._resultset_to_df(rs)
         trading_df = df[df["is_trading_day"] == "1"].reset_index(drop=True)
         return trading_df[["calendar_date", "is_trading_day"]]
@@ -67,8 +132,7 @@ class BaostockDataFetcher:
     ) -> pd.DataFrame:
         """查询证券基本资料。"""
 
-        self._ensure_session()
-        rs = bs.query_stock_basic(code=code, code_name=code_name)
+        rs = self._call_with_retry(bs.query_stock_basic, code, code_name)
         df = self._resultset_to_df(rs)
         if df.empty:
             return df
@@ -85,8 +149,7 @@ class BaostockDataFetcher:
     def get_stock_industry(self, code: str | None = None) -> pd.DataFrame:
         """查询行业分类信息。"""
 
-        self._ensure_session()
-        rs = bs.query_stock_industry(code=code)
+        rs = self._call_with_retry(bs.query_stock_industry, code)
         df = self._resultset_to_df(rs)
         if df.empty:
             return df
@@ -109,7 +172,10 @@ class BaostockDataFetcher:
             raise ValueError("暂不支持的指数标识：{value}".format(value=index))
 
         query_fn = index_map[index_key]
-        rs = query_fn(date=date) if date else query_fn()
+        if date:
+            rs = self._call_with_retry(query_fn, date=date)
+        else:
+            rs = self._call_with_retry(query_fn)
         df = self._resultset_to_df(rs)
         if df.empty:
             return df
@@ -138,11 +204,10 @@ class BaostockDataFetcher:
             若在 fallback_days 内仍未找到任何数据，则返回空 DataFrame。
         """
 
-        self._ensure_session()
-
         def _query(day: str) -> pd.DataFrame:
             """内部封装一次 query_all_stock 调用。"""
-            rs = bs.query_all_stock(day=day)
+
+            rs = self._call_with_retry(bs.query_all_stock, day)
             df = self._resultset_to_df(rs)
             return df
 
@@ -184,12 +249,12 @@ class BaostockDataFetcher:
     ) -> pd.DataFrame:
         """获取 K 线行情数据。"""
 
-        self._ensure_session()
         fields = (
             "date,code,open,high,low,close,preclose,volume,amount,"
             "adjustflag,tradestatus,pctChg,isST"
         )
-        rs = bs.query_history_k_data_plus(
+        rs = self._call_with_retry(
+            bs.query_history_k_data_plus,
             code,
             fields,
             start_date=start_date,
@@ -219,43 +284,37 @@ class BaostockDataFetcher:
     def get_profit_data(self, code: str, year: int, quarter: int) -> pd.DataFrame:
         """获取利润表数据。"""
 
-        self._ensure_session()
-        rs = bs.query_profit_data(code=code, year=year, quarter=quarter)
+        rs = self._call_with_retry(bs.query_profit_data, code, year, quarter)
         return self._resultset_to_df(rs)
 
     def get_growth_data(self, code: str, year: int, quarter: int) -> pd.DataFrame:
         """获取成长能力数据。"""
 
-        self._ensure_session()
-        rs = bs.query_growth_data(code=code, year=year, quarter=quarter)
+        rs = self._call_with_retry(bs.query_growth_data, code, year, quarter)
         return self._resultset_to_df(rs)
 
     def get_balance_data(self, code: str, year: int, quarter: int) -> pd.DataFrame:
         """获取资产负债表数据。"""
 
-        self._ensure_session()
-        rs = bs.query_balance_data(code=code, year=year, quarter=quarter)
+        rs = self._call_with_retry(bs.query_balance_data, code, year, quarter)
         return self._resultset_to_df(rs)
 
     def get_cash_flow_data(self, code: str, year: int, quarter: int) -> pd.DataFrame:
         """获取现金流量表数据。"""
 
-        self._ensure_session()
-        rs = bs.query_cash_flow_data(code=code, year=year, quarter=quarter)
+        rs = self._call_with_retry(bs.query_cash_flow_data, code, year, quarter)
         return self._resultset_to_df(rs)
 
     def get_operation_data(self, code: str, year: int, quarter: int) -> pd.DataFrame:
         """获取营运能力数据。"""
 
-        self._ensure_session()
-        rs = bs.query_operation_data(code=code, year=year, quarter=quarter)
+        rs = self._call_with_retry(bs.query_operation_data, code, year, quarter)
         return self._resultset_to_df(rs)
 
     def get_dupont_data(self, code: str, year: int, quarter: int) -> pd.DataFrame:
         """获取杜邦指标数据。"""
 
-        self._ensure_session()
-        rs = bs.query_dupont_data(code=code, year=year, quarter=quarter)
+        rs = self._call_with_retry(bs.query_dupont_data, code, year, quarter)
         return self._resultset_to_df(rs)
 
     def get_performance_express_report(
@@ -263,9 +322,11 @@ class BaostockDataFetcher:
     ) -> pd.DataFrame:
         """获取业绩快报。"""
 
-        self._ensure_session()
-        rs = bs.query_performance_express_report(
-            code=code, start_date=start_date, end_date=end_date
+        rs = self._call_with_retry(
+            bs.query_performance_express_report,
+            code,
+            start_date,
+            end_date,
         )
         return self._resultset_to_df(rs)
 
@@ -274,8 +335,9 @@ class BaostockDataFetcher:
     ) -> pd.DataFrame:
         """获取业绩预告。"""
 
-        self._ensure_session()
-        rs = bs.query_forecast_report(code=code, start_date=start_date, end_date=end_date)
+        rs = self._call_with_retry(
+            bs.query_forecast_report, code, start_date, end_date
+        )
         return self._resultset_to_df(rs)
 
     def get_dividend_data(
@@ -283,8 +345,7 @@ class BaostockDataFetcher:
     ) -> pd.DataFrame:
         """获取分红送配信息。"""
 
-        self._ensure_session()
-        rs = bs.query_dividend_data(code=code, year=year, yearType=year_type)
+        rs = self._call_with_retry(bs.query_dividend_data, code, year, year_type)
         return self._resultset_to_df(rs)
 
     def get_adjust_factor(
@@ -292,8 +353,7 @@ class BaostockDataFetcher:
     ) -> pd.DataFrame:
         """获取复权因子信息。"""
 
-        self._ensure_session()
-        rs = bs.query_adjust_factor(code=code, start_date=start_date, end_date=end_date)
+        rs = self._call_with_retry(bs.query_adjust_factor, code, start_date, end_date)
         return self._resultset_to_df(rs)
 
     def get_deposit_rate_data(
@@ -301,8 +361,9 @@ class BaostockDataFetcher:
     ) -> pd.DataFrame:
         """获取存款利率数据。"""
 
-        self._ensure_session()
-        rs = bs.query_deposit_rate_data(start_date=start_date, end_date=end_date)
+        rs = self._call_with_retry(
+            bs.query_deposit_rate_data, start_date=start_date, end_date=end_date
+        )
         return self._resultset_to_df(rs)
 
     def get_loan_rate_data(
@@ -310,8 +371,9 @@ class BaostockDataFetcher:
     ) -> pd.DataFrame:
         """获取贷款利率数据。"""
 
-        self._ensure_session()
-        rs = bs.query_loan_rate_data(start_date=start_date, end_date=end_date)
+        rs = self._call_with_retry(
+            bs.query_loan_rate_data, start_date=start_date, end_date=end_date
+        )
         return self._resultset_to_df(rs)
 
     def get_required_reserve_ratio_data(
@@ -319,9 +381,11 @@ class BaostockDataFetcher:
     ) -> pd.DataFrame:
         """获取存款准备金率数据。"""
 
-        self._ensure_session()
-        rs = bs.query_required_reserve_ratio_data(
-            start_date=start_date, end_date=end_date, yearType=year_type
+        rs = self._call_with_retry(
+            bs.query_required_reserve_ratio_data,
+            start_date,
+            end_date,
+            year_type,
         )
         return self._resultset_to_df(rs)
 
@@ -330,8 +394,9 @@ class BaostockDataFetcher:
     ) -> pd.DataFrame:
         """获取月度货币供应量数据。"""
 
-        self._ensure_session()
-        rs = bs.query_money_supply_data_month(start_date=start_date, end_date=end_date)
+        rs = self._call_with_retry(
+            bs.query_money_supply_data_month, start_date=start_date, end_date=end_date
+        )
         return self._resultset_to_df(rs)
 
     def get_money_supply_data_year(
@@ -339,8 +404,9 @@ class BaostockDataFetcher:
     ) -> pd.DataFrame:
         """获取年度货币供应量数据。"""
 
-        self._ensure_session()
-        rs = bs.query_money_supply_data_year(start_date=start_date, end_date=end_date)
+        rs = self._call_with_retry(
+            bs.query_money_supply_data_year, start_date=start_date, end_date=end_date
+        )
         return self._resultset_to_df(rs)
 
     def get_shibor_data(
@@ -351,8 +417,9 @@ class BaostockDataFetcher:
         if not hasattr(bs, "query_shibor_data"):
             raise RuntimeError("当前 Baostock 版本不支持 Shibor 接口。")
 
-        self._ensure_session()
-        rs = bs.query_shibor_data(start_date=start_date, end_date=end_date)
+        rs = self._call_with_retry(
+            bs.query_shibor_data, start_date=start_date, end_date=end_date
+        )
         return self._resultset_to_df(rs)
 
 

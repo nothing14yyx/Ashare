@@ -65,7 +65,9 @@ def _worker_fetch_kline(args: tuple[str, str, str, str, str, int]) -> tuple[str,
 
             time.sleep(_calc_backoff(attempt))
             try:
-                _worker_session.ensure_alive(force_refresh=attempt > 1)
+                message = str(exc)
+                force_refresh = attempt > 1 or "10054" in message
+                _worker_session.ensure_alive(force_refresh=force_refresh)
             except Exception:  # noqa: BLE001
                 _worker_session = BaostockSession()
                 _worker_session.connect()
