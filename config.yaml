@@ -40,6 +40,18 @@ baostock:
   max_retries: 2
   # 断点续跑判定：每只股票满足最少行数后视为已完成
   resume_min_rows_per_code: 200
+  # 并发控制：默认/最小/最大子进程数以及网络带宽上限
+  worker_processes: 4
+  min_worker_processes: 1
+  max_worker_processes: 8
+  network_worker_cap: 4
+  # 进度日志与批量写入配置
+  progress_log_every: 100
+  history_flush_batch: 5
+  history_write_chunksize: 500
+  # 清理策略：window=仅清理当前批次区间，skip=直接追加；history_retention_days>0 时会按窗口定期清理
+  history_cleanup_mode: window
+  history_retention_days: 0
 
 akshare:
   enabled: false

@@ -7,12 +7,10 @@ import multiprocessing as mp
 import os
 import time
 from pathlib import Path
-from queue import Empty
 from typing import Iterable, Tuple
 
 import pandas as pd
-from tqdm import tqdm
-from sqlalchemy import bindparam, text
+from sqlalchemy import bindparam, inspect, text
 
 from .akshare_fetcher import AkshareDataFetcher
 from .baostock_core import BaostockDataFetcher
@@ -25,32 +23,52 @@ from .universe import AshareUniverseBuilder
 from .utils import setup_logger
 
 
-def _fetch_kline_task(
-    queue: mp.Queue,
-    code: str,
-    start_date: str,
-    end_date: str,
-    freq: str,
-    adjustflag: str,
-) -> None:
-    """子进程中拉取单只股票 K 线并通过队列返回。"""
+_worker_session: BaostockSession | None = None
+_worker_fetcher: BaostockDataFetcher | None = None
 
-    session = BaostockSession()
-    try:
-        session.connect()
-        fetcher = BaostockDataFetcher(session)
-        df = fetcher.get_kline(
-            code=code,
-            start_date=start_date,
-            end_date=end_date,
-            freq=freq,
-            adjustflag=adjustflag,
-        )
-        queue.put(("ok", df))
-    except Exception as exc:  # noqa: BLE001
-        queue.put(("error", str(exc)))
-    finally:
-        session.logout()
+
+def _init_kline_worker() -> None:
+    """在子进程中初始化并复用 Baostock 会话。"""
+
+    global _worker_session, _worker_fetcher
+    _worker_session = BaostockSession()
+    _worker_session.connect()
+    _worker_fetcher = BaostockDataFetcher(_worker_session)
+
+
+def _worker_fetch_kline(args: tuple[str, str, str, str, str, int]) -> tuple[str, str, pd.DataFrame | str]:
+    """子进程中拉取单只股票 K 线，复用会话减少登录开销。"""
+
+    global _worker_session, _worker_fetcher
+    code, start_date, end_date, freq, adjustflag, max_retries = args
+    if _worker_session is None or _worker_fetcher is None:
+        raise RuntimeError("Baostock 会话未初始化。")
+
+    def _calc_backoff(attempt_index: int) -> float:
+        base = 1.0
+        max_backoff = 15.0
+        return min(max_backoff, base * (2 ** (attempt_index - 1)))
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            df = _worker_fetcher.get_kline(
+                code=code,
+                start_date=start_date,
+                end_date=end_date,
+                freq=freq,
+                adjustflag=adjustflag,
+            )
+            return "ok", code, df
+        except Exception as exc:  # noqa: BLE001
+            if attempt >= max_retries:
+                return "error", code, str(exc)
+            time.sleep(_calc_backoff(attempt))
+            try:
+                _worker_session.reconnect()
+            except Exception:  # noqa: BLE001
+                _worker_session = BaostockSession()
+                _worker_session.connect()
+                _worker_fetcher = BaostockDataFetcher(_worker_session)
 
 
 class AshareApp:
@@ -78,16 +96,52 @@ class AshareApp:
         self.baostock_max_retries = self._read_int_from_env(
             "ASHARE_BAOSTOCK_MAX_RETRIES", baostock_cfg.get("max_retries", 2)
         )
+        worker_default = baostock_cfg.get("worker_processes", min(4, mp.cpu_count()))
+        worker_min = baostock_cfg.get("min_worker_processes", 1)
+        worker_max = baostock_cfg.get("max_worker_processes", mp.cpu_count())
+        network_cap = baostock_cfg.get("network_worker_cap", worker_default)
+        self.worker_processes_default = self._read_int_from_env(
+            "ASHARE_BAOSTOCK_WORKERS", worker_default
+        )
+        self.worker_processes_min = self._read_int_from_env(
+            "ASHARE_BAOSTOCK_MIN_WORKERS", worker_min
+        )
+        self.worker_processes_max = self._read_int_from_env(
+            "ASHARE_BAOSTOCK_MAX_WORKERS", worker_max
+        )
+        self.network_worker_cap = self._read_int_from_env(
+            "ASHARE_BAOSTOCK_NETWORK_WORKER_CAP", network_cap
+        )
+        self.progress_log_every = self._read_int_from_env(
+            "ASHARE_PROGRESS_LOG_EVERY", baostock_cfg.get("progress_log_every", 100)
+        )
         self.resume_min_rows_per_code = self._read_int_from_env(
             "ASHARE_RESUME_MIN_ROWS_PER_CODE",
             baostock_cfg.get("resume_min_rows_per_code", 200),
         )
-        self.history_flush_batch = 5
-        self.write_chunksize = 500
+        self.history_flush_batch = self._read_int_from_env(
+            "ASHARE_HISTORY_FLUSH_BATCH", baostock_cfg.get("history_flush_batch", 5)
+        )
+        self.write_chunksize = self._read_int_from_env(
+            "ASHARE_HISTORY_WRITE_CHUNKSIZE",
+            baostock_cfg.get("history_write_chunksize", 500),
+        )
+        cleanup_mode_raw = os.getenv(
+            "ASHARE_HISTORY_CLEANUP_MODE", baostock_cfg.get("history_cleanup_mode", "window")
+        )
+        cleanup_mode = str(cleanup_mode_raw).strip().lower()
+        if cleanup_mode not in {"window", "skip"}:
+            cleanup_mode = "window"
+        self.history_cleanup_mode = cleanup_mode
+        self.history_retention_days = self._read_int_from_env(
+            "ASHARE_HISTORY_RETENTION_DAYS", baostock_cfg.get("history_retention_days", 0)
+        )
         if self.baostock_max_retries < 1:
             self.baostock_max_retries = 1
         if self.baostock_per_code_timeout <= 0:
             self.baostock_per_code_timeout = 30
+        if self.progress_log_every < 1:
+            self.progress_log_every = 100
 
         # 从 config.yaml 读取基础面刷新开关
         app_cfg = get_section("app")
@@ -212,6 +266,23 @@ class AshareApp:
 
         return default
 
+    def _choose_worker_processes(self, total_codes: int) -> int:
+        """根据配置、CPU 与任务规模动态确定子进程数量。"""
+
+        bounded_max = max(1, min(self.worker_processes_max, mp.cpu_count()))
+        bounded_min = max(1, min(self.worker_processes_min, bounded_max))
+        base_default = max(bounded_min, min(self.worker_processes_default, bounded_max))
+        network_cap = self.network_worker_cap
+        if network_cap <= 0:
+            network_cap = bounded_max
+        else:
+            network_cap = max(bounded_min, min(network_cap, bounded_max))
+
+        adaptive = min(base_default, network_cap, total_codes or 1)
+        if total_codes > 1000 and adaptive < bounded_max:
+            adaptive = min(bounded_max, adaptive + 1)
+        return max(bounded_min, adaptive)
+
     def _get_trading_days_between(
         self, start_day: dt.date, end_day: dt.date
     ) -> list[dt.date]:
@@ -261,6 +332,10 @@ class AshareApp:
             dynamic_threshold = trading_count
         return max(1, min(self.resume_min_rows_per_code, dynamic_threshold))
 
+    def _table_exists(self, table_name: str) -> bool:
+        inspector = inspect(self.db_writer.engine)
+        return inspector.has_table(table_name)
+
     def _load_completed_codes(self, table_name: str, min_rows: int) -> set[str]:
         query = text(
             "SELECT `code` FROM `{table}` GROUP BY `code` HAVING COUNT(*) >= :threshold".format(
@@ -304,25 +379,30 @@ class AshareApp:
                 max_date = max_date_raw.date().isoformat()
 
         if codes and min_date and max_date:
-            delete_stmt = (
-                text(
-                    "DELETE FROM `{table}` WHERE `code` IN (:codes) AND `date` BETWEEN :start_date AND :end_date".format(
-                        table=table_name
-                    )
-                ).bindparams(bindparam("codes", expanding=True))
-            )
-            try:
-                with self.db_writer.engine.begin() as conn:
-                    conn.execute(
-                        delete_stmt,
-                        {
-                            "codes": codes,
-                            "start_date": min_date,
-                            "end_date": max_date,
-                        },
-                    )
-            except Exception as exc:  # noqa: BLE001
-                self.logger.warning("删除旧数据失败，将直接追加：%s", exc)
+            if self.history_cleanup_mode == "skip":
+                self.logger.info("清理模式为 skip，直接追加 %s 条记录。", len(combined))
+            elif not self._table_exists(table_name):
+                self.logger.info("表 %s 不存在，跳过旧数据删除。", table_name)
+            else:
+                delete_stmt = (
+                    text(
+                        "DELETE FROM `{table}` WHERE `code` IN :codes AND `date` BETWEEN :start_date AND :end_date".format(
+                            table=table_name
+                        )
+                    ).bindparams(bindparam("codes", expanding=True))
+                )
+                try:
+                    with self.db_writer.engine.begin() as conn:
+                        conn.execute(
+                            delete_stmt,
+                            {
+                                "codes": codes,
+                                "start_date": min_date,
+                                "end_date": max_date,
+                            },
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    self.logger.warning("删除旧数据失败，将直接追加：%s", exc)
 
         self.db_writer.write_dataframe(
             combined,
@@ -331,6 +411,42 @@ class AshareApp:
             chunksize=self.write_chunksize,
             method="multi",
         )
+
+        self._log_memory_usage("历史批量写入")
+
+    def _log_memory_usage(self, prefix: str) -> None:
+        try:
+            import resource
+
+            usage = resource.getrusage(resource.RUSAGE_SELF)
+            memory_mb = usage.ru_maxrss / 1024
+            self.logger.debug("%s后内存峰值约 %.2f MB", prefix, memory_mb)
+        except Exception:
+            return
+
+    def _purge_old_history(self, table_name: str, reference_date: str) -> None:
+        if self.history_retention_days <= 0:
+            return
+        if not self._table_exists(table_name):
+            return
+
+        try:
+            end_day = dt.datetime.strptime(reference_date, "%Y-%m-%d").date()
+        except ValueError:
+            return
+
+        cutoff = (end_day - dt.timedelta(days=self.history_retention_days)).isoformat()
+        purge_stmt = text(
+            "DELETE FROM `{table}` WHERE `date` < :cutoff".format(table=table_name)
+        )
+        try:
+            with self.db_writer.engine.begin() as conn:
+                conn.execute(purge_stmt, {"cutoff": cutoff})
+            self.logger.info(
+                "已按照保留窗口 %s 天清理 %s 之前的历史日线。", self.history_retention_days, cutoff
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.logger.warning("历史保留窗口清理失败：%s", exc)
 
     def _write_failed_codes(self, failed_codes: list[str]) -> None:
         if not failed_codes:
@@ -344,62 +460,6 @@ class AshareApp:
         merged = sorted(existing.union(failed_codes))
         failed_path.write_text("\n".join(merged))
 
-    def _fetch_single_code_with_timeout(
-            self, code: str, start_date: str, end_date: str, freq: str, adjustflag: str
-    ) -> pd.DataFrame | None:
-        for attempt in range(1, self.baostock_max_retries + 1):
-            ctx = mp.get_context("spawn")
-            queue: mp.Queue = ctx.Queue()
-            process = ctx.Process(
-                target=_fetch_kline_task,
-                args=(queue, code, start_date, end_date, freq, adjustflag),
-            )
-            process.start()
-            status: str | None = None
-            payload: pd.DataFrame | str | None = None
-            timeout_start = time.time()  # 记录开始时间
-
-            try:
-                while True:
-                    try:
-                        if time.time() - timeout_start > self.baostock_per_code_timeout:
-                            raise TimeoutError(f"股票 {code} 拉取超时。")
-
-                        status, payload = queue.get(timeout=1)
-                        break
-                    except Empty:
-                        time.sleep(0.1)
-            except TimeoutError as exc:
-                self.logger.warning(
-                    "股票 %s 拉取超时（第 %s/%s 次）: %s",
-                    code,
-                    attempt,
-                    self.baostock_max_retries,
-                    exc,
-                )
-                process.terminate()
-                process.join()
-                continue
-            finally:
-                if process.is_alive():
-                    process.join(timeout=1)
-                    if process.is_alive():
-                        process.terminate()
-                        process.join()
-
-            if status == "ok":
-                return payload
-
-            self.logger.warning(
-                "股票 %s 拉取失败（第 %s/%s 次）: %s",
-                code,
-                attempt,
-                self.baostock_max_retries,
-                payload,
-            )
-
-        return None
-
     def _fetch_and_store_history(
         self,
         stock_df: pd.DataFrame,
@@ -410,7 +470,6 @@ class AshareApp:
         resume_threshold: int | None = None,
     ) -> tuple[int, list[str], list[str], int]:
         history_frames: list[pd.DataFrame] = []
-        total = len(stock_df)
         success_count = 0
         empty_codes: list[str] = []
         failed_codes: list[str] = []
@@ -419,42 +478,57 @@ class AshareApp:
         if resume_threshold is not None and resume_threshold > 0:
             done_codes = self._load_completed_codes(base_table, resume_threshold)
 
-        pbar = tqdm(stock_df["code"], desc="数据拉取进度", total=total)
-        for idx, code in enumerate(pbar, start=1):
-            pbar.set_postfix_str(str(code))
-            if code in done_codes:
-                skipped += 1
-                continue
+        codes = [str(code) for code in stock_df.get("code", []) if pd.notna(code)]
+        codes_to_fetch = [code for code in codes if code not in done_codes]
+        skipped = len(codes) - len(codes_to_fetch)
+        if not codes_to_fetch:
+            self.logger.info("历史日线已经完成，跳过拉取。")
+            return success_count, empty_codes, failed_codes, skipped
 
-            daily_df = self._fetch_single_code_with_timeout(
-                code=code,
-                start_date=start_day,
-                end_date=end_date,
-                freq="d",
-                adjustflag=adjustflag,
-            )
+        ctx = mp.get_context("spawn")
+        worker_processes = self._choose_worker_processes(len(codes_to_fetch))
+        worker_args = [
+            (code, start_day, end_date, "d", adjustflag, self.baostock_max_retries)
+            for code in codes_to_fetch
+        ]
 
-            if daily_df is None:
-                failed_codes.append(code)
-                continue
+        self.logger.info(
+            "本次历史日线拉取将使用 %s 个并发子进程（候选 %s 支股票）。",
+            worker_processes,
+            len(codes_to_fetch),
+        )
 
-            if daily_df.empty:
-                empty_codes.append(code)
-                continue
-
-            history_frames.append(daily_df)
-            success_count += 1
-
-            if history_frames and (
-                len(history_frames) >= self.history_flush_batch or idx == total
+        with ctx.Pool(
+            processes=worker_processes,
+            initializer=_init_kline_worker,
+            maxtasksperchild=200,
+        ) as pool:
+            for idx, result in enumerate(
+                pool.imap_unordered(_worker_fetch_kline, worker_args), start=1
             ):
-                self._flush_history_batch(history_frames, base_table, if_exists="append")
-                history_frames.clear()
+                status, code, payload = result
+                if status == "ok" and isinstance(payload, pd.DataFrame):
+                    if payload.empty:
+                        empty_codes.append(code)
+                    else:
+                        history_frames.append(payload)
+                        success_count += 1
+                else:
+                    failed_codes.append(code)
 
-            if idx % 500 == 0 or idx == total:
-                self.logger.info(
-                    "已完成 %s/%s 支股票的拉取，最近处理 %s", idx, total, code
-                )
+                if history_frames and (
+                    len(history_frames) >= self.history_flush_batch
+                    or idx == len(codes_to_fetch)
+                ):
+                    self._flush_history_batch(
+                        history_frames, base_table, if_exists="append"
+                    )
+                    history_frames.clear()
+
+                if idx % self.progress_log_every == 0 or idx == len(codes_to_fetch):
+                    self.logger.info(
+                        "已完成 %s/%s 支股票的拉取，最近处理 %s", idx, len(codes_to_fetch), code
+                    )
 
         if history_frames:
             self._flush_history_batch(history_frames, base_table, if_exists="append")
@@ -465,7 +539,7 @@ class AshareApp:
         self.logger.info(
             "拉取结束：成功 %s/%s，空数据 %s，失败 %s，跳过 %s",
             success_count,
-            total,
+            len(codes_to_fetch),
             len(empty_codes),
             len(failed_codes),
             skipped,
@@ -475,6 +549,8 @@ class AshareApp:
             self.logger.debug("完全未返回数据的股票：%s", ", ".join(sorted(empty_codes)))
         if failed_codes:
             self.logger.debug("请求失败的股票：%s", ", ".join(sorted(failed_codes)))
+
+        self._purge_old_history(base_table, end_date)
 
         return success_count, empty_codes, failed_codes, skipped
 

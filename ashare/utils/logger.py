@@ -1,6 +1,7 @@
 """日志工具."""
 
 import logging
+import os
 from pathlib import Path
 
 
@@ -20,8 +21,13 @@ def setup_logger(log_dir: Path | None = None) -> logging.Logger:
     log_dir.mkdir(parents=True, exist_ok=True)
 
     log_file = log_dir / "ashare.log"
+    level_name = os.getenv("ASHARE_LOG_LEVEL", "INFO").upper()
+    level = logging.getLevelName(level_name)
+    if not isinstance(level, int):
+        level = logging.INFO
+
     logging.basicConfig(
-        level=logging.INFO,
+        level=level,
         format="%(asctime)s [%(levelname)s] %(message)s",
         handlers=[
             logging.FileHandler(log_file, encoding="utf-8"),
