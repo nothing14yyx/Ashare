@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 
 import pandas as pd
 
-from .baostock_core import BaostockDataFetcher
+from .baostock_core import ADJUSTFLAG_NONE, BaostockDataFetcher
 from .baostock_session import BaostockSession
 
 
@@ -28,7 +28,11 @@ def fetch_recent_30d_daily_k_all(
             try:
                 session.ensure_alive()
                 return fetcher.get_kline(
-                    code, start_date, end_date, freq="d", adjustflag="1"
+                    code,
+                    start_date,
+                    end_date,
+                    freq="d",
+                    adjustflag=ADJUSTFLAG_NONE,
                 )
             except Exception as exc:  # noqa: BLE001
                 last_exc = exc

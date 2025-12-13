@@ -14,7 +14,7 @@ import pandas as pd
 from sqlalchemy import bindparam, inspect, text
 
 from .akshare_fetcher import AkshareDataFetcher
-from .baostock_core import BaostockDataFetcher
+from .baostock_core import ADJUSTFLAG_NONE, BaostockDataFetcher
 from .baostock_session import BaostockSession
 from .config import ProxyConfig, get_section
 from .db import DatabaseConfig, MySQLWriter
@@ -553,7 +553,7 @@ class AshareApp:
         start_day: str,
         end_date: str,
         base_table: str,
-        adjustflag: str = "1",
+        adjustflag: str = ADJUSTFLAG_NONE,
         resume_threshold: int | None = None,
     ) -> tuple[int, list[str], list[str], int]:
         history_frames: list[pd.DataFrame] = []
@@ -763,7 +763,7 @@ class AshareApp:
             start_day=start_day,
             end_date=end_date,
             base_table=base_table,
-            adjustflag="1",
+            adjustflag=ADJUSTFLAG_NONE,
             resume_threshold=resume_threshold,
         )
 
@@ -943,7 +943,7 @@ class AshareApp:
                     start_day=start_day,
                     end_date=end_date,
                     base_table=base_table,
-                    adjustflag="1",
+                    adjustflag=ADJUSTFLAG_NONE,
                     resume_threshold=None,
                 )
             else:

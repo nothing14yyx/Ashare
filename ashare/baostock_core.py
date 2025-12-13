@@ -13,6 +13,9 @@ import pandas as pd
 from .baostock_session import BaostockSession
 from .config import get_section
 
+# adjustflag=3 表示不复权，适用于与实盘价格对齐的场景
+ADJUSTFLAG_NONE = "3"
+
 
 class BaostockDataFetcher:
     """封装常用 Baostock 数据访问接口。"""
@@ -266,7 +269,7 @@ class BaostockDataFetcher:
         start_date: str,
         end_date: str,
         freq: str = "d",
-        adjustflag: str = "3",
+        adjustflag: str = ADJUSTFLAG_NONE,
     ) -> pd.DataFrame:
         """获取 K 线行情数据。"""
 
