@@ -349,7 +349,7 @@ class AshareApp:
     ) -> pd.DataFrame | None:
         for attempt in range(1, self.baostock_max_retries + 1):
             ctx = mp.get_context("spawn")
-            queue: mp.SimpleQueue = ctx.SimpleQueue()
+            queue: mp.Queue = ctx.Queue()
             process = ctx.Process(
                 target=_fetch_kline_task,
                 args=(queue, code, start_date, end_date, freq, adjustflag),
@@ -359,15 +359,33 @@ class AshareApp:
             payload: pd.DataFrame | str | None = None
             timeout_start = time.time()  # 记录开始时间
 
-            while True:
-                try:
-                    # 设置超时
-                    if time.time() - timeout_start > self.baostock_per_code_timeout:
-                        raise TimeoutError(f"股票 {code} 拉取超时。")
-                    status, payload = queue.get(timeout=1)  # 设置1秒超时
-                    break
-                except Empty:
-                    time.sleep(0.1)  # 如果队列为空，休眠一下
+            try:
+                while True:
+                    try:
+                        if time.time() - timeout_start > self.baostock_per_code_timeout:
+                            raise TimeoutError(f"股票 {code} 拉取超时。")
+
+                        status, payload = queue.get(timeout=1)
+                        break
+                    except Empty:
+                        time.sleep(0.1)
+            except TimeoutError as exc:
+                self.logger.warning(
+                    "股票 %s 拉取超时（第 %s/%s 次）: %s",
+                    code,
+                    attempt,
+                    self.baostock_max_retries,
+                    exc,
+                )
+                process.terminate()
+                process.join()
+                continue
+            finally:
+                if process.is_alive():
+                    process.join(timeout=1)
+                    if process.is_alive():
+                        process.terminate()
+                        process.join()
 
             if status == "ok":
                 return payload
