@@ -136,13 +136,18 @@ class BaostockSession:
             return
 
         try:
-            rs = bs.query_server_version()
-            if getattr(rs, "error_code", None) != "0":
-                raise RuntimeError("Baostock 会话失效，需要重新登录。")
+            self._probe_alive()
         except Exception:
             self.reconnect()
         else:
             self._last_alive_ts = time.time()
+
+    def _probe_alive(self) -> None:
+        """通过轻量查询验证会话可用性。"""
+
+        rs = bs.query_sz50_stocks()
+        if getattr(rs, "error_code", None) != "0":
+            raise RuntimeError("Baostock 会话失效，需要重新登录。")
 
     def reconnect(self) -> None:
         """重新建立 Baostock 连接。"""
