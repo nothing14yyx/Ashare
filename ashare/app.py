@@ -289,8 +289,9 @@ class AshareApp:
             else self._read_int_from_env("ASHARE_MIN_LISTING_DAYS", cfg_min_listing)
         )
         self.logger.info(
-            "参数配置：history_days=%s, top_liquidity_count=%s, min_listing_days=%s, fetch_daily_kline=%s",
+            "参数配置：history_days=%s, history_view_days=%s, top_liquidity_count=%s, min_listing_days=%s, fetch_daily_kline=%s",
             self.history_days,
+            self.history_view_days,
             resolved_top_liquidity,
             resolved_min_listing_days,
             self.fetch_daily_kline,
@@ -362,20 +363,18 @@ class AshareApp:
         create_view_sql = text(
             """
             CREATE OR REPLACE VIEW `{view}` AS
-            WITH recent_dates AS (
-                SELECT
-                    `date`,
-                    DENSE_RANK() OVER (ORDER BY `date` DESC) AS rnk
+            SELECT b.*
+            FROM `{base}` AS b
+            JOIN (
+                SELECT `date`
                 FROM (
                     SELECT DISTINCT `date`
                     FROM `{base}`
                     WHERE `date` <= '{cutoff}'
+                    ORDER BY `date` DESC
+                    LIMIT {window}
                 ) AS d
-            )
-            SELECT b.*
-            FROM `{base}` AS b
-            JOIN recent_dates AS r ON b.`date` = r.`date`
-            WHERE r.rnk <= {window}
+            ) AS recent_dates ON b.`date` = recent_dates.`date`
             """.format(
                 view=view,
                 base=base_table,
@@ -1088,6 +1087,50 @@ class AshareApp:
         recent_df["date"] = pd.to_datetime(recent_df["date"])
         return recent_df, recent_view
 
+
+    def _refresh_history_calendar_view(
+        self,
+        base_table: str,
+        end_day: dt.date,
+        slice_window_days: int | None = None,
+    ) -> None:
+        """按自然日刷新近期查询视图（用于手动 SQL 查询，不影响回测/指标计算口径）。
+
+        - 使用 app.history_view_days 控制自然日窗口（例如 45）。
+        - 默认视图名为 history_recent_{N}_days；若与交易日切片视图同名，则自动改为
+          history_recent_calendar_{N}_days 以避免覆盖。
+        """
+
+        view_days_raw = getattr(self, "history_view_days", 0) or 0
+        try:
+            view_days = int(view_days_raw)
+        except (TypeError, ValueError):  # noqa: PERF203
+            view_days = 0
+
+        if view_days <= 0:
+            return
+
+        view_name = f"history_recent_{view_days}_days"
+        if slice_window_days is not None and int(slice_window_days) == view_days:
+            view_name = f"history_recent_calendar_{view_days}_days"
+
+        try:
+            self._create_recent_history_calendar_view(
+                base_table,
+                view_days,
+                end_day=end_day,
+                view_name=view_name,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.logger.warning(
+                "创建近期自然日视图失败（base=%s, view=%s, end=%s, days=%s）: %s",
+                base_table,
+                view_name,
+                end_day.isoformat(),
+                view_days,
+                exc,
+            )
+
     def _export_daily_history_incremental(
         self,
         stock_df: pd.DataFrame,
@@ -1161,6 +1204,7 @@ class AshareApp:
             recent_df, recent_table = self._export_recent_daily_history(
                 stock_df, end_date, days=window_days, base_table=base_table
             )
+            self._refresh_history_calendar_view(base_table, end_day, slice_window_days=window_days)
             return recent_df, recent_table
         elif fetch_enabled and last_date_value >= end_day:
             done_codes = self._load_completed_codes(
@@ -1173,6 +1217,7 @@ class AshareApp:
                 recent_df, recent_table = self._export_recent_daily_history(
                     stock_df, end_date, days=window_days, base_table=base_table
                 )
+                self._refresh_history_calendar_view(base_table, end_day, slice_window_days=window_days)
                 return recent_df, recent_table
             self.logger.info(
                 "历史日线表 %s 已包含截至 %s 的数据，跳过增量拉取。",
@@ -1180,6 +1225,7 @@ class AshareApp:
                 end_date,
             )
             recent_df, recent_table = self._slice_recent_window(base_table, end_day, window_days)
+            self._refresh_history_calendar_view(base_table, end_day, slice_window_days=window_days)
             return recent_df, recent_table
         elif fetch_enabled:
             trade_start = last_date_value + dt.timedelta(days=1)
@@ -1212,8 +1258,8 @@ class AshareApp:
                 self.logger.info("本次没有任何新的日线数据可写入。")
 
         recent_df, recent_table = self._slice_recent_window(base_table, end_day, window_days)
+        self._refresh_history_calendar_view(base_table, end_day, slice_window_days=window_days)
         return recent_df, recent_table
-
     def _extract_focus_codes(self, df: pd.DataFrame) -> list[str]:
         if df.empty:
             return []
