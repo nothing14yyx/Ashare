@@ -5,9 +5,10 @@
 数据依赖：
   history_daily_kline（全量日线表；运行时按日期窗口截取，避免依赖 history_recent_xxx_days VIEW）
 
-输出两张 MySQL 表：
+输出：
   - strategy_ma5_ma20_signals：最新交易日每只股票的信号快照（BUY/SELL/HOLD + reason）
-  - strategy_ma5_ma20_candidates：仅保留 BUY 候选清单（符合“多数时间等待，少数时间出手”）
+  - 默认通过 VIEW 筛选最新交易日 BUY 候选
+    （v_strategy_ma5_ma20_candidates_latest，如需物理表可关闭 candidates_as_view）
 
 说明：
   - 本实现先做“日线低频版本”作为选股/清单层。
@@ -55,9 +56,13 @@ class MA5MA20Params:
     # KDJ 低位阈值（可选增强：只做 reason 标记，不强制）
     kdj_low_threshold: float = 30.0
 
-    # 输出表
+    # 输出表/视图
     signals_table: str = "strategy_ma5_ma20_signals"
-    candidates_table: str = "strategy_ma5_ma20_candidates"
+    candidates_table: str = "strategy_ma5_ma20_candidates"  # 仅在 candidates_as_view=False 时写表
+
+    # 可选：用视图替代 candidates 表（更简洁；候选清单实时从 signals 最新日筛选）
+    candidates_as_view: bool = True
+    candidates_view: str = "v_strategy_ma5_ma20_candidates_latest"
 
     @classmethod
     def from_config(cls) -> "MA5MA20Params":
@@ -477,6 +482,28 @@ class MA5MA20StrategyRunner:
         with self.db_writer.engine.begin() as conn:
             conn.execute(create_stmt)
 
+    def _ensure_candidates_view(self, view_name: str) -> None:
+        """创建/更新 candidates 视图：从 signals 最新交易日筛选 BUY。
+
+        若 signals 行数未来显著增长，可在 signals 上为 (`date`,`signal`) 建索引。
+        """
+        base = self.params.signals_table
+        create_stmt = text(
+            f"""
+            CREATE OR REPLACE VIEW `{view_name}` AS
+            SELECT
+              `date`,`code`,`close`,
+              `ma5`,`ma20`,`ma60`,`ma250`,
+              `vol_ratio`,`macd_hist`,`kdj_k`,`kdj_d`,`atr14`,`stop_ref`,
+              `reason`
+            FROM `{base}`
+            WHERE `date` = (SELECT MAX(`date`) FROM `{base}`)
+              AND `signal` = 'BUY'
+            """
+        )
+        with self.db_writer.engine.begin() as conn:
+            conn.execute(create_stmt)
+
     def _clear_table(self, table: str) -> None:
         try:
             with self.db_writer.engine.begin() as conn:
@@ -598,7 +625,10 @@ class MA5MA20StrategyRunner:
         sig = self._generate_signals(ind)
 
         self._write_signals(latest_date, sig)
-        self._write_candidates(latest_date, sig)
+        if bool(getattr(self.params, "candidates_as_view", False)):
+            self._ensure_candidates_view(self.params.candidates_view)
+        else:
+            self._write_candidates(latest_date, sig)
 
         latest_sig = sig[sig["date"].dt.date == latest_date]
         cnt_buy = int((latest_sig["signal"] == "BUY").sum())

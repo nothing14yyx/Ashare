@@ -100,9 +100,7 @@ akshare:
     detail_top_n: 100
 
 # MA5-MA20 顺势趋势波段系统
-# - enabled: true  时会在 start.py 数据采集后自动运行，并写入两张策略表：
-#   1) strategy_ma5_ma20_signals（信号快照）
-#   2) strategy_ma5_ma20_candidates（BUY 候选清单）
+# - enabled: true 时会在 start.py 数据采集后自动运行，默认写入 signals 表并创建 candidates 视图
 strategy_ma5_ma20_trend:
   enabled: true
   # 选股池来源：top_liquidity（推荐，低频）/ universe / all
@@ -117,5 +115,9 @@ strategy_ma5_ma20_trend:
   kdj_low_threshold: 30
 
   signals_table: strategy_ma5_ma20_signals
-  candidates_table: strategy_ma5_ma20_candidates
+  candidates_table: strategy_ma5_ma20_candidates  # 仅在 candidates_as_view=false 时写表
+
+  # 用视图替代 candidates 表（更简洁：候选清单实时从 signals 最新日筛选）
+  candidates_as_view: true
+  candidates_view: v_strategy_ma5_ma20_candidates_latest
 
