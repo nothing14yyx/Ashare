@@ -1066,26 +1066,75 @@ class AshareApp:
         window_days: int,
         view_name: str | None = None,
     ) -> Tuple[pd.DataFrame, str]:
-        recent_view = self._create_recent_history_view(
-            base_table, window_days, end_day=end_day, view_name=view_name
+        """从基础表切片读取最近 window_days 个交易日的数据（不再创建 history_recent_xxx_days 视图）。"""
+
+        sanitized_days = max(1, int(window_days))
+
+        # 防注入：表名仅允许字母数字下划线
+        if not base_table or any((not (ch.isalnum() or ch == "_")) for ch in base_table):
+            raise RuntimeError(f"非法表名：{base_table}")
+
+        # 左闭右开：兼容 date 字段为 TEXT 且可能包含时间的情况
+        end_exclusive = (end_day + dt.timedelta(days=1)).isoformat()
+
+        start_date_sql = text(
+            """
+            SELECT MIN(`date`) AS start_date
+            FROM (
+                SELECT DISTINCT `date`
+                FROM `{base}`
+                WHERE `date` < :end_exclusive
+                ORDER BY `date` DESC
+                LIMIT :window_days
+            ) AS d
+            """.format(base=base_table)
         )
-        query = text("SELECT * FROM `{view}`".format(view=recent_view))
+        slice_sql = text(
+            """
+            SELECT *
+            FROM `{base}`
+            WHERE `date` >= :start_date
+              AND `date` < :end_exclusive
+            ORDER BY `code`, `date`
+            """.format(base=base_table)
+        )
 
         with self.db_writer.engine.begin() as conn:
-            recent_df = pd.read_sql_query(query, conn)
+            row = conn.execute(
+                start_date_sql,
+                {"end_exclusive": end_exclusive, "window_days": sanitized_days},
+            ).mappings().first()
+            start_date = (row or {}).get("start_date")
+            if start_date is None:
+                raise RuntimeError(
+                    f"从表 {base_table} 解析最近 {sanitized_days} 个交易日失败：start_date 为空（表为空或 date 异常）。"
+                )
+            recent_df = pd.read_sql_query(
+                slice_sql,
+                conn,
+                params={"start_date": str(start_date), "end_exclusive": end_exclusive},
+            )
 
         if recent_df.empty:
             raise RuntimeError(
-                f"从视图 {recent_view} 读取最近 {window_days} 天数据失败：结果为空。"
+                f"从表 {base_table} 切片读取最近 {sanitized_days} 个交易日数据失败：结果为空。"
             )
 
         if "date" not in recent_df.columns:
             raise RuntimeError(
-                f"视图 {recent_view} 缺少 date 列，无法进行时间窗口切片。"
+                f"表 {base_table} 缺少 date 列，无法进行时间窗口切片。"
             )
 
         recent_df["date"] = pd.to_datetime(recent_df["date"])
-        return recent_df, recent_view
+        self.logger.info(
+            "已从表 %s 切片读取最近 %s 个交易日数据（start=%s, end<%s），不再创建 history_recent_%s_days 视图。",
+            base_table,
+            sanitized_days,
+            str(start_date),
+            end_exclusive,
+            sanitized_days,
+        )
+        return recent_df, base_table
 
 
     def _refresh_history_calendar_view(
@@ -1131,6 +1180,7 @@ class AshareApp:
                 view,
                 view_days,
             )
+            self._last_history_calendar_view = view
             return view
         except Exception as exc:  # noqa: BLE001
             self.logger.warning(
@@ -1141,6 +1191,7 @@ class AshareApp:
                 view_days,
                 exc,
             )
+            self._last_history_calendar_view = None
             return None
 
     def _export_daily_history_incremental(
@@ -1537,11 +1588,16 @@ class AshareApp:
             self._sync_external_signals(latest_trade_day, top_liquidity)
 
             # 5) 提示历史日线路径
-            self.logger.info("历史日线窗口数据来源：%s（最近 %s 个交易日）", history_table, self.history_days)
-            # recent_view 由 _refresh_history_calendar_view() 创建并缓存到实例属性
+            self.logger.info(
+                "历史日线窗口数据来源：%s（切片最近 %s 个交易日）", history_table, self.history_days
+            )
             recent_view = getattr(self, "_last_history_calendar_view", None)
             if recent_view:
-                self.logger.info("近期自然日便捷视图已更新：%s（最近 %s 天）", recent_view, self.history_view_days)
+                self.logger.info(
+                    "近期自然日便捷视图已更新：%s（最近 %s 天）",
+                    recent_view,
+                    self.history_view_days,
+                )
         finally:
             self._cleanup_session()
             self.db_writer.dispose()
