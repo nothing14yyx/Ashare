@@ -334,6 +334,57 @@ class AshareApp:
         self.db_writer.write_dataframe(df, table_name)
         return table_name
 
+    def _create_recent_history_view(
+        self,
+        base_table: str,
+        window_days: int,
+        end_day: dt.date,
+        view_name: str | None = None,
+    ) -> str:
+        view = view_name or f"history_recent_{window_days}_days"
+        sanitized_days = max(1, int(window_days))
+        cutoff_date = end_day.isoformat()
+
+        drop_view_sql = text(f"DROP VIEW IF EXISTS `{view}`")
+        drop_table_sql = text(f"DROP TABLE IF EXISTS `{view}`")
+        create_view_sql = text(
+            """
+            CREATE OR REPLACE VIEW `{view}` AS
+            WITH recent_dates AS (
+                SELECT
+                    `date`,
+                    DENSE_RANK() OVER (ORDER BY `date` DESC) AS rnk
+                FROM (
+                    SELECT DISTINCT `date`
+                    FROM `{base}`
+                    WHERE `date` <= '{cutoff}'
+                ) AS d
+            )
+            SELECT b.*
+            FROM `{base}` AS b
+            JOIN recent_dates AS r ON b.`date` = r.`date`
+            WHERE r.rnk <= {window}
+            """.format(
+                view=view,
+                base=base_table,
+                cutoff=cutoff_date,
+                window=sanitized_days,
+            )
+        )
+
+        with self.db_writer.engine.begin() as conn:
+            conn.execute(drop_view_sql)
+            conn.execute(drop_table_sql)
+            conn.execute(create_view_sql)
+
+        self.logger.info(
+            "已创建视图 %s，按 %s 截止选取最近 %s 个交易日的日线窗口。",
+            view,
+            cutoff_date,
+            sanitized_days,
+        )
+        return view
+
     def _read_int_from_env(self, name: str, default: int) -> int:
         raw_value = os.getenv(name)
         if raw_value is None:
@@ -394,7 +445,15 @@ class AshareApp:
         )
         return sorted([day for day in trading_days if day <= end_day])
 
-    def _get_recent_trading_days(self, end_day: dt.date, days: int) -> list[dt.date]:
+    def _get_recent_trading_days(
+        self,
+        end_day: dt.date,
+        days: int,
+        base_table: str = "history_daily_kline",
+    ) -> list[dt.date]:
+        if not self.use_baostock:
+            return self._get_recent_trading_days_from_db(end_day, days, base_table)
+
         lookback = max(days * 3, days + 20)
         max_lookback = 365
 
@@ -414,8 +473,59 @@ class AshareApp:
 
         return trading_days[-days:]
 
-    def _compute_resume_threshold(self, end_day: dt.date, window_days: int) -> int:
-        trading_days = self._get_recent_trading_days(end_day, window_days)
+    def _get_recent_trading_days_from_db(
+        self, end_day: dt.date, days: int, base_table: str
+    ) -> list[dt.date]:
+        if not self._table_exists(base_table):
+            raise RuntimeError(
+                f"离线模式下未找到基础行情表 {base_table}，无法推导交易日。"
+            )
+
+        max_days = max(1, days)
+        end_date = end_day.isoformat()
+        query = text(
+            """
+            SELECT DISTINCT `date`
+            FROM `{table}`
+            WHERE `date` <= :end_date
+            ORDER BY `date` DESC
+            LIMIT {limit}
+            """.format(table=base_table, limit=max_days * 2)
+        )
+
+        with self.db_writer.engine.begin() as conn:
+            df = pd.read_sql_query(query, conn, params={"end_date": end_date})
+
+        if df.empty:
+            raise RuntimeError(
+                f"离线模式下未能从 {base_table} 推导交易日，查询结果为空。"
+            )
+
+        parsed = (
+            pd.to_datetime(df["date"], errors="coerce")
+            .dropna()
+            .dt.date.unique()
+            .tolist()
+        )
+        parsed.sort()
+
+        if len(parsed) < days:
+            raise RuntimeError(
+                f"离线模式下 {base_table} 仅包含 {len(parsed)} 个有效交易日，"
+                f"不足以切出最近 {days} 天窗口。"
+            )
+
+        return parsed[-days:]
+
+    def _compute_resume_threshold(
+        self,
+        end_day: dt.date,
+        window_days: int,
+        base_table: str = "history_daily_kline",
+    ) -> int:
+        trading_days = self._get_recent_trading_days(
+            end_day, window_days, base_table=base_table
+        )
         trading_count = max(1, len(trading_days))
         dynamic_threshold = int(trading_count * 0.8)
         if dynamic_threshold <= 0:
@@ -846,8 +956,12 @@ class AshareApp:
             raise RuntimeError("导出历史日线失败：股票列表为空或缺少 code 列。")
 
         end_day = dt.datetime.strptime(end_date, "%Y-%m-%d").date()
-        recent_trading_days = self._get_recent_trading_days(end_day, days)
-        resume_threshold = self._compute_resume_threshold(end_day, days)
+        recent_trading_days = self._get_recent_trading_days(
+            end_day, days, base_table=base_table
+        )
+        resume_threshold = self._compute_resume_threshold(
+            end_day, days, base_table=base_table
+        )
         start_day = recent_trading_days[0].isoformat()
 
         self.logger.info(
@@ -870,57 +984,48 @@ class AshareApp:
         if success_count == 0 and skipped == 0:
             raise RuntimeError("导出历史日线失败：全部股票均未返回数据。")
 
-        recent_df = self._slice_recent_window(base_table, end_day, days)
+        recent_table = f"history_recent_{days}_days"
+        recent_df, recent_table = self._slice_recent_window(
+            base_table, end_day, days, view_name=recent_table
+        )
         if not recent_df.empty:
             self.logger.info(
-                "已写入表 %s，当前样本行数 %s，空数据 %s，失败 %s，跳过 %s",
-                base_table,
+                "已刷新视图 %s，当前样本行数 %s，空数据 %s，失败 %s，跳过 %s",
+                recent_table,
                 len(recent_df),
                 len(empty_codes),
                 len(failed_codes),
                 skipped,
             )
-        recent_table = f"history_recent_{days}_days"
-        self._save_sample(recent_df, recent_table)
         return recent_df, recent_table
 
     def _slice_recent_window(
-        self, base_table: str, end_day: dt.date, window_days: int
-    ) -> pd.DataFrame:
-        window_trading_days = self._get_recent_trading_days(end_day, window_days)
-        window_start = window_trading_days[0].isoformat()
-        query = text(
-            "SELECT * FROM `{table}` WHERE `date` >= :window_start".format(
-                table=base_table
-            )
+        self,
+        base_table: str,
+        end_day: dt.date,
+        window_days: int,
+        view_name: str | None = None,
+    ) -> Tuple[pd.DataFrame, str]:
+        recent_view = self._create_recent_history_view(
+            base_table, window_days, end_day=end_day, view_name=view_name
         )
+        query = text("SELECT * FROM `{view}`".format(view=recent_view))
 
         with self.db_writer.engine.begin() as conn:
-            recent_df = pd.read_sql_query(query, conn, params={"window_start": window_start})
+            recent_df = pd.read_sql_query(query, conn)
 
         if recent_df.empty:
             raise RuntimeError(
-                f"从表 {base_table} 切出最近 {window_days} 天数据失败：结果为空。"
+                f"从视图 {recent_view} 读取最近 {window_days} 天数据失败：结果为空。"
             )
 
         if "date" not in recent_df.columns:
             raise RuntimeError(
-                f"表 {base_table} 缺少 date 列，无法进行时间窗口切片。"
+                f"视图 {recent_view} 缺少 date 列，无法进行时间窗口切片。"
             )
 
-        window_day_set = {day for day in window_trading_days}
         recent_df["date"] = pd.to_datetime(recent_df["date"])
-        recent_df = recent_df[recent_df["date"].dt.date.isin(window_day_set)].copy()
-
-        if recent_df.empty:
-            raise RuntimeError(
-                "从表 {table} 中切出最近 {days} 天数据失败：结果为空。".format(
-                    table=base_table,
-                    days=window_days,
-                )
-            )
-
-        return recent_df
+        return recent_df, recent_view
 
     def _export_daily_history_incremental(
         self,
@@ -960,7 +1065,9 @@ class AshareApp:
         elif isinstance(last_date_raw, str) and last_date_raw:
             last_date_value = dt.datetime.strptime(last_date_raw, "%Y-%m-%d").date()
 
-        resume_threshold = self._compute_resume_threshold(end_day, window_days)
+        resume_threshold = self._compute_resume_threshold(
+            end_day, window_days, base_table=base_table
+        )
         done_codes: set[str] = set()
 
         # 开关关闭：禁止调用 Baostock 日线K线接口，仅从数据库表切片读取
@@ -990,11 +1097,9 @@ class AshareApp:
                 base_table,
                 window_days,
             )
-            recent_df, _ = self._export_recent_daily_history(
+            recent_df, recent_table = self._export_recent_daily_history(
                 stock_df, end_date, days=window_days, base_table=base_table
             )
-            recent_table = f"history_recent_{window_days}_days"
-            self._save_sample(recent_df, recent_table)
             return recent_df, recent_table
         elif fetch_enabled and last_date_value >= end_day:
             done_codes = self._load_completed_codes(
@@ -1004,20 +1109,18 @@ class AshareApp:
                 self.logger.info(
                     "历史表 %s 已存在但未覆盖全部股票，继续补齐缺口。", base_table
                 )
-                recent_df, _ = self._export_recent_daily_history(
+                recent_df, recent_table = self._export_recent_daily_history(
                     stock_df, end_date, days=window_days, base_table=base_table
                 )
-                recent_table = f"history_recent_{window_days}_days"
-                self._save_sample(recent_df, recent_table)
                 return recent_df, recent_table
             self.logger.info(
                 "历史日线表 %s 已包含截至 %s 的数据，跳过增量拉取。",
                 base_table,
                 end_date,
             )
-            recent_df = self._slice_recent_window(base_table, end_day, window_days)
-            recent_table = f"history_recent_{window_days}_days"
-            self._save_sample(recent_df, recent_table)
+            recent_df, recent_table = self._slice_recent_window(
+                base_table, end_day, window_days, view_name=f"history_recent_{window_days}_days"
+            )
             return recent_df, recent_table
         elif fetch_enabled:
             trade_start = last_date_value + dt.timedelta(days=1)
@@ -1049,9 +1152,9 @@ class AshareApp:
             else:
                 self.logger.info("本次没有任何新的日线数据可写入。")
 
-        recent_df = self._slice_recent_window(base_table, end_day, window_days)
-        recent_table = f"history_recent_{window_days}_days"
-        self._save_sample(recent_df, recent_table)
+        recent_df, recent_table = self._slice_recent_window(
+            base_table, end_day, window_days, view_name=f"history_recent_{window_days}_days"
+        )
         return recent_df, recent_table
 
     def _extract_focus_codes(self, df: pd.DataFrame) -> list[str]:
