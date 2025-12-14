@@ -6,7 +6,13 @@ app:
   # true：会调用 Baostock K 线接口进行冷启动/增量更新
   # false：不请求 Baostock K 线接口，只从数据库表切片读取
   #       （要求 history_daily_kline 表已存在且非空）
-  fetch_daily_kline: true
+  fetch_daily_kline: false
+
+  # 是否导出股票元数据（股票列表/证券基本资料/行业分类/指数成分股）
+  # true：会调用 Baostock 元数据接口更新 a_share_stock_list/a_share_stock_basic/a_share_stock_industry/index_*_members
+  # false：不请求 Baostock 元数据接口，只从数据库读取（要求相关表已存在，或至少存在 history_daily_kline 用于兜底）
+  fetch_stock_meta: true
+
   # 最近 N 个交易日窗口
   history_days: 365
   # 流动性排序时保留的股票数量
@@ -62,7 +68,7 @@ baostock:
   history_retention_days: 0
 
 akshare:
-  enabled: false
+  enabled: true
   lhb:
     enabled: true
   margin:
@@ -87,7 +93,7 @@ akshare:
 #   1) strategy_ma5_ma20_signals（信号快照）
 #   2) strategy_ma5_ma20_candidates（BUY 候选清单）
 strategy_ma5_ma20_trend:
-  enabled: true
+  enabled: false
   # 选股池来源：top_liquidity（推荐，低频）/ universe / all
   universe_source: top_liquidity
   # 与 app.history_days 对齐（默认 365）

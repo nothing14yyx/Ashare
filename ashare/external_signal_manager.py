@@ -314,9 +314,14 @@ class ExternalSignalManager:
                 df = self._ensure_df(raw)
                 if df is None:
                     raise TypeError("akshare returned None")
-                if idx == 1:
-                    # 第一候选就是“最近一次”（通常是昨天）
-                    pass
+                # 注意：有些接口在非交易日/未更新时会“成功返回空 DF”；
+                # 如果还没到最后一次尝试，则继续回退到更早日期。
+                if getattr(df, "empty", False) and idx < len(candidates):
+                    self.logger.info(
+                        "%s 返回空数据（date=%s, try=%s/%s），继续回退。",
+                        case_name, used_iso, idx, len(candidates)
+                    )
+                    continue
                 return df, used_iso
             except Exception as exc:  # noqa: BLE001
                 last_exc = exc

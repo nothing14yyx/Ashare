@@ -149,13 +149,14 @@ def build_cases(test_day: date, test_symbol: str) -> list[tuple[str, Callable[[]
 
     cases: list[tuple[str, Callable[[], Any]]] = []
 
-    # 这两个接口常见“当天没更新/返回异常”，做日期回退：今天 -> 昨天
+    # 这几个接口依赖“交易日”。遇到周末/节假日时，仅回退 1 天仍可能不是交易日；
+    # 这里统一回退 7 天，尽量命中最近一个交易日。
+    trade_day_candidates = [test_day - timedelta(days=i) for i in range(0, 7)]
+
     def lhb_case() -> CaseResult:
-        primary = test_day
-        fallback = test_day - timedelta(days=1)
         res, _ = _try_with_date_fallback(
             name="lhb_detail_em",
-            date_list=[primary, fallback],
+            date_list=trade_day_candidates,
             call_factory=lambda d: (
                 lambda: ak.stock_lhb_detail_em(
                     start_date=_date_compact(d), end_date=_date_compact(d)
@@ -165,22 +166,18 @@ def build_cases(test_day: date, test_symbol: str) -> list[tuple[str, Callable[[]
         return res
 
     def margin_sse_case() -> CaseResult:
-        primary = test_day
-        fallback = test_day - timedelta(days=1)
         res, _ = _try_with_date_fallback(
             name="margin_detail_sse",
-            date_list=[primary, fallback],
+            date_list=trade_day_candidates,
             call_factory=lambda d: (lambda: ak.stock_margin_detail_sse(date=_date_compact(d))),
         )
         return res
 
     # SZSE：允许当天为空，不强制回退（但也提供一次回退尝试）
     def margin_szse_case() -> CaseResult:
-        primary = test_day
-        fallback = test_day - timedelta(days=1)
         res, _ = _try_with_date_fallback(
             name="margin_detail_szse",
-            date_list=[primary, fallback],
+            date_list=trade_day_candidates,
             call_factory=lambda d: (lambda: ak.stock_margin_detail_szse(date=_date_compact(d))),
         )
         return res
