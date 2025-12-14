@@ -36,6 +36,7 @@ class MA5MA20Params:
     enabled: bool = False
     universe_source: str = "top_liquidity"  # top_liquidity / universe / all
     lookback_days: int = 365
+    indicator_lookback_days: int | None = None
 
     # 日线数据来源表：默认直接用全量表（性能更稳），必要时你也可以在 config.yaml 覆盖
     daily_table: str = "history_daily_kline"
@@ -140,6 +141,38 @@ class MA5MA20StrategyRunner:
         self.logger = setup_logger()
         self.params = MA5MA20Params.from_config()
         self.db_writer = MySQLWriter(DatabaseConfig.from_env())
+        self.indicator_window = self._resolve_indicator_window()
+
+        self.logger.info(
+            "MA5-MA20 策略：基础表窗口 lookback_days=%s，指标计算窗口=%s",
+            self.params.lookback_days,
+            self.indicator_window,
+        )
+
+    def _resolve_indicator_window(self) -> int:
+        raw = getattr(self.params, "indicator_lookback_days", None)
+        try:
+            if raw is not None:
+                parsed = int(raw)
+                if parsed > 0:
+                    return parsed
+                self.logger.warning(
+                    "indicator_lookback_days=%s 无效，需为正整数，将回退 lookback_days=%s",
+                    raw,
+                    self.params.lookback_days,
+                )
+        except Exception:
+            self.logger.warning(
+                "indicator_lookback_days=%s 解析失败，将回退 lookback_days=%s",
+                raw,
+                self.params.lookback_days,
+            )
+
+        try:
+            fallback = int(self.params.lookback_days)
+        except Exception:
+            fallback = 365
+        return max(1, fallback)
 
     def _daily_table_name(self) -> str:
         tbl = (getattr(self.params, "daily_table", "") or "").strip()
@@ -186,9 +219,9 @@ class MA5MA20StrategyRunner:
         return [str(c) for c in codes]
 
     def _load_daily_kline(self, codes: List[str], end_date: dt.date) -> pd.DataFrame:
-        """读取最近 lookback_days 的日线数据。"""
+        """读取最近 indicator_window 天的日线数据，用于指标计算。"""
         tbl = self._daily_table_name()
-        lookback = int(self.params.lookback_days)
+        lookback = int(self.indicator_window)
         start_date = end_date - dt.timedelta(days=int(lookback * 2))  # 给交易日留冗余
 
         # 你的 history_daily_kline 的 date/code 是 TEXT，统一用 ISO 字符串做范围过滤（避免类型隐式转换）
