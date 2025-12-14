@@ -505,6 +505,7 @@ class MA5MA20StrategyRunner:
               `vol_ratio`,`macd_hist`,`kdj_k`,`kdj_d`,`atr14`,`stop_ref`,
               `reason`
             FROM `{base}`
+            WHERE `signal` = 'BUY'
             """
         )
         with self.db_writer.engine.begin() as conn:
