@@ -1191,3 +1191,38 @@
 2025-12-14 14:46:24,067 [INFO] 表 a_share_gdhs 已写入 5445 行。
 2025-12-14 14:49:39,857 [INFO] 表 a_share_gdhs_detail 已写入 8891 行。
 2025-12-14 14:49:39,868 [INFO] 历史日线窗口数据来源：history_recent_365_days（最近 365 个交易日）
+2025-12-14 15:13:18,410 [INFO] 参数配置：history_days=365, history_view_days=45, top_liquidity_count=100, min_listing_days=60, fetch_daily_kline=False
+2025-12-14 15:13:18,474 [INFO] 代理配置: HTTP=http://127.0.0.1:7890, HTTPS=http://127.0.0.1:7890
+2025-12-14 15:13:18,475 [INFO] 已关闭所有 Baostock 拉取开关，本次将以数据库为准执行离线模式。
+2025-12-14 15:13:18,475 [INFO] 已发现 4 个项目组件，前 10 个预览：
+2025-12-14 15:13:18,475 [INFO]  - BaostockSession
+2025-12-14 15:13:18,475 [INFO]  - BaostockDataFetcher
+2025-12-14 15:13:18,475 [INFO]  - AshareUniverseBuilder
+2025-12-14 15:13:18,475 [INFO]  - FundamentalDataManager
+2025-12-14 15:13:19,492 [INFO] 最近交易日：2025-12-12
+2025-12-14 15:13:19,696 [INFO] 基础面刷新开关已关闭，本次仅使用数据库中已有的财务表构建宽表。
+2025-12-14 15:13:20,778 [INFO] 已生成宽表 fundamentals_latest_wide，共 800 行。
+2025-12-14 15:13:23,207 [INFO] 日线K线拉取开关已关闭：跳过 Baostock 拉取，仅从表 history_daily_kline 切片读取最近 365 个交易日数据。
+2025-12-14 15:13:45,949 [INFO] 已从表 history_daily_kline 切片读取最近 365 个交易日数据（start=2024-06-17, end<2025-12-13），不再创建 history_recent_365_days 视图。
+2025-12-14 15:13:45,973 [INFO] 已创建近期自然日视图 history_recent_45_days：[2025-10-29, 2025-12-13)，共 45 天。
+2025-12-14 15:13:45,973 [INFO] 近期自然日便捷视图已更新：history_recent_45_days（最近 45 天）
+2025-12-14 15:13:46,569 [INFO] ROE 为正 过滤：3043 -> 592
+2025-12-14 15:13:46,571 [INFO] 资产负债率 < 75% 过滤：592 -> 592
+2025-12-14 15:13:46,572 [INFO] 经营现金流为正（按 CFO 比率代理） 过滤：592 -> 491
+2025-12-14 15:13:46,573 [INFO] 净利润或 EPS 同比为正 过滤：491 -> 323
+2025-12-14 15:13:47,164 [INFO] 已生成候选池：表 a_share_universe
+2025-12-14 15:13:47,395 [INFO] 已将成交额排序结果写入表 a_share_top_liquidity，可用于筛选高流动性标的。
+2025-12-14 15:13:48,616 [INFO] 表 a_share_lhb_detail 已写入 77 行。
+2025-12-14 15:13:53,301 [INFO] 表 a_share_margin_detail 已写入 3986 行。
+2025-12-14 15:14:00,660 [INFO] 表 a_share_hsgt_hold_rank 已写入 2767 行。
+2025-12-14 15:14:12,275 [INFO] 表 a_share_gdhs 已写入 5445 行。
+2025-12-14 15:17:16,317 [INFO] 表 a_share_gdhs_detail 已写入 8891 行。
+2025-12-14 15:17:16,322 [INFO] 历史日线窗口数据来源：history_daily_kline（切片最近 365 个交易日）
+2025-12-14 15:17:16,322 [INFO] 近期自然日便捷视图已更新：history_recent_45_days（最近 45 天）
+2025-12-14 15:17:17,390 [INFO] MA5-MA20 策略：日线表=history_daily_kline，选股池来源=top_liquidity，codes=100
+2025-12-14 15:17:18,166 [INFO] MA5-MA20 策略：读取日线 36500 行（100 只股票）。
+2025-12-14 15:17:18,852 [INFO] MA5-MA20 策略完成：2 BUY / 11 SELL / 87 HOLD（最新交易日：2025-12-12）
+2025-12-14 15:28:23,143 [INFO] MA5-MA20 策略：基础表窗口 lookback_days=300，指标计算窗口=300
+2025-12-14 15:28:24,145 [INFO] MA5-MA20 策略：日线表=history_daily_kline，选股池来源=top_liquidity，codes=100
+2025-12-14 15:28:24,980 [INFO] MA5-MA20 策略：读取日线 30000 行（100 只股票）。
+2025-12-14 15:28:25,704 [INFO] MA5-MA20 策略完成：2 BUY / 11 SELL / 87 HOLD（最新交易日：2025-12-12）

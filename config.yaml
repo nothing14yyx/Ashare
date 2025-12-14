@@ -103,11 +103,7 @@ strategy_ma5_ma20_trend:
   # 选股池来源：top_liquidity（推荐，低频）/ universe / all
   universe_source: top_liquidity
   # 与 app.history_days 对齐（默认 365）
-  lookback_days: 365
-
-  # 指标计算窗口，独立于基础表的时间范围，用于降低 I/O 或缩短计算开销
-  # 例如设置为 300 或 250，仍可在 history_daily_kline 里保留更长的历史数据
-  indicator_lookback_days: 365
+  lookback_days: 300
 
   volume_ratio_threshold: 1.5
   volume_ma_window: 5
