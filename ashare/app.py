@@ -248,6 +248,19 @@ class AshareApp:
             }
         self.fetch_daily_kline: bool = bool(kline_flag)
 
+        meta_flag = os.getenv("ASHARE_FETCH_STOCK_META")
+        if meta_flag is None:
+            meta_flag = app_cfg.get("fetch_stock_meta", True)
+        if isinstance(meta_flag, str):
+            meta_flag = meta_flag.strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "y",
+                "on",
+            }
+        self.fetch_stock_meta: bool = bool(meta_flag)
+
         self.history_days = (
             history_days
             if history_days is not None
@@ -306,9 +319,16 @@ class AshareApp:
         else:
             self.logger.info("Akshare 行为证据层已关闭，跳过相关初始化。")
 
+        self.use_baostock: bool = bool(
+            self.fetch_daily_kline or self.fetch_stock_meta or self.refresh_fundamentals
+        )
+
         # 登录一次会话，后续流程保持复用，减少频繁连接开销
-        self.session.ensure_alive()
-        self.logger.info("Baostock 会话已建立，后续任务将持续复用当前连接。")
+        if self.use_baostock:
+            self.session.ensure_alive()
+            self.logger.info("Baostock 会话已建立，后续任务将持续复用当前连接。")
+        else:
+            self.logger.info("已关闭所有 Baostock 拉取开关，本次将以数据库为准执行离线模式。")
 
     def _save_sample(self, df: pd.DataFrame, table_name: str) -> str:
         self.db_writer.write_dataframe(df, table_name)
@@ -405,6 +425,86 @@ class AshareApp:
     def _table_exists(self, table_name: str) -> bool:
         inspector = inspect(self.db_writer.engine)
         return inspector.has_table(table_name)
+
+    def _load_table(self, table_name: str) -> pd.DataFrame:
+        """从数据库读取整表；表不存在则返回空 DataFrame。"""
+
+        if not self._table_exists(table_name):
+            return pd.DataFrame()
+
+        query = text("SELECT * FROM `{table}`".format(table=table_name))
+        with self.db_writer.engine.begin() as conn:
+            return pd.read_sql_query(query, conn)
+
+    def _infer_latest_trade_day_from_db(self, base_table: str) -> str:
+        """在离线模式下，从历史表推断最近交易日。"""
+
+        if not self._table_exists(base_table):
+            return dt.date.today().isoformat()
+
+        query = text(
+            "SELECT MAX(`date`) AS max_date FROM `{table}`".format(table=base_table)
+        )
+        with self.db_writer.engine.begin() as conn:
+            df = pd.read_sql_query(query, conn)
+
+        if df.empty or "max_date" not in df.columns:
+            return dt.date.today().isoformat()
+
+        max_date = df.loc[0, "max_date"]
+        if pd.isna(max_date):
+            return dt.date.today().isoformat()
+
+        parsed = pd.to_datetime(max_date, errors="coerce")
+        if pd.isna(parsed):
+            return dt.date.today().isoformat()
+
+        return parsed.date().isoformat()
+
+    def _build_stock_list_from_history(
+        self, base_table: str, trade_day: str
+    ) -> pd.DataFrame:
+        """在没有 a_share_stock_list 的情况下，用历史行情表兜底生成股票列表。"""
+
+        if not self._table_exists(base_table):
+            return pd.DataFrame()
+
+        query = text(
+            "SELECT DISTINCT `code` FROM `{table}` WHERE `date` = :trade_day".format(
+                table=base_table
+            )
+        )
+        with self.db_writer.engine.begin() as conn:
+            df = pd.read_sql_query(query, conn, params={"trade_day": trade_day})
+
+        if df.empty:
+            query_all = text(
+                "SELECT DISTINCT `code` FROM `{table}`".format(table=base_table)
+            )
+            with self.db_writer.engine.begin() as conn:
+                df = pd.read_sql_query(query_all, conn)
+
+        if df.empty:
+            return df
+
+        df["code"] = df["code"].astype(str)
+        if "code_name" not in df.columns:
+            df["code_name"] = ""
+        if "tradeStatus" not in df.columns:
+            df["tradeStatus"] = "1"
+        return df[["code", "code_name", "tradeStatus"]]
+
+    def _load_index_membership_from_db(self) -> dict[str, set[str]]:
+        """从数据库读取指数成分股表，构造 {index_name: set(code)}。"""
+
+        index_membership: dict[str, set[str]] = {}
+        for index_name in ("hs300", "zz500", "sz50"):
+            table = f"index_{index_name}_members"
+            df = self._load_table(table)
+            if df.empty or "code" not in df.columns:
+                continue
+            index_membership[index_name] = set(df["code"].dropna().astype(str))
+        return index_membership
 
     def _load_completed_codes(
         self, table_name: str, min_rows: int, required_end_date: str | None = None
@@ -1053,31 +1153,70 @@ class AshareApp:
                 ]
             )
 
-            # 2) 获取最近交易日并导出股票列表
-            latest_trade_day = self.fetcher.get_latest_trading_date()
-            self.logger.info("最近交易日：%s", latest_trade_day)
-            try:
-                stock_df = self._export_stock_list(latest_trade_day)
-            except RuntimeError as exc:
-                self.logger.error("导出股票列表失败: %s", exc)
-                return
-
-            try:
-                stock_basic_df = self._export_stock_basic()
-            except RuntimeError as exc:
-                self.logger.warning(
-                    "导出证券基本资料失败: %s，将跳过上市状态与上市天数过滤。",
-                    exc,
+            # 2) 获取最近交易日并导出股票列表/元数据（允许离线）
+            if self.use_baostock:
+                latest_trade_day = self.fetcher.get_latest_trading_date()
+            else:
+                latest_trade_day = self._infer_latest_trade_day_from_db(
+                    base_table="history_daily_kline"
                 )
-                stock_basic_df = None
+            self.logger.info("最近交易日：%s", latest_trade_day)
 
-            try:
-                industry_df = self._export_stock_industry()
-            except RuntimeError as exc:
-                self.logger.error("导出行业分类数据失败: %s", exc)
-                return
+            # 股票列表（至少要拿到 code）
+            if self.fetch_stock_meta:
+                try:
+                    stock_df = self._export_stock_list(latest_trade_day)
+                except RuntimeError as exc:
+                    self.logger.error("导出股票列表失败: %s", exc)
+                    return
+            else:
+                stock_df = self._load_table("a_share_stock_list")
+                if stock_df.empty:
+                    stock_df = self._build_stock_list_from_history(
+                        base_table="history_daily_kline",
+                        trade_day=latest_trade_day,
+                    )
+                if stock_df.empty:
+                    self.logger.error(
+                        "股票列表为空：已关闭 Baostock 元数据拉取，但数据库中也没有可用的 a_share_stock_list/history_daily_kline。"
+                    )
+                    return
 
-            index_membership = self._export_index_members(latest_trade_day)
+            stock_basic_df = None
+            if self.fetch_stock_meta:
+                try:
+                    stock_basic_df = self._export_stock_basic()
+                except RuntimeError as exc:
+                    self.logger.warning(
+                        "导出证券基本资料失败: %s，将跳过上市状态与上市天数过滤。",
+                        exc,
+                    )
+                    stock_basic_df = None
+            else:
+                stock_basic_df = self._load_table("a_share_stock_basic")
+                if stock_basic_df.empty:
+                    self.logger.warning(
+                        "已关闭 Baostock 元数据拉取，且数据库中未找到 a_share_stock_basic，将跳过上市状态与上市天数过滤。"
+                    )
+                    stock_basic_df = None
+
+            industry_df = pd.DataFrame()
+            if self.fetch_stock_meta:
+                try:
+                    industry_df = self._export_stock_industry()
+                except RuntimeError as exc:
+                    self.logger.warning(
+                        "导出行业分类数据失败: %s，将继续主流程（不做行业映射）。",
+                        exc,
+                    )
+                    industry_df = pd.DataFrame()
+            else:
+                industry_df = self._load_table("a_share_stock_industry")
+
+            if self.fetch_stock_meta:
+                index_membership = self._export_index_members(latest_trade_day)
+            else:
+                index_membership = self._load_index_membership_from_db()
             fundamentals_wide = pd.DataFrame()
             try:
                 if self.refresh_fundamentals:
