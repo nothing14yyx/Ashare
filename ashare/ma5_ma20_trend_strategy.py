@@ -36,7 +36,6 @@ class MA5MA20Params:
     enabled: bool = False
     universe_source: str = "top_liquidity"  # top_liquidity / universe / all
     lookback_days: int = 365
-    indicator_lookback_days: int | None = None
 
     # 日线数据来源表：默认直接用全量表（性能更稳），必要时你也可以在 config.yaml 覆盖
     daily_table: str = "history_daily_kline"
@@ -144,35 +143,27 @@ class MA5MA20StrategyRunner:
         self.indicator_window = self._resolve_indicator_window()
 
         self.logger.info(
-            "MA5-MA20 策略：基础表窗口 lookback_days=%s，指标计算窗口=%s",
+            "MA5-MA20 策略：基础表窗口 lookback_days=%s，指标计算窗口对齐 lookback_days=%s",
             self.params.lookback_days,
             self.indicator_window,
         )
 
     def _resolve_indicator_window(self) -> int:
-        raw = getattr(self.params, "indicator_lookback_days", None)
         try:
-            if raw is not None:
-                parsed = int(raw)
-                if parsed > 0:
-                    return parsed
-                self.logger.warning(
-                    "indicator_lookback_days=%s 无效，需为正整数，将回退 lookback_days=%s",
-                    raw,
-                    self.params.lookback_days,
-                )
+            lookback = int(self.params.lookback_days)
         except Exception:
             self.logger.warning(
-                "indicator_lookback_days=%s 解析失败，将回退 lookback_days=%s",
-                raw,
+                "lookback_days=%s 解析失败，将回退默认 365 天。",
                 self.params.lookback_days,
             )
-
-        try:
-            fallback = int(self.params.lookback_days)
-        except Exception:
-            fallback = 365
-        return max(1, fallback)
+            return 365
+        if lookback <= 0:
+            self.logger.warning(
+                "lookback_days=%s 无效，需为正整数，将回退默认 365 天。",
+                self.params.lookback_days,
+            )
+            return 365
+        return lookback
 
     def _daily_table_name(self) -> str:
         tbl = (getattr(self.params, "daily_table", "") or "").strip()
