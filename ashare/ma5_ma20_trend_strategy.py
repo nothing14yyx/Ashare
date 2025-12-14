@@ -6,7 +6,9 @@
   history_daily_kline（全量日线表；运行时按日期窗口截取，避免依赖 history_recent_xxx_days VIEW）
 
 输出：
-  - strategy_ma5_ma20_signals：最新交易日每只股票的信号快照（BUY/SELL/HOLD + reason）
+  - strategy_ma5_ma20_signals：
+      - signals_write_scope=latest：仅写入最新交易日（默认）
+      - signals_write_scope=window：写入本次计算窗口内的全部交易日（用于回填历史/回测）
   - 默认通过 VIEW 筛选最新交易日 BUY 候选
     （v_strategy_ma5_ma20_candidates_latest，如需物理表可关闭 candidates_as_view）
 
@@ -63,6 +65,11 @@ class MA5MA20Params:
     # 可选：用视图替代 candidates 表（更简洁；候选清单实时从 signals 最新日筛选）
     candidates_as_view: bool = True
     candidates_view: str = "v_strategy_ma5_ma20_candidates_latest"
+
+    # signals 写入范围：
+    # - latest：仅写入最新交易日（默认，低开销）
+    # - window：写入本次计算窗口内的全部交易日（用于回填历史/回测）
+    signals_write_scope: str = "latest"
 
     @classmethod
     def from_config(cls) -> "MA5MA20Params":
@@ -511,13 +518,24 @@ class MA5MA20StrategyRunner:
         except Exception:
             pass
 
-    def _write_signals(self, latest_date: dt.date, signals: pd.DataFrame) -> None:
+    def _write_signals(
+        self, latest_date: dt.date, signals: pd.DataFrame, codes: List[str]
+    ) -> None:
         tbl = self.params.signals_table
         self._ensure_signals_table(tbl)
 
-        latest = signals[signals["date"].dt.date == latest_date].copy()
-        if latest.empty:
-            self.logger.warning("未找到最新交易日 %s 的信号行。", latest_date)
+        scope = (getattr(self.params, "signals_write_scope", "latest") or "latest").strip().lower()
+        if scope not in {"latest", "window"}:
+            self.logger.warning("signals_write_scope=%s 无效，已回退为 latest。", scope)
+            scope = "latest"
+
+        if scope == "latest":
+            to_write = signals[signals["date"].dt.date == latest_date].copy()
+        else:
+            to_write = signals.copy()
+
+        if to_write.empty:
+            self.logger.warning("signals_write_scope=%s 下无任何信号行，已跳过写入。", scope)
             return
 
         keep_cols = [
@@ -543,20 +561,58 @@ class MA5MA20StrategyRunner:
             "signal",
             "reason",
         ]
-        latest = latest[keep_cols].copy()
-        latest["date"] = pd.to_datetime(latest["date"]).dt.date
-        latest["code"] = latest["code"].astype(str)
+        to_write = to_write[keep_cols].copy()
+        to_write["date"] = pd.to_datetime(to_write["date"]).dt.date
+        to_write["code"] = to_write["code"].astype(str)
 
-        # 先删除当天同 code 的旧数据，再 append 写入（保证幂等）
-        delete_stmt = (
-            text(f"DELETE FROM `{tbl}` WHERE `date` = :d AND `code` IN :codes")
-            .bindparams(bindparam("codes", expanding=True))
-        )
-        codes = latest["code"].tolist()
-        with self.db_writer.engine.begin() as conn:
-            conn.execute(delete_stmt, {"d": latest_date, "codes": codes})
+        if scope == "latest":
+            delete_stmt = (
+                text(f"DELETE FROM `{tbl}` WHERE `date` = :d AND `code` IN :codes")
+                .bindparams(bindparam("codes", expanding=True))
+            )
+            del_codes = to_write["code"].tolist()
+            with self.db_writer.engine.begin() as conn:
+                conn.execute(delete_stmt, {"d": latest_date, "codes": del_codes})
+        else:
+            start_d = min(to_write["date"])
+            end_d = max(to_write["date"])
 
-        self.db_writer.write_dataframe(latest, tbl, if_exists="append")
+            codes_clean = [str(c) for c in (codes or []) if str(c).strip()]
+            delete_by_date_only = (not codes_clean) or (len(codes_clean) > 2000)
+
+            with self.db_writer.engine.begin() as conn:
+                if delete_by_date_only:
+                    delete_stmt = text(
+                        f"DELETE FROM `{tbl}` WHERE `date` BETWEEN :start_date AND :end_date"
+                    )
+                    conn.execute(delete_stmt, {"start_date": start_d, "end_date": end_d})
+                else:
+                    delete_stmt = (
+                        text(
+                            f"""
+                            DELETE FROM `{tbl}`
+                            WHERE `date` BETWEEN :start_date AND :end_date
+                              AND `code` IN :codes
+                            """
+                        )
+                        .bindparams(bindparam("codes", expanding=True))
+                    )
+                    chunk_size = 800
+                    for i in range(0, len(codes_clean), chunk_size):
+                        part_codes = codes_clean[i : i + chunk_size]
+                        conn.execute(
+                            delete_stmt,
+                            {"start_date": start_d, "end_date": end_d, "codes": part_codes},
+                        )
+
+            self.logger.info(
+                "signals_write_scope=window：已覆盖写入 %s~%s（%s）。",
+                start_d,
+                end_d,
+                "all-codes" if delete_by_date_only else f"{len(codes_clean)} codes",
+            )
+
+        self.db_writer.write_dataframe(to_write, tbl, if_exists="append")
 
     def _write_candidates(self, latest_date: dt.date, signals: pd.DataFrame) -> None:
         tbl = self.params.candidates_table
@@ -624,7 +680,7 @@ class MA5MA20StrategyRunner:
         ind = self._compute_indicators(daily)
         sig = self._generate_signals(ind)
 
-        self._write_signals(latest_date, sig)
+        self._write_signals(latest_date, sig, codes)
         if bool(getattr(self.params, "candidates_as_view", False)):
             self._ensure_candidates_view(self.params.candidates_view)
         else:

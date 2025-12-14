@@ -121,3 +121,6 @@ strategy_ma5_ma20_trend:
   candidates_as_view: true
   candidates_view: v_strategy_ma5_ma20_candidates_latest
 
+  # signals 写入范围：latest=仅最新交易日（默认），window=回填本次计算窗口内全部交易日
+  signals_write_scope: latest
+
