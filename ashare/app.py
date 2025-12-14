@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import re
 import multiprocessing as mp
 import os
 import time
@@ -218,12 +219,17 @@ class AshareApp:
 
         # config.yaml 的默认值（如果写成字符串也要能解析）
         cfg_history_days = app_cfg.get("history_days", 30)
+        cfg_history_view_days = app_cfg.get("history_view_days", 0)
         cfg_top_liquidity = app_cfg.get("top_liquidity_count", 100)
         cfg_min_listing = app_cfg.get("min_listing_days", 60)
         try:
             cfg_history_days = int(cfg_history_days)
         except Exception:
             cfg_history_days = 30
+        try:
+            cfg_history_view_days = int(cfg_history_view_days)
+        except Exception:
+            cfg_history_view_days = 0
         try:
             cfg_top_liquidity = int(cfg_top_liquidity)
         except Exception:
@@ -266,6 +272,12 @@ class AshareApp:
             if history_days is not None
             else self._read_int_from_env("ASHARE_HISTORY_DAYS", cfg_history_days)
         )
+        # 单独控制“近期自然日视图”窗口（便于你查近期数据）
+        self.history_view_days = self._read_int_from_env(
+            "ASHARE_HISTORY_VIEW_DAYS", cfg_history_view_days
+        )
+        if self.history_view_days < 0:
+            self.history_view_days = 0
         resolved_top_liquidity = (
             top_liquidity_count
             if top_liquidity_count is not None
@@ -381,6 +393,57 @@ class AshareApp:
             "已创建视图 %s，按 %s 截止选取最近 %s 个交易日的日线窗口。",
             view,
             cutoff_date,
+            sanitized_days,
+        )
+        return view
+
+    def _create_recent_history_calendar_view(
+        self,
+        base_table: str,
+        window_days: int,
+        end_day: dt.date,
+        view_name: str | None = None,
+    ) -> str:
+        """创建一个“最近 N 个自然日”的便捷视图，用于手动查近期数据。"""
+
+        def _is_safe_ident(name: str) -> bool:
+            return bool(re.fullmatch(r"[A-Za-z0-9_]+", name))
+
+        view = view_name or f"history_recent_{window_days}_days"
+        sanitized_days = max(1, int(window_days))
+        if not _is_safe_ident(view) or not _is_safe_ident(base_table):
+            raise RuntimeError(f"非法表/视图名：base_table={base_table}, view={view}")
+
+        start_date = (end_day - dt.timedelta(days=sanitized_days - 1)).isoformat()
+        end_exclusive = (end_day + dt.timedelta(days=1)).isoformat()
+
+        drop_view_sql = text(f"DROP VIEW IF EXISTS `{view}`")
+        drop_table_sql = text(f"DROP TABLE IF EXISTS `{view}`")
+        create_view_sql = text(
+            """
+            CREATE OR REPLACE VIEW `{view}` AS
+            SELECT *
+            FROM `{base}`
+            WHERE `date` >= '{start}'
+              AND `date` < '{end_exclusive}'
+            """.format(
+                view=view,
+                base=base_table,
+                start=start_date,
+                end_exclusive=end_exclusive,
+            )
+        )
+
+        with self.db_writer.engine.begin() as conn:
+            conn.execute(drop_view_sql)
+            conn.execute(drop_table_sql)
+            conn.execute(create_view_sql)
+
+        self.logger.info(
+            "已创建近期自然日视图 %s：[%s, %s)，共 %s 天。",
+            view,
+            start_date,
+            end_exclusive,
             sanitized_days,
         )
         return view
@@ -984,13 +1047,11 @@ class AshareApp:
         if success_count == 0 and skipped == 0:
             raise RuntimeError("导出历史日线失败：全部股票均未返回数据。")
 
-        recent_table = f"history_recent_{days}_days"
-        recent_df, recent_table = self._slice_recent_window(
-            base_table, end_day, days, view_name=recent_table
-        )
+        recent_df, recent_table = self._slice_recent_window(base_table, end_day, days)
         if not recent_df.empty:
             self.logger.info(
-                "已刷新视图 %s，当前样本行数 %s，空数据 %s，失败 %s，跳过 %s",
+                "已读取最近 %s 个交易日窗口（base=%s），当前样本行数 %s，空数据 %s，失败 %s，跳过 %s",
+                days,
                 recent_table,
                 len(recent_df),
                 len(empty_codes),
@@ -1118,9 +1179,7 @@ class AshareApp:
                 base_table,
                 end_date,
             )
-            recent_df, recent_table = self._slice_recent_window(
-                base_table, end_day, window_days, view_name=f"history_recent_{window_days}_days"
-            )
+            recent_df, recent_table = self._slice_recent_window(base_table, end_day, window_days)
             return recent_df, recent_table
         elif fetch_enabled:
             trade_start = last_date_value + dt.timedelta(days=1)
@@ -1152,9 +1211,7 @@ class AshareApp:
             else:
                 self.logger.info("本次没有任何新的日线数据可写入。")
 
-        recent_df, recent_table = self._slice_recent_window(
-            base_table, end_day, window_days, view_name=f"history_recent_{window_days}_days"
-        )
+        recent_df, recent_table = self._slice_recent_window(base_table, end_day, window_days)
         return recent_df, recent_table
 
     def _extract_focus_codes(self, df: pd.DataFrame) -> list[str]:
@@ -1376,6 +1433,8 @@ class AshareApp:
                 )
                 return
 
+            # 3.1) 单独创建“最近 N 个自然日”的便捷视图（用于你手动查近期数据）
+
             # 4) 构建候选池并挑选成交额前 N 名
             try:
                 universe_df = self.universe_builder.build_universe(
@@ -1420,7 +1479,9 @@ class AshareApp:
             self._sync_external_signals(latest_trade_day, top_liquidity)
 
             # 5) 提示历史日线路径
-            self.logger.info("历史日线数据已保存至视图：%s", history_table)
+            self.logger.info("历史日线窗口数据来源：%s（最近 %s 个交易日）", history_table, self.history_days)
+            if recent_view:
+                self.logger.info("近期自然日便捷视图已更新：%s（最近 %s 天）", recent_view, self.history_view_days)
         finally:
             self._cleanup_session()
             self.db_writer.dispose()

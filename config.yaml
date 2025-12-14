@@ -15,6 +15,12 @@ app:
 
   # 最近 N 个交易日窗口
   history_days: 365
+
+  # 近期自然日视图窗口（仅用于你手动查询近期数据方便）
+  # - 会创建/刷新视图：history_recent_{history_view_days}_days
+  # - 与 history_days 解耦；history_days 仍用于程序内部计算窗口
+  # - 设为 0 则不创建视图
+  history_view_days: 45
   # 流动性排序时保留的股票数量
   top_liquidity_count: 100
   # 最少上市天数过滤阈值
@@ -93,7 +99,7 @@ akshare:
 #   1) strategy_ma5_ma20_signals（信号快照）
 #   2) strategy_ma5_ma20_candidates（BUY 候选清单）
 strategy_ma5_ma20_trend:
-  enabled: false
+  enabled: true
   # 选股池来源：top_liquidity（推荐，低频）/ universe / all
   universe_source: top_liquidity
   # 与 app.history_days 对齐（默认 365）

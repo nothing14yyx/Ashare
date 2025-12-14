@@ -2,8 +2,8 @@
 
 把“顺势 + MA5/MA20 触发 + 量价/指标过滤 + 风险第一 + 低频交易”落到你的程序里。
 
-数据依赖（你现有的日线窗口表）：
-  history_recent_{lookback_days}_days  （默认 lookback_days=365 -> history_recent_365_days）
+数据依赖：
+  history_daily_kline（全量日线表；运行时按日期窗口截取，避免依赖 history_recent_xxx_days VIEW）
 
 输出两张 MySQL 表：
   - strategy_ma5_ma20_signals：最新交易日每只股票的信号快照（BUY/SELL/HOLD + reason）
@@ -36,6 +36,9 @@ class MA5MA20Params:
     enabled: bool = False
     universe_source: str = "top_liquidity"  # top_liquidity / universe / all
     lookback_days: int = 365
+
+    # 日线数据来源表：默认直接用全量表（性能更稳），必要时你也可以在 config.yaml 覆盖
+    daily_table: str = "history_daily_kline"
 
     # 放量确认：volume / vol_ma >= threshold
     volume_ratio_threshold: float = 1.5
@@ -139,6 +142,9 @@ class MA5MA20StrategyRunner:
         self.db_writer = MySQLWriter(DatabaseConfig.from_env())
 
     def _daily_table_name(self) -> str:
+        tbl = (getattr(self.params, "daily_table", "") or "").strip()
+        if tbl:
+            return tbl
         return f"history_recent_{int(self.params.lookback_days)}_days"
 
     def _get_latest_trade_date(self) -> dt.date:
@@ -157,6 +163,9 @@ class MA5MA20StrategyRunner:
     def _load_universe_codes(self, latest_date: dt.date) -> List[str]:
         """按配置选择选股池来源：top_liquidity / universe / all"""
         source = (self.params.universe_source or "top_liquidity").strip().lower()
+        # all：表示“全市场”，不要先把 3000+ codes 拉到 Python（更慢）；后续 SQL 直接按日期窗口读取
+        if source == "all":
+            return []
         with self.db_writer.engine.begin() as conn:
             if source == "top_liquidity":
                 stmt = text("SELECT `code` FROM `a_share_top_liquidity` WHERE `date` = :d")
@@ -182,39 +191,63 @@ class MA5MA20StrategyRunner:
         lookback = int(self.params.lookback_days)
         start_date = end_date - dt.timedelta(days=int(lookback * 2))  # 给交易日留冗余
 
-        # codes 太多时避免 IN 超长：先按日期取，再在 Pandas 侧过滤
-        use_in = len(codes) <= 2000
+        # 你的 history_daily_kline 的 date/code 是 TEXT，统一用 ISO 字符串做范围过滤（避免类型隐式转换）
+        start_date_s = start_date.isoformat()
+        end_date_s = end_date.isoformat()
 
-        if use_in:
-            stmt = (
-                text(
+        # 只取策略计算必需列，降低 I/O
+        select_cols = "`date`,`code`,`high`,`low`,`close`,`preclose`,`volume`,`amount`"
+
+        codes = [str(c) for c in (codes or []) if str(c).strip()]
+        use_in = bool(codes) and len(codes) <= 2000
+
+        with self.db_writer.engine.begin() as conn:
+            if not codes:
+                stmt = text(
                     f"""
-                    SELECT
-                        `date`,`code`,`open`,`high`,`low`,`close`,`preclose`,`volume`,`amount`,
-                        `tradestatus`,`isST`,`pctChg`
+                    SELECT {select_cols}
                     FROM `{tbl}`
-                    WHERE `code` IN :codes AND `date` BETWEEN :start_date AND :end_date
+                    WHERE `date` BETWEEN :start_date AND :end_date
                     ORDER BY `code`,`date`
                     """
                 )
-                .bindparams(bindparam("codes", expanding=True))
-            )
-            params = {"codes": codes, "start_date": start_date, "end_date": end_date}
-        else:
-            stmt = text(
-                f"""
-                SELECT
-                    `date`,`code`,`open`,`high`,`low`,`close`,`preclose`,`volume`,`amount`,
-                    `tradestatus`,`isST`,`pctChg`
-                FROM `{tbl}`
-                WHERE `date` BETWEEN :start_date AND :end_date
-                ORDER BY `code`,`date`
-                """
-            )
-            params = {"start_date": start_date, "end_date": end_date}
-
-        with self.db_writer.engine.begin() as conn:
-            df = pd.read_sql(stmt, conn, params=params)
+                df = pd.read_sql(stmt, conn, params={"start_date": start_date_s, "end_date": end_date_s})
+            elif use_in:
+                # IN 列表分批，避免 SQL 过长/解析慢
+                chunk_size = 800
+                stmt = (
+                    text(
+                        f"""
+                        SELECT {select_cols}
+                        FROM `{tbl}`
+                        WHERE `code` IN :codes AND `date` BETWEEN :start_date AND :end_date
+                        ORDER BY `code`,`date`
+                        """
+                    )
+                    .bindparams(bindparam("codes", expanding=True))
+                )
+                parts: List[pd.DataFrame] = []
+                for i in range(0, len(codes), chunk_size):
+                    part_codes = codes[i : i + chunk_size]
+                    part = pd.read_sql(
+                        stmt,
+                        conn,
+                        params={"codes": part_codes, "start_date": start_date_s, "end_date": end_date_s},
+                    )
+                    if not part.empty:
+                        parts.append(part)
+                df = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+            else:
+                # 极端情况：codes 很多时退化为按日期读取（不建议用 all 做日线指标计算）
+                stmt = text(
+                    f"""
+                    SELECT {select_cols}
+                    FROM `{tbl}`
+                    WHERE `date` BETWEEN :start_date AND :end_date
+                    ORDER BY `code`,`date`
+                    """
+                )
+                df = pd.read_sql(stmt, conn, params={"start_date": start_date_s, "end_date": end_date_s})
 
         if df.empty:
             raise RuntimeError(f"未能从 {tbl} 读取到任何日线数据。")
@@ -224,12 +257,9 @@ class MA5MA20StrategyRunner:
 
         df = _to_numeric(
             df,
-            ["open", "high", "low", "close", "preclose", "volume", "amount", "pctChg"],
+            ["high", "low", "close", "preclose", "volume", "amount"],
         )
         df = df.dropna(subset=["date", "code", "close", "high", "low", "preclose"]).copy()
-
-        if (not use_in) and codes:
-            df = df[df["code"].isin(set(map(str, codes)))].copy()
 
         df = df.sort_values(["code", "date"]).reset_index(drop=True)
         df = df.groupby("code", group_keys=False).tail(lookback).reset_index(drop=True)
@@ -239,17 +269,18 @@ class MA5MA20StrategyRunner:
         """为每个 code 计算均线、量能、MACD、KDJ、ATR。"""
         df = df.sort_values(["code", "date"]).copy()
 
-        g_close = df.groupby("code")["close"]
-        g_vol = df.groupby("code")["volume"]
+        # 用 groupby().rolling() 替代 transform(lambda...)，减少 Python 层开销
+        g_close = df.groupby("code", sort=False)["close"]
+        g_vol = df.groupby("code", sort=False)["volume"]
 
-        df["ma5"] = g_close.transform(lambda s: s.rolling(5, min_periods=5).mean())
-        df["ma10"] = g_close.transform(lambda s: s.rolling(10, min_periods=10).mean())
-        df["ma20"] = g_close.transform(lambda s: s.rolling(20, min_periods=20).mean())
-        df["ma60"] = g_close.transform(lambda s: s.rolling(60, min_periods=60).mean())
-        df["ma250"] = g_close.transform(lambda s: s.rolling(250, min_periods=250).mean())
+        df["ma5"] = g_close.rolling(5, min_periods=5).mean().reset_index(level=0, drop=True)
+        df["ma10"] = g_close.rolling(10, min_periods=10).mean().reset_index(level=0, drop=True)
+        df["ma20"] = g_close.rolling(20, min_periods=20).mean().reset_index(level=0, drop=True)
+        df["ma60"] = g_close.rolling(60, min_periods=60).mean().reset_index(level=0, drop=True)
+        df["ma250"] = g_close.rolling(250, min_periods=250).mean().reset_index(level=0, drop=True)
 
         vol_win = int(self.params.volume_ma_window)
-        df["vol_ma"] = g_vol.transform(lambda s: s.rolling(vol_win, min_periods=vol_win).mean())
+        df["vol_ma"] = g_vol.rolling(vol_win, min_periods=vol_win).mean().reset_index(level=0, drop=True)
         df["vol_ratio"] = df["volume"] / df["vol_ma"]
 
         def _add_oscillators(sub: pd.DataFrame) -> pd.DataFrame:
