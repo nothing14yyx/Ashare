@@ -35,6 +35,19 @@ app:
   # false：只使用数据库中已有的财务表，直接拼接 fundamentals_latest_wide
   refresh_fundamentals: false
 
+  # 是否拉取常用指数日线数据（用于大盘趋势过滤）
+  fetch_index_kline: true
+  index_codes:
+    - sh.000001
+    - sh.000300
+    - sh.000905
+    - sz.399001
+    - sz.399006
+  index_history_days: 400
+
+  # 是否创建/更新股票-行业维表（基于 query_stock_industry）
+  build_stock_industry_dim: true
+
 database:
   host: 127.0.0.1
   port: 3306
@@ -99,6 +112,14 @@ akshare:
     detail_enabled: true
     detail_top_n: 100
 
+  board_industry:
+    enabled: true
+    spot_enabled: true
+    hist_enabled: false
+    history_days: 200
+    adjust: hfq
+    build_stock_board_dim: true
+
 # MA5-MA20 顺势趋势波段系统
 # - enabled: true 时会在 start.py 数据采集后自动运行，默认写入 signals 表并创建 candidates 视图
 strategy_ma5_ma20_trend:
@@ -160,6 +181,9 @@ open_monitor:
 
   # 情绪过滤：信号日如果已经接近涨停的大阳线，次日默认不追
   signal_day_limit_up_pct: 0.095
+
+  # 大盘环境分数阈值（指数均线评分低于此值时默认 WAIT）
+  env_index_score_threshold: 2.0
 
   # 输出
   write_to_db: true

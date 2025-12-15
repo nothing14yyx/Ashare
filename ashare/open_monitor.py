@@ -208,6 +208,22 @@ class MA5MA20OpenMonitorRunner:
         self.params = OpenMonitorParams.from_config()
         self.db_writer = MySQLWriter(DatabaseConfig.from_env())
         self.volume_ratio_threshold = self._resolve_volume_ratio_threshold()
+        app_cfg = get_section("app") or {}
+        self.index_codes = []
+        if isinstance(app_cfg, dict):
+            codes = app_cfg.get("index_codes", [])
+            if isinstance(codes, (list, tuple)):
+                self.index_codes = [str(c).strip() for c in codes if str(c).strip()]
+        ak_cfg = get_section("akshare") or {}
+        board_cfg = ak_cfg.get("board_industry", {}) if isinstance(ak_cfg, dict) else {}
+        if not isinstance(board_cfg, dict):
+            board_cfg = {}
+        self.board_env_enabled = bool(board_cfg.get("enabled", False))
+        self.board_spot_enabled = bool(board_cfg.get("spot_enabled", True))
+        self.board_strength_history_days = board_cfg.get("history_days", 200)
+        om_cfg = get_section("open_monitor") or {}
+        threshold = _to_float(om_cfg.get("env_index_score_threshold"))
+        self.env_index_score_threshold = threshold if threshold is not None else 2.0
 
     def _resolve_volume_ratio_threshold(self) -> float:
         strat = get_section("strategy_ma5_ma20_trend") or {}
@@ -470,6 +486,158 @@ class MA5MA20OpenMonitorRunner:
         df["code"] = df["code"].astype(str)
         return df
 
+    def _load_stock_industry_dim(self) -> pd.DataFrame:
+        candidates = ["dim_stock_industry", "a_share_stock_industry"]
+        for table in candidates:
+            if not self._table_exists(table):
+                continue
+            try:
+                with self.db_writer.engine.begin() as conn:
+                    df = pd.read_sql_query(text(f"SELECT * FROM `{table}`"), conn)
+            except Exception as exc:  # noqa: BLE001
+                self.logger.debug("读取 %s 失败：%s", table, exc)
+                continue
+            if not df.empty:
+                df["code"] = df["code"].astype(str)
+                return df
+        return pd.DataFrame()
+
+    def _load_board_constituent_dim(self) -> pd.DataFrame:
+        table = "dim_stock_board_industry"
+        if not self._table_exists(table):
+            return pd.DataFrame()
+        try:
+            with self.db_writer.engine.begin() as conn:
+                df = pd.read_sql_query(text(f"SELECT * FROM `{table}`"), conn)
+        except Exception as exc:  # noqa: BLE001
+            self.logger.debug("读取 %s 失败：%s", table, exc)
+            return pd.DataFrame()
+        if not df.empty and "code" in df.columns:
+            df["code"] = df["code"].astype(str)
+        return df
+
+    def _load_board_spot_strength(self) -> pd.DataFrame:
+        if not (self.board_env_enabled and self.board_spot_enabled):
+            return pd.DataFrame()
+        if not self._table_exists("board_industry_spot"):
+            return pd.DataFrame()
+
+        stmt = text(
+            """
+            SELECT *
+            FROM board_industry_spot
+            WHERE ts = (SELECT MAX(ts) FROM board_industry_spot)
+            """
+        )
+        try:
+            with self.db_writer.engine.begin() as conn:
+                df = pd.read_sql_query(stmt, conn)
+        except Exception as exc:  # noqa: BLE001
+            self.logger.debug("读取 board_industry_spot 失败：%s", exc)
+            return pd.DataFrame()
+
+        if df.empty:
+            return df
+
+        rename_map = {}
+        for col in df.columns:
+            if "板块" in col and "名称" in col:
+                rename_map[col] = "board_name"
+            if "涨跌幅" in col or col in {"chg_pct", "涨跌幅(%)"}:
+                rename_map[col] = "chg_pct"
+            if "代码" in col:
+                rename_map[col] = "board_code"
+        df = df.rename(columns=rename_map)
+        if "chg_pct" in df.columns:
+            df["chg_pct"] = pd.to_numeric(df["chg_pct"], errors="coerce")
+            df = df.sort_values(by="chg_pct", ascending=False).reset_index(drop=True)
+            df["rank"] = df.index + 1
+        if "board_code" in df.columns:
+            df["board_code"] = df["board_code"].astype(str)
+        return df
+
+    def _load_index_trend(self, latest_trade_date: str) -> dict[str, Any]:
+        if not self.index_codes or not self._table_exists("history_index_daily_kline"):
+            return {"score": None, "detail": {}}
+
+        stmt = text(
+            """
+            SELECT *
+            FROM history_index_daily_kline
+            WHERE `code` IN :codes AND `date` <= :d
+            ORDER BY `code`, `date`
+            """
+        ).bindparams(bindparam("codes", expanding=True))
+        try:
+            with self.db_writer.engine.begin() as conn:
+                df = pd.read_sql_query(
+                    stmt, conn, params={"codes": self.index_codes, "d": latest_trade_date}
+                )
+        except Exception as exc:  # noqa: BLE001
+            self.logger.debug("读取指数日线失败：%s", exc)
+            return {"score": None, "detail": {}}
+
+        if df.empty:
+            return {"score": None, "detail": {}}
+
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        numeric_cols = ["close", "ma20", "ma60", "ma250"]
+        for col in numeric_cols:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        detail: dict[str, dict[str, Any]] = {}
+        for code, group in df.groupby("code"):
+            grp = group.sort_values("date")
+            grp["ma20"] = grp["close"].rolling(20, min_periods=1).mean()
+            grp["ma60"] = grp["close"].rolling(60, min_periods=1).mean()
+            grp["ma250"] = grp["close"].rolling(250, min_periods=1).mean()
+            latest = grp.iloc[-1]
+            score = 0
+            for ma in ["ma20", "ma60", "ma250"]:
+                ma_val = latest.get(ma)
+                close_val = latest.get("close")
+                if ma_val is not None and close_val is not None and close_val > ma_val:
+                    score += 1
+            detail[code] = {
+                "close": latest.get("close"),
+                "ma20": latest.get("ma20"),
+                "ma60": latest.get("ma60"),
+                "ma250": latest.get("ma250"),
+                "score": score,
+            }
+
+        if not detail:
+            return {"score": None, "detail": {}}
+
+        avg_score = sum(v["score"] for v in detail.values()) / len(detail)
+        return {"score": avg_score, "detail": detail}
+
+    def _build_environment_context(self, latest_trade_date: str) -> dict[str, Any]:
+        index_trend = self._load_index_trend(latest_trade_date)
+        board_strength = self._load_board_spot_strength()
+        board_map: dict[str, Any] = {}
+        if not board_strength.empty and "board_name" in board_strength.columns:
+            total = len(board_strength)
+            for _, row in board_strength.iterrows():
+                name = str(row.get("board_name") or "").strip()
+                code = str(row.get("board_code") or "").strip()
+                rank = row.get("rank")
+                pct = row.get("chg_pct")
+                status = "neutral"
+                if total > 0 and rank:
+                    if rank <= max(1, int(total * 0.2)):
+                        status = "strong"
+                    elif rank >= max(1, int(total * 0.8)):
+                        status = "weak"
+                payload = {"rank": rank, "chg_pct": pct, "status": status}
+                for key in [name, code]:
+                    key_norm = str(key).strip()
+                    if key_norm:
+                        board_map[key_norm] = payload
+
+        return {"index": index_trend, "boards": board_map}
+
     # -------------------------
     # Quote fetch
     # -------------------------
@@ -644,6 +812,7 @@ class MA5MA20OpenMonitorRunner:
         quotes: pd.DataFrame,
         latest_snapshots: pd.DataFrame,
         latest_trade_date: str,
+        env_context: dict[str, Any] | None = None,
     ) -> pd.DataFrame:
         if signals.empty:
             return pd.DataFrame()
@@ -665,6 +834,33 @@ class MA5MA20OpenMonitorRunner:
 
         q["code"] = q["code"].astype(str)
         merged = signals.merge(q, on="code", how="left", suffixes=("", "_q"))
+
+        env_context = env_context or {}
+        industry_dim = self._load_stock_industry_dim()
+        if not industry_dim.empty:
+            rename_map = {}
+            if "industryClassification" in industry_dim.columns:
+                rename_map["industryClassification"] = "industry_classification"
+            industry_dim = industry_dim.rename(columns=rename_map)
+            if "industry" not in industry_dim.columns and "industry_classification" in industry_dim.columns:
+                industry_dim["industry"] = industry_dim["industry_classification"]
+            merged = merged.merge(
+                industry_dim[[c for c in ["code", "industry", "industry_classification"] if c in industry_dim.columns]],
+                on="code",
+                how="left",
+            )
+        board_dim = self._load_board_constituent_dim()
+        if not board_dim.empty:
+            cols = [c for c in ["code", "board_name", "board_code"] if c in board_dim.columns]
+            if cols:
+                deduped = board_dim.drop_duplicates(subset=["code"], keep="first")
+                merged = merged.merge(deduped[cols], on="code", how="left")
+
+        board_map: dict[str, Any] = env_context.get("boards", {}) if isinstance(env_context, dict) else {}
+        index_score = None
+        if isinstance(env_context, dict):
+            index_section = env_context.get("index", {}) if isinstance(env_context.get("index"), dict) else {}
+            index_score = index_section.get("score")
 
         if not latest_snapshots.empty:
             snap = latest_snapshots.copy()
@@ -741,6 +937,10 @@ class MA5MA20OpenMonitorRunner:
         stop_refs: List[float | None] = []
         signal_stop_refs: List[float | None] = []
         valid_days_list: List[int | None] = []
+        env_index_scores: List[float | None] = []
+        board_statuses: List[str | None] = []
+        board_ranks: List[float | None] = []
+        board_chg_pcts: List[float | None] = []
 
         def _prefer_latest(row: pd.Series, key: str) -> float | None:
             latest_val = row.get(f"latest_{key}")
@@ -927,6 +1127,53 @@ class MA5MA20OpenMonitorRunner:
                         f"（>{max_entry_vs_ma5*100:.2f}%）"
                     )
 
+            board_candidates: list[str] = []
+            for key in [
+                row.get("board_name"),
+                row.get("board_code"),
+                row.get("industry"),
+                row.get("industry_classification"),
+            ]:
+                if pd.notna(key):
+                    key_norm = str(key).strip()
+                    if key_norm and key_norm.lower() != "nan":
+                        board_candidates.append(key_norm)
+            board_info = None
+            board_status = None
+            board_rank = None
+            board_chg = None
+            for key in board_candidates:
+                board_info = board_map.get(key)
+                if board_info:
+                    break
+            if isinstance(board_info, dict):
+                board_status = board_info.get("status")
+                board_rank = _to_float(board_info.get("rank"))
+                board_chg = _to_float(board_info.get("chg_pct"))
+
+            if (
+                index_score is not None
+                and action == "EXECUTE"
+                and index_score < self.env_index_score_threshold
+            ):
+                action = "WAIT"
+                reason = (
+                    f"大盘趋势分数 {index_score:.1f} 低于阈值"
+                    f" {self.env_index_score_threshold:.1f}，建议观望/减仓"
+                )
+
+            if board_status == "weak" and action == "EXECUTE":
+                action = "WAIT"
+                reason = "所属板块走势偏弱，建议降低优先级"
+            elif board_status == "strong" and action == "WAIT" and action != "SKIP":
+                rank_display = f"{board_rank:.0f}" if board_rank is not None else "-"
+                reason = f"板块强势(rank={rank_display})，等待入场条件"
+
+            env_index_scores.append(_to_float(index_score))
+            board_statuses.append(board_status)
+            board_ranks.append(board_rank)
+            board_chg_pcts.append(board_chg)
+
             actions.append(action)
             reasons.append(reason)
             statuses.append(status)
@@ -945,6 +1192,10 @@ class MA5MA20OpenMonitorRunner:
         merged["signal_stop_ref"] = signal_stop_refs
         merged["valid_days"] = valid_days_list
         merged["checked_at"] = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        merged["env_index_score"] = env_index_scores
+        merged["board_status"] = board_statuses
+        merged["board_rank"] = board_ranks
+        merged["board_chg_pct"] = board_chg_pcts
 
         keep_cols = [
             "monitor_date",
@@ -970,6 +1221,13 @@ class MA5MA20OpenMonitorRunner:
             "atr14",
             "stop_ref",
             "signal_stop_ref",
+            "env_index_score",
+            "industry",
+            "board_name",
+            "board_code",
+            "board_status",
+            "board_rank",
+            "board_chg_pct",
             "signal",
             "reason",
             "candidate_status",
@@ -1078,7 +1336,10 @@ class MA5MA20OpenMonitorRunner:
             self.logger.info("实时行情已获取：%s 条", len(quotes))
 
         latest_snapshots = self._load_latest_snapshots(latest_trade_date, codes)
-        result = self._evaluate(signals, quotes, latest_snapshots, latest_trade_date)
+        env_context = self._build_environment_context(latest_trade_date)
+        result = self._evaluate(
+            signals, quotes, latest_snapshots, latest_trade_date, env_context
+        )
         if result.empty:
             return
 

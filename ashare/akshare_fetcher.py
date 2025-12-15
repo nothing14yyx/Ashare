@@ -87,3 +87,36 @@ class AkshareDataFetcher:
                 frames.append(df)
 
         return frames
+
+    def get_board_industry_spot(self) -> pd.DataFrame:
+        """东方财富行业板块当日表现快照。"""
+
+        raw = ak.stock_board_industry_name_em()
+        return self._ensure_df(raw)
+
+    def get_board_industry_hist(
+        self,
+        board_name: str,
+        start_date: str,
+        end_date: str,
+        adjust: str = "hfq",
+        period: str = "日k",
+    ) -> pd.DataFrame:
+        """东方财富行业板块历史行情。"""
+
+        normalized_start = str(start_date).replace("-", "")
+        normalized_end = str(end_date).replace("-", "")
+        raw = ak.stock_board_industry_hist_em(
+            symbol=board_name,
+            period=period,
+            start_date=normalized_start,
+            end_date=normalized_end,
+            adjust=adjust,
+        )
+        return self._ensure_df(raw)
+
+    def get_board_industry_constituents(self, board_name: str) -> pd.DataFrame:
+        """东方财富行业板块成份股列表。"""
+
+        raw = ak.stock_board_industry_cons_em(symbol=board_name)
+        return self._ensure_df(raw)
