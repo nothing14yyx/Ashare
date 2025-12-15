@@ -683,10 +683,19 @@ class MA5MA20OpenMonitorRunner:
     # -------------------------
     # Public run
     # -------------------------
-    def run(self) -> None:
-        if not self.params.enabled:
+    def run(self, *, force: bool = False) -> None:
+        """执行开盘监测。
+
+        - 默认遵循 config.yaml: open_monitor.enabled。
+        - 当 force=True 时，即便 enabled=false 也会执行（用于单独运行脚本）。
+        """
+
+        if (not force) and (not self.params.enabled):
             self.logger.info("open_monitor.enabled=false，跳过开盘监测。")
             return
+
+        if force and (not self.params.enabled):
+            self.logger.info("open_monitor.enabled=false，但 force=True，仍将执行开盘监测。")
 
         signal_date, signals = self._load_latest_buy_signals()
         if not signal_date or signals.empty:

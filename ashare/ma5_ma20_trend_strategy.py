@@ -653,10 +653,19 @@ class MA5MA20StrategyRunner:
         self._clear_table(tbl)
         self.db_writer.write_dataframe(cands, tbl, if_exists="append")
 
-    def run(self) -> None:
-        if not self.params.enabled:
+    def run(self, *, force: bool = False) -> None:
+        """执行 MA5-MA20 策略。
+
+        - 默认遵循 config.yaml: strategy_ma5_ma20_trend.enabled。
+        - 当 force=True 时，即便 enabled=false 也会执行（用于单独运行脚本）。
+        """
+
+        if (not force) and (not self.params.enabled):
             self.logger.info("strategy_ma5_ma20_trend.enabled=false，已跳过 MA5-MA20 策略运行。")
             return
+
+        if force and (not self.params.enabled):
+            self.logger.info("strategy_ma5_ma20_trend.enabled=false，但 force=True，仍将执行 MA5-MA20 策略。")
 
         self.logger.debug(
             "MA5-MA20 参数：lookback_days=%s indicator_window=%s",

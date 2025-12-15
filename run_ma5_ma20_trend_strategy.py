@@ -12,7 +12,8 @@ from ashare.ma5_ma20_trend_strategy import MA5MA20StrategyRunner
 
 
 def main() -> None:
-    MA5MA20StrategyRunner().run()
+    # 独立执行脚本：不受 config.yaml 的 enabled 总开关限制
+    MA5MA20StrategyRunner().run(force=True)
 
 
 if __name__ == "__main__":

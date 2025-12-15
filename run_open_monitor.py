@@ -13,7 +13,8 @@ from ashare.open_monitor import MA5MA20OpenMonitorRunner
 
 
 def main() -> None:
-    MA5MA20OpenMonitorRunner().run()
+    # 独立执行脚本：不受 config.yaml 的 enabled 总开关限制
+    MA5MA20OpenMonitorRunner().run(force=True)
 
 
 if __name__ == "__main__":
