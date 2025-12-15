@@ -314,12 +314,6 @@ def build_cases(
     cases.append((f"margin_detail_sse_{_date_compact(test_day)}", margin_sse_case))
     cases.append((f"margin_detail_szse_{_date_compact(test_day)}", margin_szse_case))
 
-    cases.append(
-        ("hsgt_hold_stock_em_hgt_5d", lambda: ak.stock_hsgt_hold_stock_em(market="沪股通", indicator="5日排行"))
-    )
-    cases.append(
-        ("hsgt_hold_stock_em_sgt_5d", lambda: ak.stock_hsgt_hold_stock_em(market="深股通", indicator="5日排行"))
-    )
     cases.append(("gdhs_summary_latest", lambda: ak.stock_zh_a_gdhs(symbol="最新")))
     cases.append((f"gdhs_detail_{test_symbol}", lambda: ak.stock_zh_a_gdhs_detail_em(symbol=test_symbol)))
 

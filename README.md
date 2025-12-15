@@ -10,7 +10,6 @@
 - 可选启用 Akshare 行为证据采集：
   - 龙虎榜详情写入 `a_share_lhb_detail`
   - 两融明细写入 `a_share_margin_detail`
-  - 北向持股排行写入 `a_share_hsgt_hold_rank`
   - 股东户数汇总与明细写入 `a_share_gdhs` 与 `a_share_gdhs_detail`
 - 提供脚本化入口 `start.py`，直接运行即可完成上述流程。
 
