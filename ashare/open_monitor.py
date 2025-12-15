@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
 import math
 import time
@@ -52,6 +53,48 @@ def _to_float(value: Any) -> float | None:  # noqa: ANN401
         return float(value)
     except Exception:
         return None
+
+
+SNAPSHOT_HASH_EXCLUDE = {"checked_at"}
+
+
+def _normalize_snapshot_value(value: Any) -> Any:  # noqa: ANN401
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    if isinstance(value, float):
+        if math.isnan(value) or math.isinf(value):
+            return None
+        return round(value, 6)
+    if isinstance(value, int):
+        return value
+    try:
+        if hasattr(value, "item"):
+            base = value.item()
+            if isinstance(base, (float, int)):
+                return _normalize_snapshot_value(base)
+            return base
+    except Exception:
+        pass
+    if isinstance(value, (dt.datetime, dt.date)):
+        return value.isoformat(sep=" ")
+    return value
+
+
+def make_snapshot_hash(row: Dict[str, Any]) -> str:
+    payload = {}
+    for key, value in row.items():
+        if key in SNAPSHOT_HASH_EXCLUDE:
+            continue
+        payload[key] = _normalize_snapshot_value(value)
+    serialized = json.dumps(
+        payload, sort_keys=True, ensure_ascii=False, separators=(",", ":")
+    )
+    return hashlib.md5(serialized.encode("utf-8")).hexdigest()
 
 
 def _strip_baostock_prefix(code: str) -> str:
@@ -257,6 +300,118 @@ class MA5MA20OpenMonitorRunner:
             return not df.empty
         except Exception:
             return False
+
+    def _column_exists(self, table: str, column: str) -> bool:
+        try:
+            stmt = text(
+                """
+                SELECT COUNT(*) AS cnt
+                FROM information_schema.columns
+                WHERE table_schema = :schema AND table_name = :table AND column_name = :column
+                """
+            )
+            with self.db_writer.engine.begin() as conn:
+                df = pd.read_sql_query(
+                    stmt,
+                    conn,
+                    params={
+                        "schema": self.db_writer.config.db_name,
+                        "table": table,
+                        "column": column,
+                    },
+                )
+            return not df.empty and bool(df.iloc[0].get("cnt", 0))
+        except Exception as exc:  # noqa: BLE001
+            self.logger.debug("检查列 %s.%s 是否存在失败：%s", table, column, exc)
+            return False
+
+    def _index_exists(self, table: str, index: str) -> bool:
+        try:
+            stmt = text(
+                """
+                SELECT COUNT(*) AS cnt
+                FROM information_schema.statistics
+                WHERE table_schema = :schema AND table_name = :table AND index_name = :index
+                """
+            )
+            with self.db_writer.engine.begin() as conn:
+                df = pd.read_sql_query(
+                    stmt,
+                    conn,
+                    params={
+                        "schema": self.db_writer.config.db_name,
+                        "table": table,
+                        "index": index,
+                    },
+                )
+            return not df.empty and bool(df.iloc[0].get("cnt", 0))
+        except Exception as exc:  # noqa: BLE001
+            self.logger.debug("检查索引 %s.%s 是否存在失败：%s", table, index, exc)
+            return False
+
+    def _ensure_snapshot_schema(self, table: str) -> None:
+        if not table or not self._table_exists(table):
+            return
+
+        if not self._column_exists(table, "snapshot_hash"):
+            try:
+                with self.db_writer.engine.begin() as conn:
+                    conn.execute(
+                        text(
+                            f"ALTER TABLE `{table}` ADD COLUMN `snapshot_hash` VARCHAR(64)"
+                        )
+                    )
+                self.logger.info("表 %s 已新增 snapshot_hash 列用于去重。", table)
+            except Exception as exc:  # noqa: BLE001
+                self.logger.warning("为表 %s 添加 snapshot_hash 列失败：%s", table, exc)
+
+        index_name = "ux_open_monitor_dedupe"
+        if not self._index_exists(table, index_name):
+            try:
+                with self.db_writer.engine.begin() as conn:
+                    conn.execute(
+                        text(
+                            f"""
+                            CREATE UNIQUE INDEX `{index_name}`
+                            ON `{table}` (`monitor_date`, `date`, `code`, `snapshot_hash`)
+                            """
+                        )
+                    )
+                self.logger.info("表 %s 已创建唯一索引 %s 用于幂等写入。", table, index_name)
+            except Exception as exc:  # noqa: BLE001
+                self.logger.warning("创建唯一索引 %s 失败：%s", index_name, exc)
+
+    def _load_existing_snapshot_keys(
+        self, table: str, monitor_date: str, codes: List[str]
+    ) -> set[tuple[str, str, str, str]]:
+        if not (table and monitor_date and codes and self._table_exists(table)):
+            return set()
+        stmt = text(
+            f"""
+            SELECT `monitor_date`, `date`, `code`, `snapshot_hash`
+            FROM `{table}`
+            WHERE `monitor_date` = :d AND `code` IN :codes
+            """
+        ).bindparams(bindparam("codes", expanding=True))
+
+        try:
+            with self.db_writer.engine.begin() as conn:
+                df = pd.read_sql_query(
+                    stmt, conn, params={"d": monitor_date, "codes": codes}
+                )
+        except Exception as exc:  # noqa: BLE001
+            self.logger.debug("读取已存在的 snapshot_hash 失败：%s", exc)
+            return set()
+
+        existing: set[tuple[str, str, str, str]] = set()
+        for _, row in df.iterrows():
+            snap = str(row.get("snapshot_hash") or "").strip()
+            code = str(row.get("code") or "").strip()
+            date_val = str(row.get("date") or "").strip()
+            monitor = str(row.get("monitor_date") or "").strip()
+            if snap and code and date_val and monitor:
+                existing.add((monitor, date_val, code, snap))
+        return existing
 
     def _daily_table(self) -> str:
         """获取日线数据表名（用于补充计算“信号日涨幅”等信息）。"""
@@ -1248,6 +1403,7 @@ class MA5MA20OpenMonitorRunner:
             "action",
             "action_reason",
             "checked_at",
+            "snapshot_hash",
         ]
         for col in keep_cols:
             if col not in merged.columns:
@@ -1268,6 +1424,9 @@ class MA5MA20OpenMonitorRunner:
         monitor_date = str(df.iloc[0].get("monitor_date") or "").strip()
         codes = df["code"].dropna().astype(str).unique().tolist()
 
+        df["snapshot_hash"] = df.apply(lambda row: make_snapshot_hash(row.to_dict()), axis=1)
+        df = df.drop_duplicates(subset=["monitor_date", "date", "code", "snapshot_hash"])
+
         # 增量模式：不删除旧记录，保留每次运行的历史快照（checked_at 会区分）
         if (not self.params.incremental_write) and monitor_date and codes and self._table_exists(table):
             delete_stmt = text(
@@ -1281,9 +1440,35 @@ class MA5MA20OpenMonitorRunner:
             except Exception as exc:  # noqa: BLE001
                 self.logger.warning("开盘监测表去重删除失败，将直接追加：%s", exc)
 
+        if self._table_exists(table):
+            self._ensure_snapshot_schema(table)
+            existing_keys = self._load_existing_snapshot_keys(table, monitor_date, codes)
+            if existing_keys:
+                before = len(df)
+                df = df[
+                    ~df.apply(
+                        lambda row: (
+                            str(row.get("monitor_date") or "").strip(),
+                            str(row.get("date") or "").strip(),
+                            str(row.get("code") or "").strip(),
+                            str(row.get("snapshot_hash") or "").strip(),
+                        )
+                        in existing_keys,
+                        axis=1,
+                    )
+                ]
+                dropped = before - len(df)
+                if dropped > 0:
+                    self.logger.info("检测到 %s 条完全相同快照，已跳过重复写入。", dropped)
+
+        if df.empty:
+            self.logger.info("本次开盘监测结果全部为重复快照，跳过写入。")
+            return
+
         try:
             self.db_writer.write_dataframe(df, table, if_exists="append")
             self.logger.info("开盘监测结果已写入表 %s：%s 条", table, len(df))
+            self._ensure_snapshot_schema(table)
         except Exception as exc:  # noqa: BLE001
             self.logger.error("写入开盘监测表失败：%s", exc)
 
@@ -1314,6 +1499,7 @@ class MA5MA20OpenMonitorRunner:
         path = outdir / f"open_monitor_{monitor_date}{suffix}.csv"
 
         export_df = df.copy()
+        export_df = export_df.drop(columns=["snapshot_hash"], errors="ignore")
         export_df["gap_pct"] = export_df["gap_pct"].apply(_to_float)
         # CSV 里把“状态正常且可执行”放在最前面，方便你开盘快速扫一眼
         action_rank = {"EXECUTE": 0, "WAIT": 1, "SKIP": 2, "UNKNOWN": 3}
