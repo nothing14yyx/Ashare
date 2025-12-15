@@ -13,7 +13,7 @@
 
 注意：
 - 该脚本“只做监测与清单输出”，不下单。
-- 实时行情优先用 AkShare 的东方财富 A 股实时接口；若未安装 AkShare，则自动回退到 Eastmoney push2 接口。
+- 实时行情默认使用 Eastmoney push2 接口；如需测试 AkShare，可在 config.yaml 将 open_monitor.quote_source=akshare。
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import math
+import time
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
@@ -98,8 +99,8 @@ class OpenMonitorParams:
     # 输出表：开盘检查结果
     output_table: str = "strategy_ma5_ma20_open_monitor"
 
-    # 行情来源：auto / akshare / eastmoney
-    quote_source: str = "auto"
+    # 行情来源：eastmoney / akshare（兼容：auto 将按 eastmoney 处理）
+    quote_source: str = "eastmoney"
 
     # 核心过滤规则
     max_gap_up_pct: float = 0.05       # 今开相对昨收涨幅 > 5% → skip
@@ -319,15 +320,17 @@ class MA5MA20OpenMonitorRunner:
     # Quote fetch
     # -------------------------
     def _fetch_quotes(self, codes: List[str]) -> pd.DataFrame:
-        source = (self.params.quote_source or "auto").lower()
+        """获取实时行情。
 
-        if source in {"auto", "akshare"}:
-            df = self._fetch_quotes_akshare(codes)
-            if not df.empty:
-                return df
-            if source == "akshare":
-                return df
+        路线A：默认直接走东财（eastmoney）以避免 AkShare 全市场实时接口不稳定。
+        - quote_source=eastmoney/auto：直接东财
+        - quote_source=akshare：仅在显式指定时才调用 AkShare
+        """
 
+        source = (self.params.quote_source or "eastmoney").strip().lower()
+        if source == "akshare":
+            return self._fetch_quotes_akshare(codes)
+        # 兼容：auto 视为 eastmoney
         return self._fetch_quotes_eastmoney(codes)
 
     def _fetch_quotes_akshare(self, codes: List[str]) -> pd.DataFrame:
@@ -381,6 +384,38 @@ class MA5MA20OpenMonitorRunner:
         out["code"] = out["symbol"].map(mapping).fillna(out["code"])
         return out.reset_index(drop=True)
 
+    def _urlopen_json_no_proxy(self, url: str, *, timeout: int = 10, retries: int = 2) -> Dict[str, Any]:
+        """访问东财接口并返回 JSON（默认不使用环境代理）。
+
+        说明：urllib 默认会读取环境变量代理；这里强制 ProxyHandler({})，避免被 HTTP(S)_PROXY 影响。
+        """
+
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/123.0 Safari/537.36"
+            ),
+            "Accept": "application/json, text/plain, */*",
+            "Referer": "https://quote.eastmoney.com/",
+            "Connection": "close",
+        }
+        req = urllib.request.Request(url, headers=headers)
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+        last_exc: Exception | None = None
+        for i in range(retries + 1):
+            try:
+                with opener.open(req, timeout=timeout) as resp:
+                    raw = resp.read().decode("utf-8", errors="ignore")
+                return json.loads(raw) if raw else {}
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                if i < retries:
+                    time.sleep(0.5 * (2**i))
+                    continue
+                raise
+
     def _fetch_quotes_eastmoney(self, codes: List[str]) -> pd.DataFrame:
         if not codes:
             return pd.DataFrame()
@@ -401,8 +436,7 @@ class MA5MA20OpenMonitorRunner:
             }
             url = f"{base_url}?{urllib.parse.urlencode(query)}"
             try:
-                with urllib.request.urlopen(url, timeout=10) as resp:
-                    payload = json.loads(resp.read().decode("utf-8", errors="ignore"))
+                payload = self._urlopen_json_no_proxy(url, timeout=10, retries=2)
             except Exception as exc:  # noqa: BLE001
                 self.logger.error("Eastmoney 行情请求失败：%s", exc)
                 continue
@@ -541,6 +575,8 @@ class MA5MA20OpenMonitorRunner:
             if entry_px is not None and atr14 is not None and atr14 > 0 and stop_atr_mult > 0:
                 stop_ref = entry_px - stop_atr_mult * atr14
 
+            stop_refs.append(_to_float(stop_ref))
+
             # 情绪过滤：信号日（昨收）本身接近涨停，次日默认不追
             if action == "EXECUTE" and signal_day_pct is not None and signal_day_pct >= signal_day_limit_up:
                 action = "SKIP"
@@ -577,7 +613,19 @@ class MA5MA20OpenMonitorRunner:
                 threshold = ma20 * (1.0 + min_vs_ma20)
                 if entry_px < threshold:
                     action = "SKIP"
-                    reason = f"开盘价 {opx:.2f} 跌破 MA20 阈值 {threshold:.2f}"
+                    px_label = "入场价(最新)" if used_latest_as_entry else "入场价"
+                    reason = f"{px_label} {entry_px:.2f} 跌破 MA20 阈值 {threshold:.2f}"
+
+            # 追高过滤：入场价相对 MA5 乖离过大
+            if action == "EXECUTE" and (ma5 is not None) and (entry_px is not None) and (max_entry_vs_ma5 > 0):
+                threshold_ma5 = ma5 * (1.0 + max_entry_vs_ma5)
+                if entry_px > threshold_ma5:
+                    action = "SKIP"
+                    px_label = "入场价(最新)" if used_latest_as_entry else "入场价"
+                    reason = (
+                        f"{px_label} {entry_px:.2f} 高于 MA5 阈值 {threshold_ma5:.2f}"
+                        f"（>{max_entry_vs_ma5*100:.2f}%）"
+                    )
 
             actions.append(action)
             reasons.append(reason)
@@ -586,6 +634,7 @@ class MA5MA20OpenMonitorRunner:
         merged["signal_date"] = signal_date
         merged["action"] = actions
         merged["action_reason"] = reasons
+        merged["stop_ref"] = stop_refs
         merged["checked_at"] = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         keep_cols = [
