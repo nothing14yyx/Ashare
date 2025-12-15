@@ -265,6 +265,63 @@ class ExternalSignalManager:
     # =========================
     # Trade-date backoff (核心：取最近一次可用数据)
     # =========================
+    def _iter_recent_trading_dates(
+        self,
+        requested_trade_date_iso: str,
+        max_backoff_days: int,
+        skip_today: bool,
+    ) -> list[str]:
+        """按交易日回退（优先）。
+
+        设计目标：不引入额外配置/开关，也不改调用方签名。
+        - 优先使用本地数据库里“指数日线”表的日期序列作为交易日历；
+        - 若表不存在/为空/查询失败，则返回空列表，由调用方回退到自然日逻辑。
+
+        返回值：ISO 日期列表（YYYY-MM-DD），按“最近 -> 更早”顺序。
+        返回条数与旧逻辑保持一致：最多返回 max_backoff_days + 1 次尝试的候选日期。
+        """
+
+        req_iso = str(requested_trade_date_iso or "").strip()
+        if not req_iso:
+            return []
+
+        # 多取 1 条：如果 req_iso 本身在表里且 skip_today=True，需要丢掉第一条
+        limit = int(max_backoff_days) + 2
+        if limit <= 0:
+            return []
+
+        sql = text(
+            f"SELECT DISTINCT `date` AS d FROM `history_index_daily_kline` "
+            "WHERE `date` <= :req ORDER BY `date` DESC "
+            f"LIMIT {limit}"
+        )
+
+        try:
+            with self.db_writer.engine.connect() as conn:
+                rows = conn.execute(sql, {"req": req_iso}).fetchall()
+        except Exception:
+            return []
+
+        dates: list[str] = []
+        for row in rows:
+            if not row:
+                continue
+            value = row[0]
+            if value is None:
+                continue
+            iso = str(value).strip()
+            if iso:
+                dates.append(iso)
+
+        if not dates:
+            return []
+
+        if skip_today and dates and dates[0] == req_iso:
+            dates = dates[1:]
+
+        # 旧逻辑：最多尝试 max_backoff_days + 1 次
+        return dates[: int(max_backoff_days) + 1]
+
     def _iter_recent_dates(
         self,
         requested_trade_date: str,
@@ -273,12 +330,26 @@ class ExternalSignalManager:
     ) -> list[str]:
         """
         返回 ISO 日期列表（YYYY-MM-DD），按“最近 -> 更早”顺序。
-        默认 skip_today=True：从上一天开始尝试，直到回退 max_backoff_days 天。
+
+        为避免国庆/春节等长假导致“自然日回退不够而全空”，这里默认优先按交易日回退：
+        - 能从本地交易日历拿到候选日期 → 用交易日序列；
+        - 否则回退到自然日（兼容旧行为）。
         """
         req_ymd = self._to_yyyymmdd(requested_trade_date)
         if not req_ymd:
             return []
 
+        req_iso = self._yyyymmdd_to_iso(req_ymd)
+
+        trading_dates = self._iter_recent_trading_dates(
+            requested_trade_date_iso=req_iso,
+            max_backoff_days=max_backoff_days,
+            skip_today=skip_today,
+        )
+        if trading_dates:
+            return trading_dates
+
+        # fallback：自然日回退（旧逻辑）
         start_offset = 1 if skip_today else 0
         dates: list[str] = []
         for offset in range(start_offset, max_backoff_days + 1 + start_offset):

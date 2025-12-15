@@ -187,6 +187,10 @@ open_monitor:
 
   # 输出
   write_to_db: true
+  # 增量写入：true=每次运行 append（保留历史快照，便于对比）；false=按 monitor_date+code 去重，只保留当天最新一份
+  incremental_write: true
+  # 增量导出：true=文件名带 checked_at 时间戳，避免同一天多次导出覆盖
+  incremental_export_timestamp: true
   export_csv: false
   export_top_n: 100
   output_subdir: open_monitor

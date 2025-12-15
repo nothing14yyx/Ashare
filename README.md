@@ -26,6 +26,21 @@
    - `a_share_universe`: 剔除 ST、退市与停牌标的后的候选池
    - `a_share_top_liquidity`: 按成交额排序的高流动性标的列表
 
+## 开盘监测（可选）
+项目内置“开盘监测”脚本：读取前一交易日收盘信号（BUY），结合实时行情再次过滤，输出“可执行/不可执行”清单。
+
+- 单次运行：
+  ```bash
+  python run_open_monitor.py
+  ```
+
+- 定时调度（每整 5 / 10 分钟触发一次）：
+  ```bash
+  python run_open_monitor_scheduler.py --interval 5
+  # 或
+  python run_open_monitor_scheduler.py --interval 10
+  ```
+
 ## 注意事项
 - Baostock 需要登录才能正常请求接口，项目内的 `BaostockSession` 会自动处理登录与登出。
 - 若网络环境不稳定导致个别标的的历史日线为空，脚本会自动跳过并继续处理其他标的。

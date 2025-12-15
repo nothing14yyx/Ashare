@@ -131,6 +131,15 @@ class OpenMonitorParams:
 
     # 输出控制
     write_to_db: bool = True
+
+    # 增量写入：
+    # - True：每次运行都 append（保留历史快照，便于对比）
+    # - False：按 monitor_date+code 先删后写（只保留当天最新一份）
+    incremental_write: bool = True
+
+    # 增量导出：文件名带 checked_at 时间戳，避免同一天多次导出互相覆盖
+    incremental_export_timestamp: bool = True
+
     export_csv: bool = True
     export_top_n: int = 100
     output_subdir: str = "open_monitor"
@@ -194,6 +203,10 @@ class OpenMonitorParams:
             signal_day_limit_up_pct=_get_float("signal_day_limit_up_pct", cls.signal_day_limit_up_pct),
 
             write_to_db=_get_bool("write_to_db", cls.write_to_db),
+            incremental_write=_get_bool("incremental_write", cls.incremental_write),
+            incremental_export_timestamp=_get_bool(
+                "incremental_export_timestamp", cls.incremental_export_timestamp
+            ),
             export_csv=_get_bool("export_csv", cls.export_csv),
             export_top_n=_get_int("export_top_n", cls.export_top_n),
             output_subdir=str(sec.get("output_subdir", cls.output_subdir)).strip() or cls.output_subdir,
@@ -1255,7 +1268,8 @@ class MA5MA20OpenMonitorRunner:
         monitor_date = str(df.iloc[0].get("monitor_date") or "").strip()
         codes = df["code"].dropna().astype(str).unique().tolist()
 
-        if monitor_date and codes and self._table_exists(table):
+        # 增量模式：不删除旧记录，保留每次运行的历史快照（checked_at 会区分）
+        if (not self.params.incremental_write) and monitor_date and codes and self._table_exists(table):
             delete_stmt = text(
                 "DELETE FROM `{table}` WHERE `monitor_date` = :d AND `code` IN :codes".format(
                     table=table
@@ -1286,7 +1300,18 @@ class MA5MA20OpenMonitorRunner:
         outdir.mkdir(parents=True, exist_ok=True)
 
         monitor_date = str(df.iloc[0].get("monitor_date") or dt.date.today().isoformat())
-        path = outdir / f"open_monitor_{monitor_date}.csv"
+
+        # 增量导出：文件名带上 checked_at，避免同一天多次运行覆盖
+        suffix = ""
+        if self.params.incremental_export_timestamp:
+            checked_at = str(df.iloc[0].get("checked_at") or "").strip()
+            # checked_at 形如：2025-12-15 09:30:00
+            if checked_at and " " in checked_at:
+                time_part = checked_at.split(" ", 1)[1].replace(":", "")
+                if time_part:
+                    suffix = f"_{time_part}"
+
+        path = outdir / f"open_monitor_{monitor_date}{suffix}.csv"
 
         export_df = df.copy()
         export_df["gap_pct"] = export_df["gap_pct"].apply(_to_float)
