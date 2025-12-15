@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import logging
 import re
@@ -42,6 +43,9 @@ def _reset_worker_session() -> None:
     """在子进程内重新建立 Baostock 会话。"""
 
     global _worker_session, _worker_fetcher
+    if _worker_session is not None:
+        with contextlib.suppress(Exception):
+            _worker_session.logout()
     _worker_session = BaostockSession()
     _worker_session.connect()
     _worker_fetcher = BaostockDataFetcher(_worker_session)
@@ -544,6 +548,46 @@ class AshareApp:
 
         return chosen
 
+    def _probe_daily_kline_availability(
+        self, target_date: str, sample_codes: Iterable[str] | None = None
+    ) -> bool:
+        """探测指定交易日的日线是否已生成，避免无效的全量拉取。"""
+
+        samples = list(sample_codes or ["sh.600000", "sz.000001", "sh.000001"])
+        normalized = [self._normalize_stock_code(code) for code in samples if code]
+        if not normalized:
+            return True
+
+        has_error = False
+        self.session.ensure_alive(force_check=True)
+
+        for code in normalized:
+            try:
+                df = self.fetcher.get_kline(
+                    code=code,
+                    start_date=target_date,
+                    end_date=target_date,
+                    freq="d",
+                    adjustflag=ADJUSTFLAG_NONE,
+                )
+            except Exception as exc:  # noqa: BLE001
+                has_error = True
+                self.logger.debug("日线可用性探针异常（%s）：%s", code, exc)
+                continue
+
+            if df.empty:
+                self.logger.debug("日线可用性探针：%s %s 返回空。", code, target_date)
+                continue
+
+            self.logger.debug("日线可用性探针：%s %s 已返回数据。", code, target_date)
+            return True
+
+        if has_error:
+            self.logger.warning("日线可用性探针出现异常，继续尝试全量拉取。")
+            return True
+
+        return False
+
     def _get_trading_days_between(
         self, start_day: dt.date, end_day: dt.date
     ) -> list[dt.date]:
@@ -885,6 +929,8 @@ class AshareApp:
         base_table: str,
         adjustflag: str = ADJUSTFLAG_NONE,
         resume_threshold: int | None = None,
+        probe_date: str | None = None,
+        latest_existing_date: str | None = None,
     ) -> tuple[int, list[str], list[str], int]:
         history_frames: list[pd.DataFrame] = []
         success_count = 0
@@ -899,10 +945,26 @@ class AshareApp:
 
         codes = [str(code) for code in stock_df.get("code", []) if pd.notna(code)]
         codes_to_fetch = [code for code in codes if code not in done_codes]
+        total_attempted = len(codes_to_fetch)
         skipped = len(codes) - len(codes_to_fetch)
         if not codes_to_fetch:
             self.logger.info("历史日线已经完成，跳过拉取。")
             return success_count, empty_codes, failed_codes, skipped
+
+        if (
+            probe_date
+            and start_day == end_date
+            and not self._probe_daily_kline_availability(probe_date)
+        ):
+            db_hint = (
+                f"；数据库仍截至 {latest_existing_date}" if latest_existing_date else ""
+            )
+            self.logger.info(
+                "Baostock 尚未更新到 %s（日线返回全空），本次跳过增量拉取%s",
+                probe_date,
+                db_hint or "。",
+            )
+            return success_count, empty_codes, failed_codes, skipped + total_attempted
 
         ctx = mp.get_context("spawn")
         worker_processes = self._choose_worker_processes(len(codes_to_fetch))
@@ -999,14 +1061,31 @@ class AshareApp:
         if failed_codes:
             self._write_failed_codes(failed_codes)
 
-        self.logger.info(
-            "拉取结束：成功 %s/%s，空数据 %s，失败 %s，跳过 %s",
-            success_count,
-            len(codes_to_fetch),
-            len(empty_codes),
-            len(failed_codes),
-            skipped,
+        all_empty = (
+            success_count == 0
+            and len(empty_codes) == total_attempted
+            and not failed_codes
+            and total_attempted > 0
         )
+
+        if all_empty:
+            db_hint = (
+                f"；数据库仍截至 {latest_existing_date}" if latest_existing_date else ""
+            )
+            self.logger.info(
+                "Baostock 尚未更新到 %s（日线返回全空），本次跳过增量拉取%s",
+                end_date,
+                db_hint or "。",
+            )
+        else:
+            self.logger.info(
+                "拉取结束：成功 %s/%s，空数据 %s，失败 %s，跳过 %s",
+                success_count,
+                total_attempted,
+                len(empty_codes),
+                len(failed_codes),
+                skipped,
+            )
 
         if empty_codes:
             self.logger.debug("完全未返回数据的股票：%s", ", ".join(sorted(empty_codes)))
@@ -1704,6 +1783,8 @@ class AshareApp:
                     base_table=base_table,
                     adjustflag=ADJUSTFLAG_NONE,
                     resume_threshold=None,
+                    probe_date=end_date,
+                    latest_existing_date=last_date_value.isoformat(),
                 )
             else:
                 self.logger.info("本次没有任何新的日线数据可写入。")
