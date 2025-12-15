@@ -100,12 +100,6 @@ akshare:
     exchanges:
       - sse
       - szse
-  hsgt:
-    enabled: true
-    markets:
-      - "沪股通"
-      - "深股通"
-    indicator: "5日排行"
   gdhs:
     enabled: true
     period: ""

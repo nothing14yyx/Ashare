@@ -12,7 +12,7 @@ from .db import MySQLWriter
 
 
 class ExternalSignalManager:
-    """负责从 Akshare 拉取龙虎榜、两融、北向持股与股东户数等信号并入库。"""
+    """负责从 Akshare 拉取龙虎榜、两融与股东户数等信号并入库。"""
 
     def __init__(
         self,
@@ -476,33 +476,6 @@ class ExternalSignalManager:
         self._upsert(combined, "a_share_margin_detail", subset=subset or None)
         return combined
 
-    def sync_hsgt_hold_rank(self, market_list: Iterable[str], indicator: str, trade_date: str) -> pd.DataFrame:
-        frames: list[pd.DataFrame] = []
-        for market in market_list:
-            try:
-                df = self.fetcher.get_hsgt_hold_rank(market=market, indicator=indicator)
-            except Exception as exc:  # noqa: BLE001
-                self.logger.warning("北向持股排行 %s 获取失败: %s", market, exc)
-                continue
-
-            if df is None or df.empty:
-                self.logger.info("北向持股排行 %s 返回为空。", market)
-                continue
-
-            self._normalize_code_column(df)
-            self._normalize_trade_date(df, trade_date)
-            self._normalize_market(df, market)
-            self._normalize_indicator(df, indicator)
-            frames.append(df)
-
-        if not frames:
-            return pd.DataFrame()
-
-        combined = pd.concat(frames, ignore_index=True)
-        subset = [col for col in ["market", "indicator", "trade_date", "code"] if col in combined.columns]
-        self._upsert(combined, "a_share_hsgt_hold_rank", subset=subset or None)
-        return combined
-
     def sync_shareholder_counts(self, trade_date: str, focus_codes: list[str] | None = None) -> pd.DataFrame:
         gdhs_cfg = self.config.get("gdhs", {}) if isinstance(self.config.get("gdhs", {}), dict) else {}
         period = gdhs_cfg.get("period") or "最新"
@@ -589,17 +562,6 @@ class ExternalSignalManager:
                 self.logger.warning("两融同步阶段出现异常: %s", exc)
         else:
             self.logger.info("两融采集已关闭。")
-
-        hsgt_cfg = ak_cfg.get("hsgt", {})
-        if isinstance(hsgt_cfg, dict) and hsgt_cfg.get("enabled", True):
-            markets = hsgt_cfg.get("markets", ["沪股通", "深股通"])
-            indicator = hsgt_cfg.get("indicator", "5日排行")
-            try:
-                self.sync_hsgt_hold_rank(markets, indicator, trade_date)
-            except Exception as exc:  # noqa: BLE001
-                self.logger.warning("北向持股同步阶段出现异常: %s", exc)
-        else:
-            self.logger.info("北向持股采集已关闭。")
 
         gdhs_cfg = ak_cfg.get("gdhs", {})
         if isinstance(gdhs_cfg, dict) and gdhs_cfg.get("enabled", True):

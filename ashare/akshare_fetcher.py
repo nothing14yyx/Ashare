@@ -54,13 +54,6 @@ class AkshareDataFetcher:
         raw = fetch_fn(date=str(trade_date).replace("-", ""))
         return self._ensure_df(raw)
 
-    def get_hsgt_hold_rank(
-        self, market: str = "沪股通", indicator: str = "5日排行"
-    ) -> pd.DataFrame:
-        """获取北向持股排行数据。"""
-        raw = ak.stock_hsgt_hold_stock_em(market=market, indicator=indicator)
-        return self._ensure_df(raw)
-
     def get_shareholder_count(self, period: str) -> pd.DataFrame:
         """获取全市场股东户数汇总。"""
         raw = ak.stock_zh_a_gdhs(symbol=period)
