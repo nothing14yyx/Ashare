@@ -80,8 +80,10 @@ def _normalize_snapshot_value(value: Any) -> Any:  # noqa: ANN401
             return base
     except Exception:
         pass
-    if isinstance(value, (dt.datetime, dt.date)):
+    if isinstance(value, dt.datetime):
         return value.isoformat(sep=" ")
+    if isinstance(value, dt.date):
+        return value.isoformat()
     return value
 
 
