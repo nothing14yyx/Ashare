@@ -267,6 +267,32 @@ class AshareApp:
             }
         self.fetch_stock_meta: bool = bool(meta_flag)
 
+        index_flag = os.getenv("ASHARE_FETCH_INDEX_KLINE")
+        if index_flag is None:
+            index_flag = app_cfg.get("fetch_index_kline", True)
+        if isinstance(index_flag, str):
+            index_flag = index_flag.strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "y",
+                "on",
+            }
+        self.fetch_index_kline: bool = bool(index_flag)
+
+        build_dim_flag = os.getenv("ASHARE_BUILD_STOCK_INDUSTRY_DIM")
+        if build_dim_flag is None:
+            build_dim_flag = app_cfg.get("build_stock_industry_dim", True)
+        if isinstance(build_dim_flag, str):
+            build_dim_flag = build_dim_flag.strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "y",
+                "on",
+            }
+        self.build_stock_industry_dim: bool = bool(build_dim_flag)
+
         self.history_days = (
             history_days
             if history_days is not None
@@ -278,6 +304,16 @@ class AshareApp:
         )
         if self.history_view_days < 0:
             self.history_view_days = 0
+
+        index_codes_cfg = app_cfg.get("index_codes", [])
+        if not isinstance(index_codes_cfg, (list, tuple)):
+            index_codes_cfg = []
+        self.index_codes = [str(c).strip() for c in index_codes_cfg if str(c).strip()]
+        self.index_history_days = self._read_int_from_env(
+            "ASHARE_INDEX_HISTORY_DAYS", app_cfg.get("index_history_days", 400)
+        )
+        if self.index_history_days <= 0:
+            self.index_history_days = 400
         resolved_top_liquidity = (
             top_liquidity_count
             if top_liquidity_count is not None
@@ -317,6 +353,17 @@ class AshareApp:
         )
         akshare_cfg = get_section("akshare")
         self.akshare_enabled = akshare_cfg.get("enabled", False)
+        board_cfg = akshare_cfg.get("board_industry", {}) if isinstance(akshare_cfg, dict) else {}
+        if not isinstance(board_cfg, dict):
+            board_cfg = {}
+        self.board_industry_enabled = bool(board_cfg.get("enabled", False))
+        self.board_spot_enabled = bool(board_cfg.get("spot_enabled", True))
+        self.board_hist_enabled = bool(board_cfg.get("hist_enabled", False))
+        self.board_constituent_enabled = bool(board_cfg.get("build_stock_board_dim", True))
+        self.board_history_days = self._read_int_from_env(
+            "ASHARE_BOARD_HISTORY_DAYS", board_cfg.get("history_days", 200)
+        )
+        self.board_adjust = str(board_cfg.get("adjust", "hfq") or "hfq")
         self.external_signal_manager: ExternalSignalManager | None = None
         if self.akshare_enabled:
             try:
@@ -333,7 +380,10 @@ class AshareApp:
             self.logger.info("Akshare 行为证据层已关闭，跳过相关初始化。")
 
         self.use_baostock: bool = bool(
-            self.fetch_daily_kline or self.fetch_stock_meta or self.refresh_fundamentals
+            self.fetch_daily_kline
+            or self.fetch_stock_meta
+            or self.refresh_fundamentals
+            or self.fetch_index_kline
         )
 
         # 登录一次会话，后续流程保持复用，减少频繁连接开销
@@ -346,6 +396,14 @@ class AshareApp:
     def _save_sample(self, df: pd.DataFrame, table_name: str) -> str:
         self.db_writer.write_dataframe(df, table_name)
         return table_name
+
+    def _table_exists(self, table: str) -> bool:
+        try:
+            with self.db_writer.engine.begin() as conn:
+                inspector = inspect(conn)
+                return inspector.has_table(table)
+        except Exception:  # noqa: BLE001
+            return False
 
     def _create_recent_history_view(
         self,
@@ -984,7 +1042,337 @@ class AshareApp:
 
         table_name = self._save_sample(industry_df, "a_share_stock_industry")
         self.logger.info("已保存行业分类信息至表 %s", table_name)
+        if self.build_stock_industry_dim:
+            self._save_stock_industry_dimension(industry_df)
         return industry_df
+
+    def _save_stock_industry_dimension(self, industry_df: pd.DataFrame) -> None:
+        if industry_df.empty:
+            return
+
+        dim = industry_df.copy()
+        rename_map = {
+            "updateDate": "update_date",
+            "code_name": "code_name",
+            "industry": "industry",
+            "industryClassification": "industry_classification",
+        }
+        dim = dim.rename(columns=rename_map)
+        for col in ["update_date"]:
+            if col in dim.columns:
+                dim[col] = pd.to_datetime(dim[col], errors="coerce")
+        dim["source"] = "baostock"
+        dim["updated_at"] = dt.datetime.now()
+
+        cols = [
+            "update_date",
+            "code",
+            "code_name",
+            "industry",
+            "industry_classification",
+            "source",
+            "updated_at",
+        ]
+        dim = dim[[c for c in cols if c in dim.columns]]
+
+        with self.db_writer.engine.begin() as conn:
+            dim.to_sql(
+                "dim_stock_industry",
+                conn,
+                if_exists="replace",
+                index=False,
+                chunksize=self.write_chunksize,
+            )
+        self.logger.info("股票-行业维表 dim_stock_industry 已刷新，共 %s 条", len(dim))
+
+    def _export_index_daily_history(self, end_date: str) -> pd.DataFrame:
+        if not self.fetch_index_kline:
+            self.logger.info("已关闭指数日线拉取，跳过 history_index_daily_kline。")
+            return pd.DataFrame()
+        if not self.index_codes:
+            self.logger.warning("index_codes 为空，跳过指数日线拉取。")
+            return pd.DataFrame()
+
+        end_day = dt.datetime.strptime(end_date, "%Y-%m-%d").date()
+        start_day = end_day - dt.timedelta(days=max(1, int(self.index_history_days)))
+        frames: list[pd.DataFrame] = []
+        for code in self.index_codes:
+            try:
+                df = self.fetcher.get_kline(
+                    code=code,
+                    start_date=start_day.isoformat(),
+                    end_date=end_day.isoformat(),
+                    freq="d",
+                    adjustflag=ADJUSTFLAG_NONE,
+                )
+            except Exception as exc:  # noqa: BLE001
+                self.logger.warning("拉取指数 %s 失败：%s", code, exc)
+                continue
+
+            if df.empty:
+                continue
+
+            df["source"] = "baostock"
+            df["created_at"] = dt.datetime.now()
+            frames.append(df)
+
+        if not frames:
+            self.logger.warning("指数日线拉取结果为空。")
+            return pd.DataFrame()
+
+        merged = pd.concat(frames, ignore_index=True)
+        merged = merged.drop_duplicates(subset=["date", "code"], keep="last")
+        with self.db_writer.engine.begin() as conn:
+            if self._table_exists("history_index_daily_kline"):
+                conn.execute(
+                    text(
+                        "DELETE FROM history_index_daily_kline WHERE `date` >= :start_date AND `date` <= :end_date"
+                    ),
+                    {"start_date": start_day.isoformat(), "end_date": end_day.isoformat()},
+                )
+            merged.to_sql(
+                "history_index_daily_kline",
+                conn,
+                if_exists="append",
+                index=False,
+                chunksize=self.write_chunksize,
+            )
+        self.logger.info(
+            "指数日线已写入 history_index_daily_kline：%s 条（窗口 %s - %s）",
+            len(merged),
+            start_day,
+            end_day,
+        )
+        return merged
+
+    @staticmethod
+    def _normalize_stock_code(symbol: str) -> str:
+        code = str(symbol).strip()
+        if not code:
+            return code
+        if code.startswith(("sh.", "sz.")):
+            return code
+        if code.startswith("6"):
+            return f"sh.{code}"
+        if code.startswith(("0", "3")):
+            return f"sz.{code}"
+        return code
+
+    def _export_board_industry_spot(self) -> pd.DataFrame:
+        if not (self.akshare_enabled and self.board_industry_enabled and self.board_spot_enabled):
+            self.logger.info("板块快照拉取未开启，跳过 board_industry_spot。")
+            return pd.DataFrame()
+
+        try:
+            fetcher = AkshareDataFetcher()
+        except Exception as exc:  # noqa: BLE001
+            self.logger.warning("AkShare 初始化失败，无法拉取板块快照：%s", exc)
+            return pd.DataFrame()
+
+        try:
+            spot = fetcher.get_board_industry_spot()
+        except Exception as exc:  # noqa: BLE001
+            self.logger.warning("拉取行业板块快照失败：%s", exc)
+            return pd.DataFrame()
+
+        if spot.empty:
+            self.logger.warning("行业板块快照为空。")
+            return pd.DataFrame()
+
+        normalized = spot.copy()
+        rename_map = {}
+        for col in normalized.columns:
+            if "代码" in col:
+                rename_map[col] = "board_code"
+            if "板块" in col and "名称" in col:
+                rename_map[col] = "board_name"
+            if col in {"涨跌幅", "涨跌幅(%)", "change_rate", "pct_chg"}:
+                rename_map[col] = "chg_pct"
+            if col in {"成交额", "amount"}:
+                rename_map[col] = "amount"
+            if "领涨" in col and "涨跌幅" in col:
+                rename_map[col] = "leader_pct"
+            elif "领涨" in col:
+                rename_map[col] = "leader_stock"
+
+        normalized = normalized.rename(columns=rename_map)
+        if "board_code" in normalized.columns:
+            normalized["board_code"] = normalized["board_code"].astype(str)
+        if "chg_pct" in normalized.columns:
+            normalized["chg_pct"] = pd.to_numeric(normalized["chg_pct"], errors="coerce")
+        normalized["ts"] = dt.datetime.now()
+
+        with self.db_writer.engine.begin() as conn:
+            normalized.to_sql(
+                "board_industry_spot",
+                conn,
+                if_exists="append",
+                index=False,
+                chunksize=self.write_chunksize,
+            )
+        self.logger.info("行业板块快照已写入 board_industry_spot：%s 条", len(normalized))
+        return normalized
+
+    def _export_board_industry_constituents(
+        self, spot: pd.DataFrame | None = None
+    ) -> pd.DataFrame:
+        if not (
+            self.akshare_enabled
+            and self.board_industry_enabled
+            and self.board_constituent_enabled
+            and self.board_spot_enabled
+        ):
+            return pd.DataFrame()
+
+        if spot is None or spot.empty:
+            spot = self._export_board_industry_spot()
+
+        if spot.empty:
+            self.logger.info("缺少板块快照，跳过成份股维表构建。")
+            return pd.DataFrame()
+
+        try:
+            fetcher = AkshareDataFetcher()
+        except Exception as exc:  # noqa: BLE001
+            self.logger.warning("AkShare 初始化失败，无法拉取板块成份股：%s", exc)
+            return pd.DataFrame()
+
+        frames: list[pd.DataFrame] = []
+        for _, row in spot.iterrows():
+            board_name = str(row.get("board_name") or "").strip()
+            board_code = str(row.get("board_code") or "").strip()
+            if not board_name:
+                continue
+            try:
+                cons = fetcher.get_board_industry_constituents(board_name)
+            except Exception as exc:  # noqa: BLE001
+                self.logger.warning("拉取板块 %s 成份股失败：%s", board_name, exc)
+                continue
+
+            if cons.empty:
+                continue
+
+            cons = cons.copy()
+            rename_map = {}
+            for col in cons.columns:
+                if col in {"代码", "股票代码", "symbol"}:
+                    rename_map[col] = "code"
+                elif col in {"名称", "股票名称", "股票简称"}:
+                    rename_map[col] = "code_name"
+            cons = cons.rename(columns=rename_map)
+            if "code" not in cons.columns:
+                continue
+            cons["code"] = cons["code"].astype(str).apply(self._normalize_stock_code)
+            cons["board_name"] = board_name
+            cons["board_code"] = board_code
+            cons["source"] = "akshare"
+            cons["updated_at"] = dt.datetime.now()
+            frames.append(cons[["code", "board_name", "board_code", "source", "updated_at"]])
+
+        if not frames:
+            self.logger.info("未获取到任何板块成份股数据。")
+            return pd.DataFrame()
+
+        merged = pd.concat(frames, ignore_index=True)
+        merged = merged.drop_duplicates(subset=["code", "board_name"], keep="last")
+        merged = merged.sort_values(by=["code", "board_name"])
+        merged = merged.dropna(subset=["code", "board_name"])
+        merged["code"] = merged["code"].astype(str)
+
+        with self.db_writer.engine.begin() as conn:
+            merged.to_sql(
+                "dim_stock_board_industry",
+                conn,
+                if_exists="replace",
+                index=False,
+                chunksize=self.write_chunksize,
+            )
+        self.logger.info("板块成份股维表已写入 dim_stock_board_industry：%s 条", len(merged))
+        return merged
+
+    def _export_board_industry_history(
+        self, end_date: str, spot: pd.DataFrame | None = None
+    ) -> pd.DataFrame:
+        if not (self.akshare_enabled and self.board_industry_enabled and self.board_hist_enabled):
+            self.logger.info("板块历史拉取未开启，跳过 board_industry_hist_daily。")
+            return pd.DataFrame()
+
+        try:
+            fetcher = AkshareDataFetcher()
+        except Exception as exc:  # noqa: BLE001
+            self.logger.warning("AkShare 初始化失败，无法拉取板块历史：%s", exc)
+            return pd.DataFrame()
+
+        if spot is None or spot.empty:
+            spot = self._export_board_industry_spot()
+        if spot.empty:
+            self.logger.warning("没有有效的板块列表，跳过历史行情拉取。")
+            return pd.DataFrame()
+
+        start_day = (
+            dt.datetime.strptime(end_date, "%Y-%m-%d").date()
+            - dt.timedelta(days=max(1, int(self.board_history_days)))
+        )
+        boards: pd.Series | None = None
+        if "board_name" in spot.columns:
+            boards = spot["board_name"]
+        elif "板块名称" in spot.columns:
+            boards = spot["板块名称"]
+        if boards is None:
+            self.logger.warning("板块快照中缺少 board_name 列，跳过历史拉取。")
+            return pd.DataFrame()
+
+        frames: list[pd.DataFrame] = []
+        for name in boards.dropna().unique():
+            try:
+                hist = fetcher.get_board_industry_hist(
+                    board_name=str(name),
+                    start_date=start_day.isoformat(),
+                    end_date=end_date,
+                    adjust=self.board_adjust,
+                )
+            except Exception as exc:  # noqa: BLE001
+                self.logger.warning("拉取板块 %s 历史失败：%s", name, exc)
+                continue
+
+            if hist.empty:
+                continue
+
+            hist = hist.copy()
+            hist["board_name"] = name
+            hist["source"] = "akshare"
+            hist["created_at"] = dt.datetime.now()
+            frames.append(hist)
+
+        if not frames:
+            self.logger.warning("板块历史拉取结果为空。")
+            return pd.DataFrame()
+
+        merged = pd.concat(frames, ignore_index=True)
+        merged = merged.rename(columns={"日期": "date"}) if "日期" in merged.columns else merged
+        merged = merged.drop_duplicates(subset=["date", "board_name"], keep="last")
+        with self.db_writer.engine.begin() as conn:
+            if self._table_exists("board_industry_hist_daily"):
+                conn.execute(
+                    text(
+                        "DELETE FROM board_industry_hist_daily WHERE `date` >= :start_date AND `date` <= :end_date"
+                    ),
+                    {"start_date": start_day.isoformat(), "end_date": end_date},
+                )
+            merged.to_sql(
+                "board_industry_hist_daily",
+                conn,
+                if_exists="append",
+                index=False,
+                chunksize=self.write_chunksize,
+            )
+        self.logger.info(
+            "板块历史行情已写入 board_industry_hist_daily：%s 条（窗口 %s - %s）",
+            len(merged),
+            start_day,
+            end_date,
+        )
+        return merged
 
     def _export_index_members(self, latest_trade_day: str) -> dict[str, set[str]]:
         index_membership: dict[str, set[str]] = {}
@@ -1431,6 +1819,11 @@ class AshareApp:
                 )
             self.logger.info("最近交易日：%s", latest_trade_day)
 
+            try:
+                self._export_index_daily_history(latest_trade_day)
+            except Exception as exc:  # noqa: BLE001
+                self.logger.warning("拉取指数日线失败：%s", exc)
+
             # 股票列表（至少要拿到 code）
             if self.fetch_stock_meta:
                 try:
@@ -1481,6 +1874,21 @@ class AshareApp:
                     industry_df = pd.DataFrame()
             else:
                 industry_df = self._load_table("a_share_stock_industry")
+
+            board_spot = pd.DataFrame()
+            if self.board_industry_enabled:
+                try:
+                    board_spot = self._export_board_industry_spot()
+                except Exception as exc:  # noqa: BLE001
+                    self.logger.warning("板块快照刷新失败：%s", exc)
+                try:
+                    self._export_board_industry_constituents(board_spot)
+                except Exception as exc:  # noqa: BLE001
+                    self.logger.warning("板块成份股维表刷新失败：%s", exc)
+                try:
+                    self._export_board_industry_history(latest_trade_day, spot=board_spot)
+                except Exception as exc:  # noqa: BLE001
+                    self.logger.warning("板块数据刷新失败：%s", exc)
 
             if self.fetch_stock_meta:
                 index_membership = self._export_index_members(latest_trade_day)
