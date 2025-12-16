@@ -1829,8 +1829,8 @@ class MA5MA20OpenMonitorRunner:
 
         merged["intraday_vol_ratio"] = merged.apply(_calc_intraday_vol_ratio, axis=1)
         if "latest_vol_ratio" in merged.columns:
-            merged["latest_vol_ratio"] = merged["intraday_vol_ratio"].combine_first(
-                merged.get("latest_vol_ratio")
+            merged["latest_vol_ratio"] = merged["intraday_vol_ratio"].where(
+                merged["intraday_vol_ratio"].notna(), merged["latest_vol_ratio"]
             )
         else:
             merged["latest_vol_ratio"] = merged["intraday_vol_ratio"]

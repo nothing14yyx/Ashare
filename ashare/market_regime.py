@@ -79,7 +79,7 @@ class MarketRegimeClassifier:
 
             ma250_valid = grp["ma250"].notna()
             below_ma250 = (close < grp["ma250"]) & ma250_valid
-            prev_below = below_ma250.shift(1).fillna(False)
+            prev_below = below_ma250.shift(1).fillna(False).astype(bool)
             below_ma250_streak_series = consecutive_true(below_ma250)
             below_ma250_streak = (
                 int(below_ma250_streak_series.iloc[-1])
