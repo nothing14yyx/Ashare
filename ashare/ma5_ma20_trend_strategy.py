@@ -685,8 +685,12 @@ class MA5MA20StrategyRunner:
         yearline_enabled = out["ma250"].notna()
         if "listing_days" in out.columns and out["listing_days"].notna().any():
             yearline_enabled = yearline_enabled & out["listing_days"].ge(250).fillna(False)
-        below_ma250_mask = (out["close"] < out["ma250"]) & yearline_enabled
-        above_ma250_mask = (out["close"] >= out["ma250"]) & yearline_enabled
+        below_ma250_mask = (
+            (out["close"] < out["ma250"]) & yearline_enabled
+        ).astype("boolean")
+        above_ma250_mask = (
+            (out["close"] >= out["ma250"]) & yearline_enabled
+        ).astype("boolean")
         prev_below_ma250 = (
             below_ma250_mask.groupby(out["code"], sort=False).shift(1).fillna(False)
         )
