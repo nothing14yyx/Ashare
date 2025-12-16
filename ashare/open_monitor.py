@@ -292,6 +292,78 @@ class MA5MA20OpenMonitorRunner:
                 return float(parsed)
         return 1.5
 
+    def _ensure_column(self, table: str, column: str, definition: str) -> None:
+        if not self._table_exists(table) or self._column_exists(table, column):
+            return
+
+        try:
+            with self.db_writer.engine.begin() as conn:
+                conn.execute(text(f"ALTER TABLE `{table}` ADD COLUMN `{column}` {definition}"))
+            self.logger.info("表 %s 已新增列 %s。", table, column)
+        except Exception as exc:  # noqa: BLE001
+            self.logger.warning("为表 %s 添加列 %s 失败：%s", table, column, exc)
+
+    def _ensure_datetime_column(self, table: str, column: str) -> None:
+        if not self._table_exists(table):
+            return
+
+        if not self._column_exists(table, column):
+            try:
+                with self.db_writer.engine.begin() as conn:
+                    conn.execute(
+                        text(
+                            f"ALTER TABLE `{table}` ADD COLUMN `{column}` DATETIME NULL"
+                        )
+                    )
+                self.logger.info("表 %s 已新增 DATETIME 列 %s。", table, column)
+            except Exception as exc:  # noqa: BLE001
+                self.logger.warning("为表 %s 添加 DATETIME 列 %s 失败：%s", table, column, exc)
+            return
+
+        try:
+            stmt = text(
+                """
+                SELECT DATA_TYPE, COLUMN_TYPE
+                FROM information_schema.columns
+                WHERE table_schema = :schema AND table_name = :table AND column_name = :column
+                """
+            )
+            with self.db_writer.engine.begin() as conn:
+                df = pd.read_sql_query(
+                    stmt,
+                    conn,
+                    params={
+                        "schema": self.db_writer.config.db_name,
+                        "table": table,
+                        "column": column,
+                    },
+                )
+        except Exception as exc:  # noqa: BLE001
+            self.logger.debug("读取列 %s.%s 类型失败：%s", table, column, exc)
+            return
+
+        if df.empty:
+            return
+
+        data_type = str(df.iloc[0].get("DATA_TYPE") or "").lower()
+        if data_type == "datetime":
+            return
+
+        try:
+            with self.db_writer.engine.begin() as conn:
+                conn.execute(
+                    text(
+                        f"ALTER TABLE `{table}` MODIFY COLUMN `{column}` DATETIME NULL"
+                    )
+                )
+            self.logger.info(
+                "表 %s.%s 列已转换为 DATETIME，保证时间排序正确。", table, column
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.logger.warning(
+                "将列 %s.%s 转为 DATETIME 失败，保留原类型：%s", table, column, exc
+            )
+
     # -------------------------
     # DB helpers
     # -------------------------
@@ -485,6 +557,8 @@ class MA5MA20OpenMonitorRunner:
         if not table or not self._table_exists(table):
             return
 
+        self._ensure_datetime_column(table, "checked_at")
+
         if not self._column_exists(table, "snapshot_hash"):
             try:
                 with self.db_writer.engine.begin() as conn:
@@ -516,6 +590,30 @@ class MA5MA20OpenMonitorRunner:
                 self.logger.info("表 %s 已创建唯一索引 %s 用于幂等写入。", table, index_name)
             except Exception as exc:  # noqa: BLE001
                 self.logger.warning("创建唯一索引 %s 失败：%s", index_name, exc)
+
+    def _ensure_strength_schema(self, table: str) -> None:
+        if not table or not self._table_exists(table):
+            return
+
+        self._ensure_datetime_column(table, "checked_at")
+
+        self._ensure_column(table, "signal_strength", "DOUBLE NULL")
+        self._ensure_column(table, "strength_delta", "DOUBLE NULL")
+        self._ensure_column(table, "strength_trend", "VARCHAR(16) NULL")
+        self._ensure_column(table, "strength_note", "VARCHAR(512) NULL")
+
+        index_name = "idx_open_monitor_strength_time"
+        if not self._index_exists(table, index_name):
+            try:
+                with self.db_writer.engine.begin() as conn:
+                    conn.execute(
+                        text(
+                            f"CREATE INDEX `{index_name}` ON `{table}` (`monitor_date`, `code`, `checked_at`)"
+                        )
+                    )
+                self.logger.info("表 %s 已新增索引 %s 加速强度历史查询。", table, index_name)
+            except Exception as exc:  # noqa: BLE001
+                self.logger.warning("创建索引 %s 失败：%s", index_name, exc)
 
     def _load_existing_snapshot_keys(
         self, table: str, monitor_date: str, codes: List[str]
@@ -789,6 +887,54 @@ class MA5MA20OpenMonitorRunner:
 
         df["code"] = df["code"].astype(str)
         return df
+
+    def _load_previous_strength(self, codes: List[str]) -> Dict[str, float]:
+        """读取开盘监测表中最新的信号强度，用于计算增减。"""
+
+        table = self.params.output_table
+        if not codes or not self._table_exists(table):
+            return {}
+
+        if not self._column_exists(table, "signal_strength") or not self._column_exists(
+            table, "checked_at"
+        ):
+            return {}
+
+        today = dt.date.today().isoformat()
+
+        stmt = text(
+            f"""
+            SELECT t1.`code`, t1.`signal_strength`
+            FROM `{table}` t1
+            JOIN (
+                SELECT `code`, MAX(`checked_at`) AS latest_checked
+                FROM `{table}`
+                WHERE `monitor_date` = :d AND `code` IN :codes AND `signal_strength` IS NOT NULL
+                GROUP BY `code`
+            ) t2
+              ON t1.`code` = t2.`code` AND t1.`checked_at` = t2.`latest_checked`
+            WHERE t1.`monitor_date` = :d AND t1.`code` IN :codes AND t1.`signal_strength` IS NOT NULL
+            """
+        ).bindparams(bindparam("codes", expanding=True))
+
+        try:
+            with self.db_writer.engine.begin() as conn:
+                df = pd.read_sql_query(stmt, conn, params={"d": today, "codes": codes})
+        except Exception as exc:  # noqa: BLE001
+            self.logger.debug("读取历史信号强度失败，将跳过强度对比：%s", exc)
+            return {}
+
+        if df.empty or "code" not in df.columns:
+            return {}
+
+        df["code"] = df["code"].astype(str)
+        strength_map: Dict[str, float] = {}
+        for _, row in df.iterrows():
+            score = _to_float(row.get("signal_strength"))
+            if score is None:
+                continue
+            strength_map[str(row.get("code"))] = score
+        return strength_map
 
     def _load_stock_industry_dim(self) -> pd.DataFrame:
         candidates = ["dim_stock_industry", "a_share_stock_industry"]
@@ -1133,7 +1279,7 @@ class MA5MA20OpenMonitorRunner:
             out["action_reason"] = "行情数据不可用"
             out["candidate_status"] = "UNKNOWN"
             out["status_reason"] = "行情数据不可用"
-            out["checked_at"] = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            out["checked_at"] = dt.datetime.now().replace(microsecond=0)
             return out
 
         q["code"] = q["code"].astype(str)
@@ -1165,6 +1311,7 @@ class MA5MA20OpenMonitorRunner:
         if isinstance(env_context, dict):
             index_section = env_context.get("index", {}) if isinstance(env_context.get("index"), dict) else {}
             index_score = index_section.get("score")
+        idx_score_float = _to_float(index_score)
 
         if not latest_snapshots.empty:
             snap = latest_snapshots.copy()
@@ -1196,6 +1343,8 @@ class MA5MA20OpenMonitorRunner:
             "latest_macd_hist",
             "latest_atr14",
             "latest_stop_ref",
+            "signal_strength",
+            "strength_delta",
         ]
         for col in float_cols:
             if col in merged.columns:
@@ -1245,6 +1394,10 @@ class MA5MA20OpenMonitorRunner:
         board_statuses: List[str | None] = []
         board_ranks: List[float | None] = []
         board_chg_pcts: List[float | None] = []
+        strength_scores: List[float | None] = []
+        strength_deltas: List[float | None] = []
+        strength_trends: List[str | None] = []
+        strength_notes: List[str | None] = []
 
         def _prefer_latest(row: pd.Series, key: str) -> float | None:
             latest_val = row.get(f"latest_{key}")
@@ -1252,6 +1405,128 @@ class MA5MA20OpenMonitorRunner:
                 return latest_val
             val = row.get(key)
             return None if pd.isna(val) else val
+
+        def _calc_signal_strength(
+            row: pd.Series,
+            price_now: float | None,
+            board_status: str | None = None,
+            idx_score: float | None = None,
+        ) -> tuple[float | None, str]:
+            score = 0.0
+            notes: list[str] = []
+
+            ma5 = _prefer_latest(row, "ma5")
+            ma20 = _prefer_latest(row, "ma20")
+            ma60 = _prefer_latest(row, "ma60")
+            vol_ratio_val = _prefer_latest(row, "vol_ratio")
+            atr14_val = _prefer_latest(row, "atr14")
+            macd_hist_signal = _to_float(row.get("macd_hist"))
+            macd_hist_now = _to_float(row.get("latest_macd_hist"))
+            if macd_hist_now is None:
+                macd_hist_now = macd_hist_signal
+
+            if ma5 is not None and ma20 is not None:
+                if ma5 > ma20:
+                    score += 1.0
+                    notes.append("MA5>MA20")
+                else:
+                    score -= 1.0
+                    notes.append("MA5<MA20")
+
+            if ma20 is not None and ma60 is not None:
+                if ma20 > ma60:
+                    score += 1.0
+                    notes.append("MA20>MA60")
+                else:
+                    score -= 0.5
+                    notes.append("MA20<=MA60")
+
+            if price_now is not None and ma20 is not None:
+                deviation = (price_now - ma20) / ma20
+                if deviation >= 0:
+                    score += 0.5
+                    notes.append("价格站上MA20")
+                else:
+                    score -= 0.5
+                    notes.append("价格跌破MA20")
+
+                if atr14_val is not None and atr14_val > 0:
+                    z_score = (price_now - ma20) / atr14_val
+                    if -0.5 <= z_score <= 1.0:
+                        score += 0.5
+                        notes.append("乖离在ATR舒适区间")
+                    elif z_score > 1.2:
+                        score -= 0.5
+                        notes.append("价格偏热")
+                    elif z_score < -0.8:
+                        score -= 0.5
+                        notes.append("跌破回踩区间")
+
+            if macd_hist_now is not None:
+                if macd_hist_now > 0:
+                    score += 0.5
+                else:
+                    score -= 0.5
+
+            macd_delta = None
+            if macd_hist_now is not None and macd_hist_signal is not None:
+                macd_delta = macd_hist_now - macd_hist_signal
+
+            if macd_delta is not None:
+                if macd_delta > 0:
+                    score += 0.5
+                    notes.append("MACD扩张")
+                elif macd_delta < 0:
+                    score -= 0.5
+                    notes.append("MACD收敛")
+
+            if vol_ratio_val is not None:
+                if vol_ratio_val >= vol_threshold:
+                    score += 0.5
+                    notes.append("量能放大")
+                elif vol_ratio_val < 1:
+                    if price_now is not None and ma20 is not None and price_now <= ma20:
+                        score += 0.2
+                        notes.append("回踩缩量")
+                    else:
+                        score -= 0.1
+                        notes.append("量能偏弱")
+
+            if isinstance(board_status, str):
+                status_norm = board_status.strip().lower()
+                if status_norm == "strong":
+                    score += 0.5
+                    notes.append("板块强")
+                elif status_norm == "weak":
+                    score -= 0.5
+                    notes.append("板块弱")
+
+            if idx_score is not None:
+                if idx_score >= self.env_index_score_threshold:
+                    score += 0.5
+                    notes.append("大盘顺风")
+                else:
+                    score -= 0.5
+                    notes.append("大盘逆风")
+
+            return round(score, 3), "；".join(notes)
+
+        def _classify_strength_trend(curr: float | None, prev: float | None) -> str | None:
+            if curr is None or prev is None:
+                return None
+            delta = curr - prev
+            if delta >= 0.5:
+                return "ENHANCING"
+            if delta <= -0.5:
+                return "WEAKENING"
+            return "FLAT"
+
+        codes_all = merged["code"].dropna().astype(str).unique().tolist()
+        if not self.params.incremental_write:
+            self.logger.warning(
+                "incremental_write=False 会覆盖当日历史，strength_delta/strength_trend 可能缺乏对比基础"
+            )
+        prev_strength_map = self._load_previous_strength(codes_all)
 
         for _, row in merged.iterrows():
             action = "EXECUTE"
@@ -1305,6 +1580,43 @@ class MA5MA20OpenMonitorRunner:
 
             price_now = _current_price()
 
+            board_candidates: list[str] = []
+            for key in [
+                row.get("board_code"),
+                row.get("board_name"),
+                row.get("industry"),
+                row.get("industry_classification"),
+            ]:
+                if pd.notna(key):
+                    key_norm = str(key).strip()
+                    if key_norm and key_norm.lower() != "nan":
+                        board_candidates.append(key_norm)
+            board_info = None
+            board_status = None
+            board_rank = None
+            board_chg = None
+            for key in board_candidates:
+                board_info = board_map.get(key)
+                if board_info:
+                    break
+            if isinstance(board_info, dict):
+                board_status = board_info.get("status")
+                board_rank = _to_float(board_info.get("rank"))
+                board_chg = _to_float(board_info.get("chg_pct"))
+
+            # 规范化，避免大小写/空格导致后续判断失效
+            if isinstance(board_status, str):
+                board_status = board_status.strip().lower()
+
+            strength_score, strength_note = _calc_signal_strength(
+                row, price_now, board_status=board_status, idx_score=idx_score_float
+            )
+            prev_strength = prev_strength_map.get(str(row.get("code")))
+            strength_delta = None
+            if strength_score is not None and prev_strength is not None:
+                strength_delta = strength_score - prev_strength
+            strength_trend = _classify_strength_trend(strength_score, prev_strength)
+
             valid_days = pullback_valid_days if self._is_pullback_signal(signal_reason) else cross_valid_days
 
             status = "ACTIVE"
@@ -1330,8 +1642,16 @@ class MA5MA20OpenMonitorRunner:
                 status = "INVALID"
                 status_reason = "跌破 ATR 止损参考价"
             elif valid_days > 0 and signal_age is not None and signal_age >= valid_days:
-                status = "EXPIRED"
-                status_reason = f"超过有效期 {valid_days} 个交易日"
+                if strength_trend == "ENHANCING" or (
+                    strength_score is not None and strength_score >= 2
+                ):
+                    status = "WAIT"
+                    status_reason = (
+                        f"超过有效期 {valid_days} 个交易日但强度走强，继续观察"
+                    )
+                else:
+                    status = "EXPIRED"
+                    status_reason = f"超过有效期 {valid_days} 个交易日"
             elif (
                 price_now is not None
                 and ma5 is not None
@@ -1376,6 +1696,14 @@ class MA5MA20OpenMonitorRunner:
                     if not vol_ok:
                         weak_reasons.append("量能不足")
                     status_reason = "；".join(weak_reasons) if weak_reasons else "继续观察"
+
+            if status == "ACTIVE" and strength_score is not None:
+                if strength_score < 0:
+                    status = "WAIT"
+                    status_reason = "信号强度偏弱，等待修复"
+                elif strength_trend == "WEAKENING":
+                    status = "WAIT"
+                    status_reason = "信号强度走弱，等待确认"
 
             if status in {"INVALID", "EXPIRED"}:
                 action = "SKIP"
@@ -1431,38 +1759,14 @@ class MA5MA20OpenMonitorRunner:
                         f"（>{max_entry_vs_ma5*100:.2f}%）"
                     )
 
-            board_candidates: list[str] = []
-            for key in [
-                row.get("board_name"),
-                row.get("board_code"),
-                row.get("industry"),
-                row.get("industry_classification"),
-            ]:
-                if pd.notna(key):
-                    key_norm = str(key).strip()
-                    if key_norm and key_norm.lower() != "nan":
-                        board_candidates.append(key_norm)
-            board_info = None
-            board_status = None
-            board_rank = None
-            board_chg = None
-            for key in board_candidates:
-                board_info = board_map.get(key)
-                if board_info:
-                    break
-            if isinstance(board_info, dict):
-                board_status = board_info.get("status")
-                board_rank = _to_float(board_info.get("rank"))
-                board_chg = _to_float(board_info.get("chg_pct"))
-
             if (
-                index_score is not None
+                idx_score_float is not None
                 and action == "EXECUTE"
-                and index_score < self.env_index_score_threshold
+                and idx_score_float < self.env_index_score_threshold
             ):
                 action = "WAIT"
                 reason = (
-                    f"大盘趋势分数 {index_score:.1f} 低于阈值"
+                    f"大盘趋势分数 {idx_score_float:.1f} 低于阈值"
                     f" {self.env_index_score_threshold:.1f}，建议观望/减仓"
                 )
 
@@ -1473,10 +1777,15 @@ class MA5MA20OpenMonitorRunner:
                 rank_display = f"{board_rank:.0f}" if board_rank is not None else "-"
                 reason = f"板块强势(rank={rank_display})，等待入场条件"
 
-            env_index_scores.append(_to_float(index_score))
+            env_index_scores.append(idx_score_float)
             board_statuses.append(board_status)
             board_ranks.append(board_rank)
             board_chg_pcts.append(board_chg)
+
+            strength_scores.append(_to_float(strength_score))
+            strength_deltas.append(_to_float(strength_delta))
+            strength_trends.append(strength_trend)
+            strength_notes.append(strength_note or None)
 
             actions.append(action)
             reasons.append(reason)
@@ -1495,11 +1804,15 @@ class MA5MA20OpenMonitorRunner:
         merged["stop_ref"] = stop_refs
         merged["signal_stop_ref"] = signal_stop_refs
         merged["valid_days"] = valid_days_list
-        merged["checked_at"] = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        merged["checked_at"] = dt.datetime.now().replace(microsecond=0)
         merged["env_index_score"] = env_index_scores
         merged["board_status"] = board_statuses
         merged["board_rank"] = board_ranks
         merged["board_chg_pct"] = board_chg_pcts
+        merged["signal_strength"] = strength_scores
+        merged["strength_delta"] = strength_deltas
+        merged["strength_trend"] = strength_trends
+        merged["strength_note"] = strength_notes
 
         keep_cols = [
             "monitor_date",
@@ -1532,6 +1845,10 @@ class MA5MA20OpenMonitorRunner:
             "board_status",
             "board_rank",
             "board_chg_pct",
+            "signal_strength",
+            "strength_delta",
+            "strength_trend",
+            "strength_note",
             "signal",
             "reason",
             "candidate_status",
@@ -1577,6 +1894,7 @@ class MA5MA20OpenMonitorRunner:
                 self.logger.warning("开盘监测表去重删除失败，将直接追加：%s", exc)
 
         if self._table_exists(table):
+            self._ensure_strength_schema(table)
             self._ensure_snapshot_schema(table)
             existing_keys = self._load_existing_snapshot_keys(table, monitor_date, codes)
             if existing_keys:
