@@ -54,6 +54,31 @@ def _default_interval_from_config() -> int:
         return 5
 
 
+TRADING_WINDOWS = [
+    (dt.time(hour=9, minute=20), dt.time(hour=11, minute=35)),
+    (dt.time(hour=12, minute=50), dt.time(hour=15, minute=10)),
+]
+
+
+def _in_trading_window(ts: dt.datetime) -> bool:
+    t = ts.time()
+    for start, end in TRADING_WINDOWS:
+        if start <= t <= end:
+            return True
+    return False
+
+
+def _next_trading_start(ts: dt.datetime) -> dt.datetime:
+    today = ts.date()
+    t = ts.time()
+    for start, end in TRADING_WINDOWS:
+        if t < start:
+            return dt.datetime.combine(today, start)
+        if start <= t <= end:
+            return ts
+    return dt.datetime.combine(today + dt.timedelta(days=1), TRADING_WINDOWS[0][0])
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="每整 N 分钟执行一次 run_open_monitor")
     parser.add_argument(
@@ -81,6 +106,16 @@ def main() -> None:
         while True:
             now = dt.datetime.now()
             run_at = _next_run_at(now, interval_min)
+            if not _in_trading_window(run_at):
+                next_start = _next_trading_start(run_at)
+                if next_start > now:
+                    logger.info(
+                        "当前不在交易时段，下一交易窗口：%s", next_start.strftime("%Y-%m-%d %H:%M:%S")
+                    )
+                run_at = _next_run_at(next_start, interval_min)
+            while not _in_trading_window(run_at):
+                next_start = _next_trading_start(run_at + dt.timedelta(minutes=interval_min))
+                run_at = _next_run_at(next_start, interval_min)
             sleep_s = (run_at - now).total_seconds()
             if sleep_s > 0:
                 logger.info("下一次触发：%s（%.1fs 后）", run_at.strftime("%Y-%m-%d %H:%M:%S"), sleep_s)

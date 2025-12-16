@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import datetime as dt
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -145,6 +145,16 @@ def _atr(high: pd.Series, low: pd.Series, preclose: pd.Series, n: int = 14) -> p
     return tr.rolling(n, min_periods=1).mean().rename("atr14")
 
 
+def _split_exchange_symbol(code: str) -> Tuple[str, str]:
+    code_s = str(code or "").strip()
+    if not code_s:
+        return "", ""
+    if "." in code_s:
+        ex, sym = code_s.split(".", 1)
+        return ex.lower(), sym
+    return "", code_s
+
+
 class MA5MA20StrategyRunner:
     """从 MySQL 读取日线 → 计算指标 → 生成 MA5-MA20 信号 → 写回 MySQL。"""
 
@@ -153,6 +163,8 @@ class MA5MA20StrategyRunner:
         self.params = MA5MA20Params.from_config()
         self.db_writer = MySQLWriter(DatabaseConfig.from_env())
         self.indicator_window = self._resolve_indicator_window()
+        self._fundamentals_cache: pd.DataFrame | None = None
+        self._stock_basic_cache: pd.DataFrame | None = None
 
     def _resolve_indicator_window(self) -> int:
         try:
@@ -295,6 +307,27 @@ class MA5MA20StrategyRunner:
         df = df.groupby("code", group_keys=False).tail(lookback).reset_index(drop=True)
         return df
 
+    def _load_fundamentals_latest(self) -> pd.DataFrame:
+        table = "fundamentals_latest_wide"
+        try:
+            with self.db_writer.engine.begin() as conn:
+                return pd.read_sql(text(f"SELECT * FROM `{table}`"), conn)
+        except Exception as exc:  # noqa: BLE001
+            self.logger.info("未能读取 %s（将跳过基本面标签）：%s", table, exc)
+            return pd.DataFrame()
+
+    def _load_stock_basic(self) -> pd.DataFrame:
+        table = "a_share_stock_basic"
+        try:
+            with self.db_writer.engine.begin() as conn:
+                return pd.read_sql(
+                    text(f"SELECT `code`,`code_name` FROM `{table}`"),
+                    conn,
+                )
+        except Exception as exc:  # noqa: BLE001
+            self.logger.info("未能读取 %s（将跳过 ST 标签与板块限幅识别）：%s", table, exc)
+            return pd.DataFrame()
+
     def _compute_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         """为每个 code 计算均线、量能、MACD、KDJ、ATR。"""
         df = df.sort_values(["code", "date"]).copy()
@@ -349,7 +382,130 @@ class MA5MA20StrategyRunner:
             df = df.groupby("code", group_keys=False).apply(_add_oscillators).reset_index(drop=True)
         return df
 
-    def _generate_signals(self, df: pd.DataFrame) -> pd.DataFrame:
+    def _select_column(
+        self, df: pd.DataFrame, candidates: List[str], *, contains: str | None = None
+    ) -> str | None:
+        for col in candidates:
+            if col in df.columns:
+                return col
+        if contains:
+            contains_lower = contains.lower()
+            for col in df.columns:
+                if contains_lower in col.lower():
+                    return col
+        return None
+
+    def _build_fundamental_risk_map(self, fundamentals: pd.DataFrame) -> Dict[str, Dict[str, str]]:
+        if fundamentals.empty:
+            return {}
+
+        netprofit_col = self._select_column(
+            fundamentals,
+            ["profit_netProfit", "profit_netprofit", "profit_net_profit"],
+            contains="netprofit",
+        )
+        yoy_col = self._select_column(
+            fundamentals,
+            ["growth_YOYNI", "growth_YOYPNI", "growth_YOYEPSBasic"],
+            contains="yoy",
+        )
+
+        if netprofit_col is None and yoy_col is None:
+            self.logger.info(
+                "fundamentals_latest_wide 缺少净利润/同比列，跳过基本面风险标签。"
+            )
+            return {}
+
+        merged = fundamentals[
+            [c for c in ["code", netprofit_col, yoy_col] if c in fundamentals.columns]
+        ].copy()
+        if merged.empty:
+            return {}
+
+        for col in [netprofit_col, yoy_col]:
+            if col and col in merged.columns:
+                merged[col] = pd.to_numeric(merged[col], errors="coerce")
+
+        risk_map: Dict[str, Dict[str, str]] = {}
+        for _, row in merged.iterrows():
+            code = str(row.get("code") or "").strip()
+            if not code:
+                continue
+
+            tags: list[str] = []
+            notes: list[str] = []
+
+            netprofit_val = row.get(netprofit_col) if netprofit_col else None
+            if (
+                netprofit_val is not None
+                and not pd.isna(netprofit_val)
+                and float(netprofit_val) <= 0
+            ):
+                tags.append("NO_PROFIT")
+                notes.append(f"净利润为 {float(netprofit_val):.2f}，缺乏业绩支撑")
+
+            yoy_val = row.get(yoy_col) if yoy_col else None
+            if yoy_val is not None and not pd.isna(yoy_val) and float(yoy_val) < 0:
+                tags.append("WEAK_GROWTH")
+                notes.append(f"净利润同比 {float(yoy_val):.2f}% 为负")
+
+            if tags:
+                risk_map[code] = {
+                    "tag": "|".join(tags),
+                    "note": "；".join(notes),
+                }
+
+        return risk_map
+
+    def _build_board_masks(
+        self, codes: pd.Series, stock_basic: pd.DataFrame
+    ) -> Tuple[pd.Series, pd.Series, pd.Series]:
+        parts = codes.map(_split_exchange_symbol)
+        code_parts = pd.DataFrame(parts.tolist(), columns=["exchange", "symbol"]).fillna("")
+
+        symbols = code_parts["symbol"].astype(str)
+        exchanges = code_parts["exchange"].astype(str)
+
+        mask_bj = (exchanges == "bj") | symbols.str.startswith(("43", "83"))
+        mask_growth = symbols.str.startswith(
+            ("300", "301", "302", "303", "688", "689")
+        )
+
+        mask_st = pd.Series(False, index=codes.index)
+        if not stock_basic.empty:
+            cols_lower = {c.lower(): c for c in stock_basic.columns}
+            code_col = cols_lower.get("code")
+            name_col = cols_lower.get("code_name") or cols_lower.get("name")
+            if code_col and name_col and name_col in stock_basic.columns:
+                base = stock_basic[[code_col, name_col]].dropna().copy()
+                base[code_col] = base[code_col].astype(str)
+                base[name_col] = base[name_col].astype(str)
+                base = base.drop_duplicates(subset=[code_col], keep="last")
+                names = base.set_index(code_col)[name_col]
+
+                def _lookup_name(raw_code: str) -> str:
+                    direct = names.get(raw_code, "")
+                    if isinstance(direct, pd.Series):
+                        direct = direct.iloc[0] if not direct.empty else ""
+                    if direct:
+                        return str(direct)
+                    ex, sym = _split_exchange_symbol(raw_code)
+                    if sym and sym in names:
+                        return str(names.get(sym, ""))
+                    if ex and f"{ex}.{sym}" in names:
+                        return str(names.get(f"{ex}.{sym}", ""))
+                    return ""
+
+                mask_st = codes.map(lambda c: _lookup_name(str(c))).str.upper().str.contains("ST")
+
+        return mask_growth, mask_bj, mask_st
+
+    def _generate_signals(
+        self,
+        df: pd.DataFrame,
+        fundamentals: pd.DataFrame | None = None,
+        stock_basic: pd.DataFrame | None = None,
+    ) -> pd.DataFrame:
         """生成 BUY/SELL/HOLD 信号，并给出 reason。"""
         p = self.params
 
@@ -428,6 +584,76 @@ class MA5MA20StrategyRunner:
         out["reason"] = reason.to_numpy()
         # 风险参考：2*ATR 作为“初始止损价”参考（你也可以换成 MA20 跌破止损）
         out["stop_ref"] = out["close"] - 2.0 * out["atr14"]
+
+        # 妖股/过热风险：短期涨幅+涨停次数+乖离
+        out["ret_10"] = out.groupby("code", sort=False)["close"].pct_change(periods=10)
+        out["ret_20"] = out.groupby("code", sort=False)["close"].pct_change(periods=20)
+        pct_change = np.where(
+            out["preclose"] > 0,
+            (out["close"] - out["preclose"]) / out["preclose"],
+            np.nan,
+        )
+        out["ma20_bias"] = np.where(
+            out["ma20"] != 0, (out["close"] - out["ma20"]) / out["ma20"], np.nan
+        )
+
+        def _format_pct(value: float | None) -> str:
+            if value is None or pd.isna(value):
+                return "N/A"
+            return f"{value*100:.2f}%"
+        code_series = out["code"].astype(str)
+        stock_basic_df = stock_basic if stock_basic is not None else pd.DataFrame()
+        mask_growth, mask_bj, mask_st = self._build_board_masks(code_series, stock_basic_df)
+        limit_up_threshold = pd.Series(
+            np.where(mask_bj, 0.295, np.where(mask_growth, 0.195, 0.097)),
+            index=out.index,
+            dtype=float,
+        )
+
+        mania_ret = (out["ret_20"] >= 0.35).fillna(False)
+        limit_up_daily = pct_change >= limit_up_threshold
+        out["limit_up_cnt_20"] = (
+            limit_up_daily.groupby(out["code"], sort=False)
+            .rolling(20, min_periods=1)
+            .sum()
+            .reset_index(level=0, drop=True)
+        )
+        mania_limit = (out["limit_up_cnt_20"] >= 2).fillna(False)
+        mania_bias = (out["ma20_bias"] >= 0.15).fillna(False)
+        mania_mask = mania_ret | mania_limit | mania_bias
+
+        ret20_fmt = out["ret_20"].apply(_format_pct)
+        bias_fmt = out["ma20_bias"].apply(_format_pct)
+        mania_notes_ret = np.where(mania_ret, "20日涨幅 " + ret20_fmt + " 过高", "")
+        mania_notes_limit = np.where(
+            mania_limit, "20日内涨停 " + out["limit_up_cnt_20"].fillna(0).astype(int).astype(str) + " 次", ""
+        )
+        mania_notes_bias = np.where(mania_bias, "MA20 乖离 " + bias_fmt + " 偏离成本", "")
+        mania_notes = [
+            "；".join([v for v in items if v])
+            for items in zip(mania_notes_ret, mania_notes_limit, mania_notes_bias)
+        ]
+
+        fund_df = fundamentals if fundamentals is not None else pd.DataFrame()
+        fund_risk_map = self._build_fundamental_risk_map(fund_df)
+        fund_tags = code_series.map(lambda c: (fund_risk_map.get(c) or {}).get("tag", ""))
+        fund_notes = code_series.map(lambda c: (fund_risk_map.get(c) or {}).get("note", ""))
+
+        mania_tags = np.where(mania_mask, "MANIA", "")
+        st_tags = np.where(mask_st.fillna(False), "ST", "")
+        st_notes = np.where(mask_st.fillna(False), "风险警示 ST", "")
+
+        risk_tags = [
+            "|".join([t for t in (mt, stt, ft) if t])
+            for mt, stt, ft in zip(mania_tags, st_tags, fund_tags)
+        ]
+        risk_notes = [
+            "；".join([v for v in (mn, sn, fn) if v])
+            for mn, sn, fn in zip(mania_notes, st_notes, fund_notes)
+        ]
+
+        out["risk_tag"] = risk_tags
+        out["risk_note"] = risk_notes
         return out
 
     def _ensure_signals_table(self, table: str) -> None:
@@ -454,6 +680,12 @@ class MA5MA20StrategyRunner:
               `kdj_j` DOUBLE NULL,
               `atr14` DOUBLE NULL,
               `stop_ref` DOUBLE NULL,
+              `ret_10` DOUBLE NULL,
+              `ret_20` DOUBLE NULL,
+              `limit_up_cnt_20` DOUBLE NULL,
+              `ma20_bias` DOUBLE NULL,
+              `risk_tag` VARCHAR(255) NULL,
+              `risk_note` VARCHAR(255) NULL,
               `signal` VARCHAR(10) NULL,
               `reason` VARCHAR(255) NULL,
               PRIMARY KEY (`date`, `code`)
@@ -462,6 +694,36 @@ class MA5MA20StrategyRunner:
         )
         with self.db_writer.engine.begin() as conn:
             conn.execute(create_stmt)
+
+    def _ensure_signals_columns(self, table: str) -> None:
+        extra_columns = {
+            "ret_10": "DOUBLE NULL",
+            "ret_20": "DOUBLE NULL",
+            "limit_up_cnt_20": "DOUBLE NULL",
+            "ma20_bias": "DOUBLE NULL",
+            "risk_tag": "VARCHAR(255) NULL",
+            "risk_note": "VARCHAR(255) NULL",
+        }
+
+        with self.db_writer.engine.begin() as conn:
+            existing_cols = pd.read_sql(
+                text(
+                    """
+                    SELECT COLUMN_NAME FROM information_schema.COLUMNS
+                    WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = :t
+                    """
+                ),
+                conn,
+                params={"t": table},
+            )["COLUMN_NAME"].tolist()
+
+            for col, ddl in extra_columns.items():
+                if col not in existing_cols:
+                    try:
+                        conn.execute(text(f"ALTER TABLE `{table}` ADD COLUMN `{col}` {ddl}"))
+                        self.logger.info("signals 表已新增列 %s", col)
+                    except Exception as exc:  # noqa: BLE001
+                        self.logger.warning("无法为 %s 添加列 %s：%s", table, col, exc)
 
     def _ensure_candidates_table(self, table: str) -> None:
         """确保 candidates 表存在（用于无 BUY 时清空表）。"""
@@ -481,6 +743,8 @@ class MA5MA20StrategyRunner:
               `kdj_d` DOUBLE NULL,
               `atr14` DOUBLE NULL,
               `stop_ref` DOUBLE NULL,
+              `risk_tag` VARCHAR(255) NULL,
+              `risk_note` VARCHAR(255) NULL,
               `reason` VARCHAR(255) NULL,
               PRIMARY KEY (`date`, `code`)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
@@ -488,6 +752,32 @@ class MA5MA20StrategyRunner:
         )
         with self.db_writer.engine.begin() as conn:
             conn.execute(create_stmt)
+
+    def _ensure_candidates_columns(self, table: str) -> None:
+        extra_columns = {
+            "risk_tag": "VARCHAR(255) NULL",
+            "risk_note": "VARCHAR(255) NULL",
+        }
+
+        with self.db_writer.engine.begin() as conn:
+            existing_cols = pd.read_sql(
+                text(
+                    """
+                    SELECT COLUMN_NAME FROM information_schema.COLUMNS
+                    WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = :t
+                    """
+                ),
+                conn,
+                params={"t": table},
+            )["COLUMN_NAME"].tolist()
+
+            for col, ddl in extra_columns.items():
+                if col not in existing_cols:
+                    try:
+                        conn.execute(text(f"ALTER TABLE `{table}` ADD COLUMN `{col}` {ddl}"))
+                        self.logger.info("candidates 表已新增列 %s", col)
+                    except Exception as exc:  # noqa: BLE001
+                        self.logger.warning("无法为 %s 添加列 %s：%s", table, col, exc)
 
     def _ensure_candidates_view(self, view_name: str) -> None:
         """创建/更新 candidates 视图：从 signals 列出全部历史 BUY 信号。
@@ -503,6 +793,7 @@ class MA5MA20StrategyRunner:
               `date`,`code`,`close`,
               `ma5`,`ma20`,`ma60`,`ma250`,
               `vol_ratio`,`macd_hist`,`kdj_k`,`kdj_d`,`atr14`,`stop_ref`,
+              `risk_tag`,`risk_note`,
               `reason`
             FROM `{base}`
             WHERE `signal` = 'BUY'
@@ -560,10 +851,27 @@ class MA5MA20StrategyRunner:
             "stop_ref",
             "signal",
             "reason",
+            "ret_10",
+            "ret_20",
+            "limit_up_cnt_20",
+            "ma20_bias",
+            "risk_tag",
+            "risk_note",
         ]
         to_write = to_write[keep_cols].copy()
         to_write["date"] = pd.to_datetime(to_write["date"]).dt.date
         to_write["code"] = to_write["code"].astype(str)
+
+        for col in ["risk_tag", "risk_note", "reason"]:
+            if col in to_write.columns:
+                to_write[col] = (
+                    to_write[col]
+                    .fillna("")
+                    .astype(str)
+                    .str.slice(0, 250)
+                )
+
+        self._ensure_signals_columns(tbl)
 
         if scope == "latest":
             delete_stmt = (
@@ -644,6 +952,8 @@ class MA5MA20StrategyRunner:
             "kdj_d",
             "atr14",
             "stop_ref",
+            "risk_tag",
+            "risk_note",
             "reason",
         ]
         cands = cands[keep_cols].copy()
@@ -651,6 +961,7 @@ class MA5MA20StrategyRunner:
         cands["code"] = cands["code"].astype(str)
 
         self._clear_table(tbl)
+        self._ensure_candidates_columns(tbl)
         self.db_writer.write_dataframe(cands, tbl, if_exists="append")
 
     def run(self, *, force: bool = False) -> None:
@@ -687,7 +998,11 @@ class MA5MA20StrategyRunner:
         self.logger.info("MA5-MA20 策略：读取日线 %s 行（%s 只股票）。", len(daily), daily["code"].nunique())
 
         ind = self._compute_indicators(daily)
-        sig = self._generate_signals(ind)
+        fundamentals = self._load_fundamentals_latest() if self._fundamentals_cache is None else self._fundamentals_cache
+        stock_basic = self._load_stock_basic() if self._stock_basic_cache is None else self._stock_basic_cache
+        self._fundamentals_cache = fundamentals
+        self._stock_basic_cache = stock_basic
+        sig = self._generate_signals(ind, fundamentals, stock_basic)
 
         self._write_signals(latest_date, sig, codes)
         if bool(getattr(self.params, "candidates_as_view", False)):
