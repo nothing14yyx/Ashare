@@ -60,6 +60,7 @@ def _to_float(value: Any) -> float | None:  # noqa: ANN401
 
 SNAPSHOT_HASH_EXCLUDE = {
     "checked_at",
+    "dedupe_bucket",
     "used_ma5",
     "used_ma20",
     "used_ma60",
@@ -198,6 +199,7 @@ class OpenMonitorParams:
     export_csv: bool = True
     export_top_n: int = 100
     output_subdir: str = "open_monitor"
+    dedupe_bucket_minutes: int = 5
 
     @classmethod
     def from_config(cls) -> "OpenMonitorParams":
@@ -308,6 +310,7 @@ class OpenMonitorParams:
             export_csv=_get_bool("export_csv", cls.export_csv),
             export_top_n=_get_int("export_top_n", cls.export_top_n),
             output_subdir=str(sec.get("output_subdir", cls.output_subdir)).strip() or cls.output_subdir,
+            dedupe_bucket_minutes=_get_int("dedupe_bucket_minutes", cls.dedupe_bucket_minutes),
         )
 
 
@@ -408,6 +411,29 @@ class MA5MA20OpenMonitorRunner:
             )
             return 120 + int(delta.total_seconds() // 60)
         return 240
+
+    def _calc_dedupe_bucket(self, ts: dt.datetime) -> str:
+        bucket_minutes = max(int(self.params.dedupe_bucket_minutes or 5), 1)
+
+        auction_start = dt.time(9, 15)
+        lunch_break_start = dt.time(11, 30)
+        lunch_break_end = dt.time(13, 0)
+        market_close = dt.time(15, 0)
+
+        t = ts.time()
+        if t < auction_start:
+            return "PREOPEN"
+        if lunch_break_start <= t < lunch_break_end:
+            return "BREAK"
+        if t >= market_close:
+            return "POSTCLOSE"
+
+        minute_of_day = ts.hour * 60 + ts.minute
+        bucket_minute = (minute_of_day // bucket_minutes) * bucket_minutes
+        bucket_time = dt.datetime.combine(
+            ts.date(), dt.time(bucket_minute // 60, bucket_minute % 60)
+        )
+        return bucket_time.strftime("%Y-%m-%d %H:%M")
 
     def _load_avg_volume(
         self, latest_trade_date: str, codes: List[str], window: int = 20
@@ -750,7 +776,14 @@ class MA5MA20OpenMonitorRunner:
     def _cleanup_duplicate_snapshots(self, table: str) -> None:
         """清理历史重复快照，确保唯一索引可创建（仅保留最新 checked_at）。"""
 
-        required_cols = {"monitor_date", "date", "code", "snapshot_hash", "checked_at"}
+        required_cols = {
+            "monitor_date",
+            "date",
+            "code",
+            "snapshot_hash",
+            "dedupe_bucket",
+            "checked_at",
+        }
         for col in required_cols:
             if not self._column_exists(table, col):
                 return
@@ -766,6 +799,7 @@ class MA5MA20OpenMonitorRunner:
                           ON t1.`monitor_date` = t2.`monitor_date`
                          AND t1.`date` = t2.`date`
                          AND t1.`code` = t2.`code`
+                         AND t1.`dedupe_bucket` = t2.`dedupe_bucket`
                          AND t1.`snapshot_hash` = t2.`snapshot_hash`
                          AND (
                               (t1.`checked_at` < t2.`checked_at`)
@@ -790,6 +824,7 @@ class MA5MA20OpenMonitorRunner:
             "date": 32,
             "code": 32,
             "snapshot_hash": 64,
+            "dedupe_bucket": 32,
         }
 
         for column, length in dedupe_columns.items():
@@ -813,6 +848,18 @@ class MA5MA20OpenMonitorRunner:
             except Exception as exc:  # noqa: BLE001
                 self.logger.warning("为表 %s 添加 snapshot_hash 列失败：%s", table, exc)
 
+        if not self._column_exists(table, "dedupe_bucket"):
+            try:
+                with self.db_writer.engine.begin() as conn:
+                    conn.execute(
+                        text(
+                            f"ALTER TABLE `{table}` ADD COLUMN `dedupe_bucket` VARCHAR(32)"
+                        )
+                    )
+                self.logger.info("表 %s 已新增 dedupe_bucket 列用于时间桶去重。", table)
+            except Exception as exc:  # noqa: BLE001
+                self.logger.warning("为表 %s 添加 dedupe_bucket 列失败：%s", table, exc)
+
         self._ensure_indexable_columns(table)
 
         index_name = "ux_open_monitor_dedupe"
@@ -825,7 +872,7 @@ class MA5MA20OpenMonitorRunner:
                         text(
                             f"""
                             CREATE UNIQUE INDEX `{index_name}`
-                            ON `{table}` (`monitor_date`, `date`, `code`, `snapshot_hash`)
+                            ON `{table}` (`monitor_date`, `date`, `code`, `dedupe_bucket`, `snapshot_hash`)
                             """
                         )
                     )
@@ -843,6 +890,8 @@ class MA5MA20OpenMonitorRunner:
         self._ensure_numeric_column(table, "strength_delta", "DOUBLE NULL")
         self._ensure_column(table, "strength_trend", "VARCHAR(16) NULL")
         self._ensure_column(table, "strength_note", "VARCHAR(512) NULL")
+
+        self._ensure_indexable_columns(table)
 
         index_name = "idx_open_monitor_strength_time"
         if not self._index_exists(table, index_name):
@@ -871,35 +920,45 @@ class MA5MA20OpenMonitorRunner:
                 self.logger.warning("创建索引 %s 失败：%s", code_time_index, exc)
 
     def _load_existing_snapshot_keys(
-        self, table: str, monitor_date: str, codes: List[str]
-    ) -> set[tuple[str, str, str, str]]:
-        if not (table and monitor_date and codes and self._table_exists(table)):
+        self, table: str, monitor_date: str, codes: List[str], dedupe_bucket: str
+    ) -> set[tuple[str, str, str, str, str]]:
+        if not (
+            table
+            and monitor_date
+            and codes
+            and dedupe_bucket
+            and self._table_exists(table)
+        ):
             return set()
+
         stmt = text(
             f"""
-            SELECT `monitor_date`, `date`, `code`, `snapshot_hash`
+            SELECT `monitor_date`, `date`, `code`, `dedupe_bucket`, `snapshot_hash`
             FROM `{table}`
-            WHERE `monitor_date` = :d AND `code` IN :codes
+            WHERE `monitor_date` = :d AND `code` IN :codes AND `dedupe_bucket` = :b
             """
         ).bindparams(bindparam("codes", expanding=True))
 
         try:
             with self.db_writer.engine.begin() as conn:
                 df = pd.read_sql_query(
-                    stmt, conn, params={"d": monitor_date, "codes": codes}
+                    stmt,
+                    conn,
+                    params={"d": monitor_date, "codes": codes, "b": dedupe_bucket},
                 )
         except Exception as exc:  # noqa: BLE001
             self.logger.debug("读取已存在的 snapshot_hash 失败：%s", exc)
             return set()
 
-        existing: set[tuple[str, str, str, str]] = set()
+        existing: set[tuple[str, str, str, str, str]] = set()
         for _, row in df.iterrows():
             snap = str(row.get("snapshot_hash") or "").strip()
             code = str(row.get("code") or "").strip()
             date_val = str(row.get("date") or "").strip()
             monitor = str(row.get("monitor_date") or "").strip()
-            if snap and code and date_val and monitor:
-                existing.add((monitor, date_val, code, snap))
+            bucket = str(row.get("dedupe_bucket") or "").strip()
+            if snap and code and date_val and monitor and bucket:
+                existing.add((monitor, date_val, code, bucket, snap))
         return existing
 
     def _daily_table(self) -> str:
@@ -1544,6 +1603,7 @@ class MA5MA20OpenMonitorRunner:
 
         q = quotes.copy()
         checked_at_ts = dt.datetime.now()
+        dedupe_bucket = self._calc_dedupe_bucket(checked_at_ts)
         avg_volume_map = self._load_avg_volume(
             latest_trade_date, signals["code"].dropna().astype(str).unique().tolist()
         )
@@ -1567,6 +1627,7 @@ class MA5MA20OpenMonitorRunner:
             out["candidate_status"] = "UNKNOWN"
             out["status_reason"] = "行情数据不可用"
             out["checked_at"] = checked_at_ts
+            out["dedupe_bucket"] = dedupe_bucket
             for col in [
                 "used_ma5",
                 "used_ma20",
@@ -2171,6 +2232,7 @@ class MA5MA20OpenMonitorRunner:
         merged["signal_stop_ref"] = signal_stop_refs
         merged["valid_days"] = valid_days_list
         merged["checked_at"] = checked_at_ts
+        merged["dedupe_bucket"] = dedupe_bucket
         merged["env_index_score"] = env_index_scores
         merged["board_status"] = board_statuses
         merged["board_rank"] = board_ranks
@@ -2238,6 +2300,7 @@ class MA5MA20OpenMonitorRunner:
             "action",
             "action_reason",
             "checked_at",
+            "dedupe_bucket",
             "snapshot_hash",
         ]
         for col in keep_cols:
@@ -2263,12 +2326,20 @@ class MA5MA20OpenMonitorRunner:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
 
+        if "dedupe_bucket" not in df.columns:
+            df["dedupe_bucket"] = None
+        df["dedupe_bucket"] = df["dedupe_bucket"].fillna(
+            self._calc_dedupe_bucket(dt.datetime.now())
+        )
+
         if self._table_exists(table):
-            self._ensure_strength_schema(table)
             self._ensure_snapshot_schema(table)
+            self._ensure_strength_schema(table)
 
         df["snapshot_hash"] = df.apply(lambda row: make_snapshot_hash(row.to_dict()), axis=1)
-        df = df.drop_duplicates(subset=["monitor_date", "date", "code", "snapshot_hash"])
+        df = df.drop_duplicates(
+            subset=["monitor_date", "date", "code", "dedupe_bucket", "snapshot_hash"]
+        )
 
         # 增量模式：不删除旧记录，保留每次运行的历史快照（checked_at 会区分）
         if (not self.params.incremental_write) and monitor_date and codes and self._table_exists(table):
@@ -2284,7 +2355,10 @@ class MA5MA20OpenMonitorRunner:
                 self.logger.warning("开盘监测表去重删除失败，将直接追加：%s", exc)
 
         if self._table_exists(table):
-            existing_keys = self._load_existing_snapshot_keys(table, monitor_date, codes)
+            bucket = str(df["dedupe_bucket"].iloc[0] or "").strip()
+            existing_keys = self._load_existing_snapshot_keys(
+                table, monitor_date, codes, bucket
+            )
             if existing_keys:
                 before = len(df)
                 df = df[
@@ -2293,6 +2367,7 @@ class MA5MA20OpenMonitorRunner:
                             str(row.get("monitor_date") or "").strip(),
                             str(row.get("date") or "").strip(),
                             str(row.get("code") or "").strip(),
+                            str(row.get("dedupe_bucket") or "").strip(),
                             str(row.get("snapshot_hash") or "").strip(),
                         )
                         in existing_keys,
@@ -2310,8 +2385,8 @@ class MA5MA20OpenMonitorRunner:
         try:
             self.db_writer.write_dataframe(df, table, if_exists="append")
             self.logger.info("开盘监测结果已写入表 %s：%s 条", table, len(df))
-            self._ensure_strength_schema(table)
             self._ensure_snapshot_schema(table)
+            self._ensure_strength_schema(table)
         except Exception as exc:  # noqa: BLE001
             self.logger.error("写入开盘监测表失败：%s", exc)
 
