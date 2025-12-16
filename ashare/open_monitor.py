@@ -199,6 +199,7 @@ class OpenMonitorParams:
     export_csv: bool = True
     export_top_n: int = 100
     output_subdir: str = "open_monitor"
+    interval_minutes: int = 5
     dedupe_bucket_minutes: int = 5
 
     @classmethod
@@ -263,6 +264,15 @@ class OpenMonitorParams:
         if quote_source == "auto":
             quote_source = "eastmoney"
 
+        interval_minutes = _get_int("interval_minutes", cls.interval_minutes)
+
+        dedupe_bucket_configured = sec.get("dedupe_bucket_minutes")
+        dedupe_bucket_minutes = (
+            _get_int("dedupe_bucket_minutes", interval_minutes)
+            if dedupe_bucket_configured is not None
+            else interval_minutes
+        )
+
         return cls(
             enabled=_get_bool("enabled", cls.enabled),
             signals_table=str(sec.get("signals_table", default_signals)).strip() or default_signals,
@@ -310,7 +320,8 @@ class OpenMonitorParams:
             export_csv=_get_bool("export_csv", cls.export_csv),
             export_top_n=_get_int("export_top_n", cls.export_top_n),
             output_subdir=str(sec.get("output_subdir", cls.output_subdir)).strip() or cls.output_subdir,
-            dedupe_bucket_minutes=_get_int("dedupe_bucket_minutes", cls.dedupe_bucket_minutes),
+            interval_minutes=interval_minutes,
+            dedupe_bucket_minutes=dedupe_bucket_minutes,
         )
 
 

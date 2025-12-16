@@ -20,6 +20,7 @@ import datetime as dt
 import time
 
 from ashare.open_monitor import MA5MA20OpenMonitorRunner
+from ashare.config import get_section
 
 
 def _next_run_at(now: dt.datetime, interval_min: int) -> dt.datetime:
@@ -42,14 +43,24 @@ def _next_run_at(now: dt.datetime, interval_min: int) -> dt.datetime:
     return (base.replace(minute=0) + dt.timedelta(hours=1))
 
 
+def _default_interval_from_config() -> int:
+    cfg = get_section("open_monitor") or {}
+    if not isinstance(cfg, dict):
+        return 5
+    try:
+        interval = int(cfg.get("interval_minutes", 5))
+        return interval if interval > 0 else 5
+    except Exception:  # noqa: BLE001
+        return 5
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="每整 N 分钟执行一次 run_open_monitor")
     parser.add_argument(
         "--interval",
         type=int,
-        default=5,
-        choices=[5, 10],
-        help="调度间隔（分钟），仅支持 5 或 10",
+        default=_default_interval_from_config(),
+        help="调度间隔（分钟），默认读取 config.yaml 的 open_monitor.interval_minutes",
     )
     parser.add_argument(
         "--once",
@@ -61,6 +72,8 @@ def main() -> None:
     runner = MA5MA20OpenMonitorRunner()
     logger = runner.logger
     interval_min = int(args.interval)
+    if interval_min <= 0:
+        raise ValueError("interval must be positive")
 
     logger.info("开盘监测调度器启动：interval=%s 分钟（整点对齐）", interval_min)
 
