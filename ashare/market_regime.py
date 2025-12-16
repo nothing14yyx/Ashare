@@ -125,10 +125,10 @@ class MarketRegimeClassifier:
             pullback_mode = None
             if close_val is None or pd.isna(close_val):
                 status = "UNKNOWN"
-            elif rolling_low is not None and not pd.isna(rolling_low) and close_val < rolling_low:
-                status = "BREAKDOWN"
             elif break_confirmed:
                 status = "BEAR_CONFIRMED"
+            elif rolling_low is not None and not pd.isna(rolling_low) and close_val < rolling_low:
+                status = "BREAKDOWN"
             elif ma250 is not None and not pd.isna(ma250) and close_val < ma250:
                 status = "RISK_OFF"
             elif ma60 is not None and not pd.isna(ma60) and close_val < ma60:
@@ -171,10 +171,10 @@ class MarketRegimeClassifier:
         avg_score = sum(v.get("score", 0) for v in detail.values()) / max(len(detail), 1)
 
         regime = "RISK_ON"
-        if "BREAKDOWN" in statuses:
-            regime = "BREAKDOWN"
-        elif "BEAR_CONFIRMED" in statuses:
+        if "BEAR_CONFIRMED" in statuses:
             regime = "BEAR_CONFIRMED"
+        elif "BREAKDOWN" in statuses:
+            regime = "BREAKDOWN"
         elif "RISK_OFF" in statuses:
             regime = "RISK_OFF"
         elif "PULLBACK" in statuses:
