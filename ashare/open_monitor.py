@@ -1460,12 +1460,26 @@ class MA5MA20OpenMonitorRunner:
                     if key_norm:
                         board_map[key_norm] = payload
 
-        return {
+        env_context = {
             "index": index_trend,
             "boards": board_map,
             "regime": index_trend.get("regime"),
             "position_hint": index_trend.get("position_hint"),
         }
+
+        for key in [
+            "below_ma250_streak",
+            "break_confirmed",
+            "reclaim_confirmed",
+            "effective_breakdown_days",
+            "effective_reclaim_days",
+            "yearline_state",
+            "regime_note",
+        ]:
+            if isinstance(index_trend, dict) and key in index_trend:
+                env_context[key] = index_trend[key]
+
+        return env_context
 
     # -------------------------
     # Quote fetch
