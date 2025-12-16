@@ -29,6 +29,7 @@ from sqlalchemy import bindparam, text
 
 from .config import get_section
 from .db import DatabaseConfig, MySQLWriter
+from .indicator_utils import consecutive_true
 from .utils import setup_logger
 
 
@@ -87,6 +88,17 @@ def _ensure_datetime(series: pd.Series) -> pd.Series:
     if np.issubdtype(series.dtype, np.datetime64):
         return series
     return pd.to_datetime(series, errors="coerce")
+
+
+def _normalize_list_date(series: pd.Series) -> pd.Series:
+    raw = series.copy()
+    as_str = raw.astype(str)
+    digit_mask = as_str.str.fullmatch(r"\d{8}")
+    parsed_digits = pd.to_datetime(as_str.where(digit_mask), format="%Y%m%d", errors="coerce")
+    parsed_general = pd.to_datetime(raw, errors="coerce")
+    parsed = parsed_digits.combine_first(parsed_general)
+    parsed = parsed.where(~raw.isna(), pd.NaT)
+    return parsed
 
 
 def _to_numeric(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
@@ -320,13 +332,31 @@ class MA5MA20StrategyRunner:
         table = "a_share_stock_basic"
         try:
             with self.db_writer.engine.begin() as conn:
-                return pd.read_sql(
-                    text(f"SELECT `code`,`code_name` FROM `{table}`"),
+                df = pd.read_sql(
+                    text(f"SELECT `code`,`code_name`,`list_date` FROM `{table}`"),
                     conn,
                 )
+                if "list_date" in df.columns:
+                    df["list_date"] = _normalize_list_date(df["list_date"])
+                return df
         except Exception as exc:  # noqa: BLE001
-            self.logger.info("未能读取 %s（将跳过 ST 标签与板块限幅识别）：%s", table, exc)
-            return pd.DataFrame()
+            self.logger.info(
+                "读取 %s 含 list_date 失败，将回退基础字段（ST/板块限幅仍可用）：%s",
+                table,
+                exc,
+            )
+            try:
+                with self.db_writer.engine.begin() as conn:
+                    return pd.read_sql(
+                        text(f"SELECT `code`,`code_name` FROM `{table}`"), conn
+                    )
+            except Exception as exc2:  # noqa: BLE001
+                self.logger.info(
+                    "读取 %s 基础字段失败（将跳过 ST 标签与板块限幅识别）：%s",
+                    table,
+                    exc2,
+                )
+                return pd.DataFrame()
 
     def _compute_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         """为每个 code 计算均线、量能、MACD、KDJ、ATR。"""
@@ -604,6 +634,20 @@ class MA5MA20StrategyRunner:
         code_series = out["code"].astype(str)
         stock_basic_df = stock_basic if stock_basic is not None else pd.DataFrame()
         mask_growth, mask_bj, mask_st = self._build_board_masks(code_series, stock_basic_df)
+        list_date_col = self._select_column(
+            stock_basic_df, ["list_date", "ipo_date"], contains="list"
+        )
+        code_col = self._select_column(stock_basic_df, ["code"], contains="code")
+        listing_days = pd.Series(pd.NA, index=out.index, dtype="Int64")
+        if list_date_col and code_col and list_date_col in stock_basic_df.columns:
+            base = stock_basic_df[[code_col, list_date_col]].dropna().copy()
+            base[code_col] = base[code_col].astype(str)
+            base[list_date_col] = pd.to_datetime(base[list_date_col], errors="coerce")
+            base = base.dropna(subset=[list_date_col]).drop_duplicates(subset=[code_col])
+            list_date_map = base.set_index(code_col)[list_date_col]
+            mapped_dates = out["code"].map(list_date_map)
+            listing_days = (out["date"] - mapped_dates).dt.days
+        out["listing_days"] = listing_days
         limit_up_threshold = pd.Series(
             np.where(mask_bj, 0.295, np.where(mask_growth, 0.195, 0.097)),
             index=out.index,
@@ -634,6 +678,62 @@ class MA5MA20StrategyRunner:
             for items in zip(mania_notes_ret, mania_notes_limit, mania_notes_bias)
         ]
 
+        yearline_enabled = (
+            out["listing_days"].ge(250)
+            if "listing_days" in out.columns
+            else out["ma250"].notna()
+        ).fillna(False)
+        below_ma250_mask = (out["close"] < out["ma250"]) & yearline_enabled
+        above_ma250_mask = (out["close"] >= out["ma250"]) & yearline_enabled
+        prev_below_ma250 = (
+            below_ma250_mask.groupby(out["code"], sort=False).shift(1).fillna(False)
+        )
+        below_ma250_streak = (
+            below_ma250_mask.groupby(out["code"], sort=False)
+            .transform(consecutive_true)
+            .astype("Int64")
+        )
+        above_ma250_streak = (
+            above_ma250_mask.groupby(out["code"], sort=False)
+            .transform(consecutive_true)
+            .astype("Int64")
+        )
+        ma250_slope = out.groupby("code", sort=False)["ma250"].diff()
+        yearline_break_confirmed = below_ma250_streak >= 3
+        yearline_break_warn = (~yearline_break_confirmed) & (
+            below_ma250_mask & (ma250_slope < 0)
+        )
+        yearline_reclaim_confirmed = (above_ma250_streak >= 2) & prev_below_ma250
+
+        yearline_state = np.select(
+            [
+                yearline_break_confirmed,
+                yearline_reclaim_confirmed & yearline_enabled,
+                below_ma250_mask,
+                yearline_enabled,
+            ],
+            [
+                "BREAK_CONFIRMED",
+                "RECLAIM_CONFIRMED",
+                "BELOW_1_2D",
+                "ABOVE",
+            ],
+            default="NO_DATA",
+        )
+
+        yearline_tags_confirmed = np.where(
+            yearline_break_confirmed, "YEARLINE_BREAK_CONFIRMED", ""
+        )
+        yearline_tags_warn = np.where(yearline_break_warn, "YEARLINE_BREAK_WARN", "")
+        yearline_notes_confirmed = np.where(
+            yearline_break_confirmed, "年线连续3日收盘跌破，趋势破位风险", ""
+        )
+        yearline_notes_warn = np.where(
+            yearline_break_warn,
+            "年线下穿且年线走弱，警惕有效跌破",
+            "",
+        )
+
         fund_df = fundamentals if fundamentals is not None else pd.DataFrame()
         fund_risk_map = self._build_fundamental_risk_map(fund_df)
         fund_tags = code_series.map(lambda c: (fund_risk_map.get(c) or {}).get("tag", ""))
@@ -644,14 +744,27 @@ class MA5MA20StrategyRunner:
         st_notes = np.where(mask_st.fillna(False), "风险警示 ST", "")
 
         risk_tags = [
-            "|".join([t for t in (mt, stt, ft) if t])
-            for mt, stt, ft in zip(mania_tags, st_tags, fund_tags)
+            "|".join([t for t in (mt, stt, ft, ytc, ytw) if t])
+            for mt, stt, ft, ytc, ytw in zip(
+                mania_tags,
+                st_tags,
+                fund_tags,
+                yearline_tags_confirmed,
+                yearline_tags_warn,
+            )
         ]
         risk_notes = [
-            "；".join([v for v in (mn, sn, fn) if v])
-            for mn, sn, fn in zip(mania_notes, st_notes, fund_notes)
+            "；".join([v for v in (mn, sn, fn, ync, ynw) if v])
+            for mn, sn, fn, ync, ynw in zip(
+                mania_notes,
+                st_notes,
+                fund_notes,
+                yearline_notes_confirmed,
+                yearline_notes_warn,
+            )
         ]
 
+        out["yearline_state"] = yearline_state
         out["risk_tag"] = risk_tags
         out["risk_note"] = risk_notes
         return out
@@ -684,6 +797,7 @@ class MA5MA20StrategyRunner:
               `ret_20` DOUBLE NULL,
               `limit_up_cnt_20` DOUBLE NULL,
               `ma20_bias` DOUBLE NULL,
+              `yearline_state` VARCHAR(50) NULL,
               `risk_tag` VARCHAR(255) NULL,
               `risk_note` VARCHAR(255) NULL,
               `signal` VARCHAR(10) NULL,
@@ -701,6 +815,7 @@ class MA5MA20StrategyRunner:
             "ret_20": "DOUBLE NULL",
             "limit_up_cnt_20": "DOUBLE NULL",
             "ma20_bias": "DOUBLE NULL",
+            "yearline_state": "VARCHAR(50) NULL",
             "risk_tag": "VARCHAR(255) NULL",
             "risk_note": "VARCHAR(255) NULL",
         }
@@ -743,6 +858,7 @@ class MA5MA20StrategyRunner:
               `kdj_d` DOUBLE NULL,
               `atr14` DOUBLE NULL,
               `stop_ref` DOUBLE NULL,
+              `yearline_state` VARCHAR(50) NULL,
               `risk_tag` VARCHAR(255) NULL,
               `risk_note` VARCHAR(255) NULL,
               `reason` VARCHAR(255) NULL,
@@ -755,6 +871,7 @@ class MA5MA20StrategyRunner:
 
     def _ensure_candidates_columns(self, table: str) -> None:
         extra_columns = {
+            "yearline_state": "VARCHAR(50) NULL",
             "risk_tag": "VARCHAR(255) NULL",
             "risk_note": "VARCHAR(255) NULL",
         }
@@ -793,7 +910,7 @@ class MA5MA20StrategyRunner:
               `date`,`code`,`close`,
               `ma5`,`ma20`,`ma60`,`ma250`,
               `vol_ratio`,`macd_hist`,`kdj_k`,`kdj_d`,`atr14`,`stop_ref`,
-              `risk_tag`,`risk_note`,
+              `yearline_state`,`risk_tag`,`risk_note`,
               `reason`
             FROM `{base}`
             WHERE `signal` = 'BUY'
@@ -855,6 +972,7 @@ class MA5MA20StrategyRunner:
             "ret_20",
             "limit_up_cnt_20",
             "ma20_bias",
+            "yearline_state",
             "risk_tag",
             "risk_note",
         ]
@@ -952,6 +1070,7 @@ class MA5MA20StrategyRunner:
             "kdj_d",
             "atr14",
             "stop_ref",
+            "yearline_state",
             "risk_tag",
             "risk_note",
             "reason",
