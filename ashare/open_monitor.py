@@ -37,6 +37,7 @@ from .baostock_core import BaostockDataFetcher
 from .baostock_session import BaostockSession
 from .config import get_section
 from .db import DatabaseConfig, MySQLWriter
+from .market_regime import MarketRegimeClassifier
 from .utils.logger import setup_logger
 
 
@@ -351,6 +352,7 @@ class MA5MA20OpenMonitorRunner:
         om_cfg = get_section("open_monitor") or {}
         threshold = _to_float(om_cfg.get("env_index_score_threshold"))
         self.env_index_score_threshold = threshold if threshold is not None else 2.0
+        self.market_regime = MarketRegimeClassifier()
 
     def _resolve_volume_ratio_threshold(self) -> float:
         strat = get_section("strategy_ma5_ma20_trend") or {}
@@ -930,6 +932,27 @@ class MA5MA20OpenMonitorRunner:
             except Exception as exc:  # noqa: BLE001
                 self.logger.warning("创建索引 %s 失败：%s", code_time_index, exc)
 
+    def _ensure_monitor_columns(self, table: str) -> None:
+        if not table or not self._table_exists(table):
+            return
+
+        extra_columns = {
+            "env_regime": "VARCHAR(32)",
+            "env_position_hint": "DOUBLE",
+            "risk_tag": "VARCHAR(255)",
+            "risk_note": "VARCHAR(255)",
+        }
+
+        with self.db_writer.engine.begin() as conn:
+            for col, ddl in extra_columns.items():
+                if self._column_exists(table, col):
+                    continue
+                try:
+                    conn.execute(text(f"ALTER TABLE `{table}` ADD COLUMN `{col}` {ddl}"))
+                    self.logger.info("表 %s 已新增列 %s", table, col)
+                except Exception as exc:  # noqa: BLE001
+                    self.logger.warning("为表 %s 添加列 %s 失败：%s", table, col, exc)
+
     def _load_existing_snapshot_keys(
         self, table: str, monitor_date: str, codes: List[str], dedupe_bucket: str
     ) -> set[tuple[str, str, str, str, str]]:
@@ -1029,6 +1052,20 @@ class MA5MA20OpenMonitorRunner:
             out[code] = (close - prev_close) / prev_close
 
         return out
+
+    def _get_table_columns(self, table: str) -> List[str]:
+        stmt = text(
+            """
+            SELECT COLUMN_NAME FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = :t
+            """
+        )
+        try:
+            with self.db_writer.engine.begin() as conn:
+                return pd.read_sql(stmt, conn, params={"t": table})["COLUMN_NAME"].tolist()
+        except Exception as exc:  # noqa: BLE001
+            self.logger.warning("无法获取 %s 列信息：%s", table, exc)
+            return []
 
     def _is_trading_day(self, date_str: str, latest_trade_date: str | None = None) -> bool:
         """粗略判断是否为交易日（优先用日线表，其次用工作日）。"""
@@ -1154,13 +1191,38 @@ class MA5MA20OpenMonitorRunner:
             "回看最近 %s 个交易日（最新=%s）BUY 信号：%s", lookback, latest_trade_date, signal_dates
         )
 
+        available_cols = set(self._get_table_columns(table))
+        base_cols = [
+            "date",
+            "code",
+            "close",
+            "ma5",
+            "ma20",
+            "ma60",
+            "ma250",
+            "vol_ratio",
+            "macd_hist",
+            "kdj_k",
+            "kdj_d",
+            "atr14",
+            "stop_ref",
+            "signal",
+            "reason",
+        ]
+        optional_cols = [
+            "ret_10",
+            "ret_20",
+            "limit_up_cnt_20",
+            "ma20_bias",
+            "risk_tag",
+            "risk_note",
+        ]
+        select_cols = base_cols + [c for c in optional_cols if c in available_cols]
+        col_sql = ",".join([f"`{c}`" for c in select_cols])
+
         stmt = text(
             f"""
-            SELECT
-              `date`,`code`,`close`,
-              `ma5`,`ma20`,`ma60`,`ma250`,
-              `vol_ratio`,`macd_hist`,`kdj_k`,`kdj_d`,`atr14`,`stop_ref`,
-              `signal`,`reason`
+            SELECT {col_sql}
             FROM `{table}`
             WHERE `date` IN :dates AND `signal` = 'BUY'
             """
@@ -1176,6 +1238,10 @@ class MA5MA20OpenMonitorRunner:
         if df.empty:
             self.logger.info("%s 内无 BUY 信号，跳过开盘监测。", signal_dates)
             return latest_trade_date, signal_dates, df
+
+        for col in optional_cols:
+            if col not in df.columns:
+                df[col] = None
 
         df["code"] = df["code"].astype(str)
         df["date_str"] = df["date"].astype(str).str[:10]
@@ -1345,7 +1411,7 @@ class MA5MA20OpenMonitorRunner:
 
     def _load_index_trend(self, latest_trade_date: str) -> dict[str, Any]:
         if not self.index_codes or not self._table_exists("history_index_daily_kline"):
-            return {"score": None, "detail": {}}
+            return {"score": None, "detail": {}, "regime": None, "position_hint": None}
 
         stmt = text(
             """
@@ -1362,43 +1428,14 @@ class MA5MA20OpenMonitorRunner:
                 )
         except Exception as exc:  # noqa: BLE001
             self.logger.debug("读取指数日线失败：%s", exc)
-            return {"score": None, "detail": {}}
+            return {"score": None, "detail": {}, "regime": None, "position_hint": None}
 
         if df.empty:
-            return {"score": None, "detail": {}}
+            return {"score": None, "detail": {}, "regime": None, "position_hint": None}
 
-        df["date"] = pd.to_datetime(df["date"], errors="coerce")
-        numeric_cols = ["close", "ma20", "ma60", "ma250"]
-        for col in numeric_cols:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-
-        detail: dict[str, dict[str, Any]] = {}
-        for code, group in df.groupby("code"):
-            grp = group.sort_values("date")
-            grp["ma20"] = grp["close"].rolling(20, min_periods=1).mean()
-            grp["ma60"] = grp["close"].rolling(60, min_periods=1).mean()
-            grp["ma250"] = grp["close"].rolling(250, min_periods=1).mean()
-            latest = grp.iloc[-1]
-            score = 0
-            for ma in ["ma20", "ma60", "ma250"]:
-                ma_val = latest.get(ma)
-                close_val = latest.get("close")
-                if ma_val is not None and close_val is not None and close_val > ma_val:
-                    score += 1
-            detail[code] = {
-                "close": latest.get("close"),
-                "ma20": latest.get("ma20"),
-                "ma60": latest.get("ma60"),
-                "ma250": latest.get("ma250"),
-                "score": score,
-            }
-
-        if not detail:
-            return {"score": None, "detail": {}}
-
-        avg_score = sum(v["score"] for v in detail.values()) / len(detail)
-        return {"score": avg_score, "detail": detail}
+        regime_result = self.market_regime.classify(df)
+        payload = regime_result.to_payload()
+        return payload
 
     def _build_environment_context(self, latest_trade_date: str) -> dict[str, Any]:
         index_trend = self._load_index_trend(latest_trade_date)
@@ -1423,7 +1460,12 @@ class MA5MA20OpenMonitorRunner:
                     if key_norm:
                         board_map[key_norm] = payload
 
-        return {"index": index_trend, "boards": board_map}
+        return {
+            "index": index_trend,
+            "boards": board_map,
+            "regime": index_trend.get("regime"),
+            "position_hint": index_trend.get("position_hint"),
+        }
 
     # -------------------------
     # Quote fetch
@@ -1674,6 +1716,10 @@ class MA5MA20OpenMonitorRunner:
                 merged = merged.merge(deduped[cols], on="code", how="left")
 
         board_map: dict[str, Any] = env_context.get("boards", {}) if isinstance(env_context, dict) else {}
+        env_regime = env_context.get("regime") if isinstance(env_context, dict) else None
+        env_position_hint = None
+        if isinstance(env_context, dict):
+            env_position_hint = _to_float(env_context.get("position_hint"))
         index_score = None
         if isinstance(env_context, dict):
             index_section = env_context.get("index", {}) if isinstance(env_context.get("index"), dict) else {}
@@ -1816,6 +1862,8 @@ class MA5MA20OpenMonitorRunner:
         signal_stop_refs: List[float | None] = []
         valid_days_list: List[int | None] = []
         env_index_scores: List[float | None] = []
+        env_regimes: List[str | None] = []
+        env_position_hints: List[float | None] = []
         board_statuses: List[str | None] = []
         board_ranks: List[float | None] = []
         board_chg_pcts: List[float | None] = []
@@ -1964,6 +2012,12 @@ class MA5MA20OpenMonitorRunner:
         for _, row in merged.iterrows():
             action = "EXECUTE"
             reason = "OK"
+            status = "ACTIVE"
+            status_reason = "健康满足"
+
+            risk_tag_raw = str(row.get("risk_tag") or "").strip()
+            risk_note = str(row.get("risk_note") or "").strip()
+            risk_tags_split = [t.strip() for t in risk_tag_raw.split("|") if t.strip()]
 
             open_px = row.get("open")
             latest_px = row.get("latest")
@@ -2051,9 +2105,6 @@ class MA5MA20OpenMonitorRunner:
             strength_trend = _classify_strength_trend(strength_score, prev_strength)
 
             valid_days = pullback_valid_days if self._is_pullback_signal(signal_reason) else cross_valid_days
-
-            status = "ACTIVE"
-            status_reason = "健康满足"
 
             if ma5 is not None and ma20 is not None and ma5 < ma20:
                 status = "INVALID"
@@ -2210,6 +2261,46 @@ class MA5MA20OpenMonitorRunner:
                 rank_display = f"{board_rank:.0f}" if board_rank is not None else "-"
                 reason = f"板块强势(rank={rank_display})，等待入场条件"
 
+            if "MANIA" in risk_tags_split:
+                action = "SKIP"
+                status = "INVALID"
+                status_reason = risk_note or "风险标签=MANIA：短期过热，默认不追"
+                reason = status_reason
+            elif risk_tags_split and action == "EXECUTE":
+                action = "WAIT"
+                status = "WAIT"
+                note_text = risk_note or "存在风险标签，建议谨慎"
+                reason = note_text
+                status_reason = note_text
+
+            if env_regime:
+                pos_hint_text = (
+                    f"（仓位建议 ≤{env_position_hint*100:.0f}%）"
+                    if env_position_hint is not None
+                    else ""
+                )
+                breakdown_reason = f"大盘结构破位，执行跳过{pos_hint_text}"
+                if env_regime == "BREAKDOWN":
+                    action = "SKIP"
+                    if status != "INVALID":
+                        status = "WAIT"
+                        status_reason = "市场环境 BREAKDOWN，暂不执行"
+                    if reason and reason != "OK":
+                        reason = breakdown_reason + "；" + reason
+                    else:
+                        reason = breakdown_reason
+                elif env_regime == "RISK_OFF":
+                    action = "WAIT"
+                    if status != "INVALID":
+                        status = "WAIT"
+                        status_reason = "市场环境 RISK_OFF，轻仓观望"
+                    if reason == "OK":
+                        reason = f"大盘偏弱{pos_hint_text}"
+                elif env_regime == "PULLBACK" and not risk_tags_split and reason == "OK":
+                    reason = f"大盘处于回踩阶段{pos_hint_text}"
+
+            env_regimes.append(env_regime)
+            env_position_hints.append(env_position_hint)
             env_index_scores.append(idx_score_float)
             board_statuses.append(board_status)
             board_ranks.append(board_rank)
@@ -2245,6 +2336,8 @@ class MA5MA20OpenMonitorRunner:
         merged["checked_at"] = checked_at_ts
         merged["dedupe_bucket"] = dedupe_bucket
         merged["env_index_score"] = env_index_scores
+        merged["env_regime"] = env_regimes
+        merged["env_position_hint"] = env_position_hints
         merged["board_status"] = board_statuses
         merged["board_rank"] = board_ranks
         merged["board_chg_pct"] = board_chg_pcts
@@ -2294,6 +2387,8 @@ class MA5MA20OpenMonitorRunner:
             "stop_ref",
             "signal_stop_ref",
             "env_index_score",
+            "env_regime",
+            "env_position_hint",
             "industry",
             "board_name",
             "board_code",
@@ -2304,6 +2399,8 @@ class MA5MA20OpenMonitorRunner:
             "strength_delta",
             "strength_trend",
             "strength_note",
+            "risk_tag",
+            "risk_note",
             "signal",
             "reason",
             "candidate_status",
@@ -2343,9 +2440,19 @@ class MA5MA20OpenMonitorRunner:
             self._calc_dedupe_bucket(dt.datetime.now())
         )
 
+        for col in ["risk_tag", "risk_note", "reason", "action_reason", "status_reason"]:
+            if col in df.columns:
+                df[col] = (
+                    df[col]
+                    .fillna("")
+                    .astype(str)
+                    .str.slice(0, 250)
+                )
+
         if self._table_exists(table):
             self._ensure_snapshot_schema(table)
             self._ensure_strength_schema(table)
+            self._ensure_monitor_columns(table)
 
         df["snapshot_hash"] = df.apply(lambda row: make_snapshot_hash(row.to_dict()), axis=1)
         df = df.drop_duplicates(
