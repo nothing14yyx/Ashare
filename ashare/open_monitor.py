@@ -363,6 +363,12 @@ class MA5MA20OpenMonitorRunner:
         om_cfg = get_section("open_monitor") or {}
         threshold = _to_float(om_cfg.get("env_index_score_threshold"))
         self.env_index_score_threshold = threshold if threshold is not None else 2.0
+        weekly_strength_threshold = _to_float(
+            om_cfg.get("weekly_soft_gate_strength_threshold")
+        )
+        self.weekly_soft_gate_strength_threshold = (
+            weekly_strength_threshold if weekly_strength_threshold is not None else 3.5
+        )
         self.market_regime = MarketRegimeClassifier()
         self.weekly_channel = WeeklyChannelClassifier(primary_code="sh.000001")
         self.weekly_plan_system = WeeklyPlanSystem()
@@ -1033,9 +1039,11 @@ class MA5MA20OpenMonitorRunner:
             "env_weekly_plan_b_then": "VARCHAR(64)",
             "env_weekly_plan_b_recover_if": "VARCHAR(128)",
             "env_weekly_plan_json": "TEXT",
+            "env_weekly_gate_action": "VARCHAR(16)",
             "risk_tag": "VARCHAR(255)",
             "risk_note": "VARCHAR(255)",
             "volume_unit": "VARCHAR(16)",
+            "entry_exposure_cap": "DOUBLE",
         }
 
         with self.db_writer.engine.begin() as conn:
@@ -2234,6 +2242,7 @@ class MA5MA20OpenMonitorRunner:
         stop_refs: List[float | None] = []
         signal_stop_refs: List[float | None] = []
         valid_days_list: List[int | None] = []
+        entry_exposure_caps: List[float | None] = []
         env_index_scores: List[float | None] = []
         env_regimes: List[str | None] = []
         env_position_hints: List[float | None] = []
@@ -2261,6 +2270,7 @@ class MA5MA20OpenMonitorRunner:
         env_weekly_plan_b_then_list: List[str | None] = []
         env_weekly_plan_b_recover_if_list: List[str | None] = []
         env_weekly_plan_json_list: List[str | None] = []
+        env_weekly_gate_action_list: List[str | None] = []
         board_statuses: List[str | None] = []
         board_ranks: List[float | None] = []
         board_chg_pcts: List[float | None] = []
@@ -2697,6 +2707,9 @@ class MA5MA20OpenMonitorRunner:
                 reason = note_text
                 status_reason = note_text
 
+            weekly_gate_action = None
+            entry_exposure_cap = env_weekly_plan_a_exposure_cap
+
             if env_regime:
                 pos_hint_text = (
                     f"（仓位建议 ≤{env_position_hint*100:.0f}%）"
@@ -2730,9 +2743,10 @@ class MA5MA20OpenMonitorRunner:
                 if env_weekly_plan_b:
                     plan_b_text = str(env_weekly_plan_b)
                     plan_tail = f"{plan_tail}；{plan_b_text}" if plan_tail else plan_b_text
+                exposure_cap_effective = entry_exposure_cap
                 exposure_hint = (
-                    f"（周线仓位≤{env_weekly_plan_a_exposure_cap*100:.0f}%）"
-                    if env_weekly_plan_a_exposure_cap is not None
+                    f"（周线仓位≤{exposure_cap_effective*100:.0f}%）"
+                    if exposure_cap_effective is not None
                     else ""
                 )
                 if not env_weekly_gating_enabled:
@@ -2745,9 +2759,61 @@ class MA5MA20OpenMonitorRunner:
                     if env_weekly_risk_level == "HIGH":
                         action = "WAIT"
                         status = "WAIT"
+                        weekly_gate_action = "WAIT"
                         append_note = "周线风险高：观望/防守"
                         status_reason = f"{status_reason}；{append_note}" if status_reason else append_note
                         reason = f"{reason}；{append_note}" if reason and reason != "OK" else append_note
+                    elif env_weekly_risk_level == "MEDIUM" and env_weekly_status == "FORMING":
+                        soft_note = "周线MEDIUM+FORMING → 软门控限仓"
+                        strong_enough = (
+                            strength_score is not None
+                            and strength_score >= self.weekly_soft_gate_strength_threshold
+                        ) or board_status == "strong"
+                        if strong_enough:
+                            action = "EXECUTE_SMALL"
+                            weekly_gate_action = "ALLOW_SMALL"
+                            entry_exposure_cap = (
+                                min(entry_exposure_cap, 0.2)
+                                if entry_exposure_cap is not None
+                                else 0.2
+                            )
+                            exposure_cap_effective = entry_exposure_cap
+                            exposure_hint = (
+                                f"（周线仓位≤{exposure_cap_effective*100:.0f}%）"
+                                if exposure_cap_effective is not None
+                                else ""
+                            )
+                            status_reason = (
+                                f"{status_reason}；{soft_note}"
+                                if status_reason
+                                else soft_note
+                            )
+                            reason = (
+                                f"{reason}；{soft_note}"
+                                if reason and reason != "OK"
+                                else soft_note
+                            )
+                            if plan_tail:
+                                combined = (
+                                    f"{reason}；{plan_tail}{exposure_hint}"
+                                    if reason and reason != "OK"
+                                    else f"{plan_tail}{exposure_hint}"
+                                )
+                                reason = combined[:255]
+                        else:
+                            action = "WAIT"
+                            status = "WAIT"
+                            weekly_gate_action = "WAIT"
+                            status_reason = (
+                                f"{status_reason}；{soft_note}"
+                                if status_reason
+                                else soft_note
+                            )
+                            reason = (
+                                f"{reason}；{soft_note}"
+                                if reason and reason != "OK"
+                                else soft_note
+                            )
                     elif env_weekly_risk_level == "MEDIUM":
                         if env_weekly_bias == "BEARISH" and env_weekly_status in {
                             "BREAKOUT_DOWN",
@@ -2756,6 +2822,7 @@ class MA5MA20OpenMonitorRunner:
                         }:
                             action = "WAIT"
                             status = "WAIT"
+                            weekly_gate_action = "WAIT"
                             append_note = "周线偏空/未修复，等待"
                             status_reason = (
                                 f"{status_reason}；{append_note}" if status_reason else append_note
@@ -2766,6 +2833,7 @@ class MA5MA20OpenMonitorRunner:
                                 else append_note
                             )
                         else:
+                            weekly_gate_action = "ALLOW"
                             if plan_tail:
                                 combined = (
                                     f"{reason}；{plan_tail}{exposure_hint}"
@@ -2774,6 +2842,7 @@ class MA5MA20OpenMonitorRunner:
                                 )
                                 reason = combined[:255]
                     elif env_weekly_risk_level == "LOW":
+                        weekly_gate_action = "ALLOW"
                         if plan_tail:
                             combined = (
                                 f"{reason}；{plan_tail}{exposure_hint}"
@@ -2781,6 +2850,9 @@ class MA5MA20OpenMonitorRunner:
                                 else f"{plan_tail}{exposure_hint}"
                             )
                             reason = combined[:255]
+
+                    if weekly_gate_action is None:
+                        weekly_gate_action = "ALLOW"
 
             env_regimes.append(env_regime)
             env_position_hints.append(env_position_hint)
@@ -2796,6 +2868,7 @@ class MA5MA20OpenMonitorRunner:
             strength_deltas.append(_to_float(strength_delta))
             strength_trends.append(strength_trend)
             strength_notes.append(strength_note or None)
+            entry_exposure_caps.append(entry_exposure_cap)
             used_ma5_list.append(_to_float(ma5))
             used_ma20_list.append(_to_float(ma20))
             used_ma60_list.append(_to_float(ma60))
@@ -2857,6 +2930,7 @@ class MA5MA20OpenMonitorRunner:
                 if env_weekly_plan_json is not None
                 else None
             )
+            env_weekly_gate_action_list.append(weekly_gate_action)
 
             actions.append(action)
             reasons.append(reason)
@@ -2876,6 +2950,7 @@ class MA5MA20OpenMonitorRunner:
         merged["stop_ref"] = stop_refs
         merged["signal_stop_ref"] = signal_stop_refs
         merged["valid_days"] = valid_days_list
+        merged["entry_exposure_cap"] = entry_exposure_caps
         merged["checked_at"] = checked_at_ts
         merged["dedupe_bucket"] = dedupe_bucket
         merged["env_index_score"] = env_index_scores
@@ -2905,6 +2980,7 @@ class MA5MA20OpenMonitorRunner:
         merged["env_weekly_plan_b_then"] = env_weekly_plan_b_then_list
         merged["env_weekly_plan_b_recover_if"] = env_weekly_plan_b_recover_if_list
         merged["env_weekly_plan_json"] = env_weekly_plan_json_list
+        merged["env_weekly_gate_action"] = env_weekly_gate_action_list
         merged["board_status"] = board_statuses
         merged["board_rank"] = board_ranks
         merged["board_chg_pct"] = board_chg_pcts
@@ -2954,6 +3030,7 @@ class MA5MA20OpenMonitorRunner:
             "atr14",
             "stop_ref",
             "signal_stop_ref",
+            "entry_exposure_cap",
             "env_index_score",
             "env_regime",
             "env_position_hint",
@@ -2981,6 +3058,7 @@ class MA5MA20OpenMonitorRunner:
             "env_weekly_plan_b_then",
             "env_weekly_plan_b_recover_if",
             "env_weekly_plan_json",
+            "env_weekly_gate_action",
             "industry",
             "board_name",
             "board_code",
