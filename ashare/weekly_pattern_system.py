@@ -93,6 +93,8 @@ class WeeklyPlanSystem:
         self.fractal_right = 2
         self.max_pivots = 8
         self.break_eps = 0.01
+        self.confirm_vol_ratio_threshold = 1.05
+        self.retest_tolerance = 0.01
 
     def _prepare_df(self, bars: List[Dict[str, Any]]) -> pd.DataFrame:
         df = pd.DataFrame(bars)
@@ -346,7 +348,9 @@ class WeeklyPlanSystem:
             description="形态识别完成，等待突破",
         )
 
-    def _detect_pattern(self, df: pd.DataFrame, weekly_closed: bool) -> PatternCandidate:
+    def _detect_pattern(
+        self, df: pd.DataFrame, weekly_closed: bool, slope_change: float | None = None
+    ) -> PatternCandidate:
         highs, lows = self._extract_pivots(df)
         base_candidate = self._detect_channel_triangle_wedge(df, highs, lows)
         candidates: List[PatternCandidate] = [base_candidate]
@@ -361,10 +365,14 @@ class WeeklyPlanSystem:
             candidates.append(hs_candidate)
         candidates = sorted(candidates, key=lambda c: c.score, reverse=True)
         top = candidates[0]
-        return self._apply_breakout_confirm(df, top, weekly_closed)
+        return self._apply_breakout_confirm(df, top, weekly_closed, slope_change)
 
     def _apply_breakout_confirm(
-        self, df: pd.DataFrame, candidate: PatternCandidate, weekly_closed: bool
+        self,
+        df: pd.DataFrame,
+        candidate: PatternCandidate,
+        weekly_closed: bool,
+        slope_change: float | None = None,
     ) -> PatternCandidate:
         last_idx = len(df) - 1
         last_close = float(df["close"].iloc[-1]) if not df.empty else None
@@ -409,11 +417,19 @@ class WeeklyPlanSystem:
         elif pd.notna(wk_vol_ratio) and wk_vol_ratio < 0.9:
             confirm_tags.append("VOL_WEAK")
 
+        confirm_signals = self._collect_confirm_signals(
+            df, key_levels, wk_vol_ratio, slope_change
+        )
+        confirm_tags.extend(confirm_signals)
+        confirmed = confirmed or bool(confirm_signals)
+
         if status in {"BREAKOUT_UP", "BREAKOUT_DOWN"} and confirmed:
             status = "CONFIRMED"
             structure_tags.append("CONFIRMED")
         if not weekly_closed:
             confirm_tags.append("IF_CURRENT_WEEK_UNCLOSED")
+
+        confirm_tags = list(dict.fromkeys(confirm_tags))
 
         score = candidate.score
         if status == "CONFIRMED":
@@ -431,6 +447,36 @@ class WeeklyPlanSystem:
             confirm_tags=confirm_tags,
             description=candidate.description,
         )
+
+    def _collect_confirm_signals(
+        self,
+        df: pd.DataFrame,
+        key_levels: Dict[str, float],
+        wk_vol_ratio: float | None,
+        slope_change: float | None = None,
+    ) -> List[str]:
+        confirm_tags: List[str] = []
+        vol_threshold = self.confirm_vol_ratio_threshold
+        if pd.notna(wk_vol_ratio) and wk_vol_ratio >= vol_threshold:
+            confirm_tags.append("VOL_CONFIRM")
+
+        obv_slope = float(df["obv_slope_13"].iloc[-1]) if not df.empty else None
+        vol_not_weak = pd.isna(wk_vol_ratio) or wk_vol_ratio >= 0.9
+        if obv_slope is not None and not pd.isna(obv_slope) and obv_slope > 0:
+            confirm_tags.append("OBV_SLOPE_UP")
+        elif slope_change is not None and not pd.isna(slope_change) and slope_change > 0 and vol_not_weak:
+            confirm_tags.append("MONEY_FLOW_TURNING_UP")
+
+        upper = key_levels.get("upper")
+        if upper is not None and len(df) >= 2:
+            recent_low = df["low"].iloc[-2:].min()
+            last_close = df["close"].iloc[-1]
+            if pd.notna(recent_low) and pd.notna(last_close):
+                hold_threshold = upper * (1 - self.retest_tolerance)
+                if last_close > upper * (1 + self.break_eps * 0.5) and recent_low >= hold_threshold:
+                    confirm_tags.append("RETEST_HELD")
+
+        return confirm_tags
 
     def _risk(self, bias: str, status: str, confirmed: bool) -> Tuple[float, str]:
         score = 50.0
@@ -587,9 +633,24 @@ class WeeklyPlanSystem:
         weekly_closed = bool(weekly_payload.get("weekly_asof_week_closed", True))
         current_week_closed = bool(weekly_payload.get("weekly_current_week_closed", False))
 
-        candidate = self._detect_pattern(df, weekly_closed)
+        slope_delta = weekly_payload.get("slope_change_4w")
+        if slope_delta is None and isinstance(weekly_payload.get("context", {}), dict):
+            slope_delta = weekly_payload.get("context", {}).get("slope_change_4w")
 
-        confirmed = candidate.status in {"CONFIRMED"}
+        candidate = self._detect_pattern(df, weekly_closed, slope_delta)
+
+        confirm_signal_set = {
+            t
+            for t in candidate.confirm_tags
+            if t
+            in {
+                "VOL_CONFIRM",
+                "OBV_SLOPE_UP",
+                "MONEY_FLOW_TURNING_UP",
+                "RETEST_HELD",
+            }
+        }
+        confirmed = candidate.status in {"CONFIRMED"} or bool(confirm_signal_set)
         risk_score, risk_level = self._risk(candidate.bias, candidate.status, confirmed)
 
         key_levels = dict(candidate.key_levels)
@@ -647,9 +708,6 @@ class WeeklyPlanSystem:
             if pd.notna(df["obv_slope_13"].iloc[-1])
             else None,
         }
-        slope_delta = weekly_payload.get("slope_change_4w")
-        if slope_delta is None and isinstance(weekly_payload.get("context", {}), dict):
-            slope_delta = weekly_payload.get("context", {}).get("slope_change_4w")
         if slope_delta is not None:
             money_proxy["slope_change_4w"] = slope_delta
 
