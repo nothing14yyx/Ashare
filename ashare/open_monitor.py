@@ -69,6 +69,8 @@ SNAPSHOT_HASH_EXCLUDE = {
     "used_macd_hist",
 }
 
+VOLUME_UNIT_SHARES = "股"
+
 
 def _normalize_snapshot_value(value: Any) -> Any:  # noqa: ANN401
     if value is None:
@@ -946,6 +948,7 @@ class MA5MA20OpenMonitorRunner:
             "env_position_hint": "DOUBLE",
             "risk_tag": "VARCHAR(255)",
             "risk_note": "VARCHAR(255)",
+            "volume_unit": "VARCHAR(16)",
         }
 
         with self.db_writer.engine.begin() as conn:
@@ -1635,7 +1638,9 @@ class MA5MA20OpenMonitorRunner:
             low = _to_float(r.get("f16"))
             open_px = _to_float(r.get("f17"))
             prev_close = _to_float(r.get("f18"))
+            # Eastmoney 成交量单位为“手”，统一转换为“股”口径
             volume = _to_float(r.get("f5"))
+            volume = volume * 100 if volume is not None else None
             amount = _to_float(r.get("f6"))
 
             code_guess = _to_baostock_code("auto", symbol)
@@ -1696,6 +1701,7 @@ class MA5MA20OpenMonitorRunner:
             out["pct_change"] = None
             out["volume"] = None
             out["amount"] = None
+            out["volume_unit"] = VOLUME_UNIT_SHARES
             out["avg_volume_20"] = None
             out["intraday_vol_ratio"] = None
             out["gap_pct"] = None
@@ -2350,6 +2356,7 @@ class MA5MA20OpenMonitorRunner:
 
         merged["monitor_date"] = dt.date.today().isoformat()
         merged["latest_trade_date"] = latest_trade_date
+        merged["volume_unit"] = VOLUME_UNIT_SHARES
         merged["action"] = actions
         merged["action_reason"] = reasons
         merged["candidate_status"] = statuses
@@ -2392,6 +2399,7 @@ class MA5MA20OpenMonitorRunner:
             "low",
             "volume",
             "amount",
+            "volume_unit",
             "avg_volume_20",
             "intraday_vol_ratio",
             "ma5",
