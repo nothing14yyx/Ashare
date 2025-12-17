@@ -613,15 +613,17 @@ class WeeklyPlanSystem:
                 key_parts.append(f"{label}={val:.2f}")
         key_levels_str = ";".join(key_parts)[:255] if key_parts else None
 
-        plan_a,
-        plan_b,
-        plan_a_if,
-        plan_a_then,
-        plan_a_confirm,
-        exposure_cap,
-        plan_b_if,
-        plan_b_then,
-        plan_b_recover = self._plan_texts(
+        (
+            plan_a,
+            plan_b,
+            plan_a_if,
+            plan_a_then,
+            plan_a_confirm,
+            exposure_cap,
+            plan_b_if,
+            plan_b_then,
+            plan_b_recover,
+        ) = self._plan_texts(
             f"{candidate.scene}_{candidate.status}",
             candidate.bias,
             candidate.status,
