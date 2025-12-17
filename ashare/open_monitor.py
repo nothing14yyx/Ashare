@@ -38,6 +38,7 @@ from .baostock_session import BaostockSession
 from .config import get_section
 from .db import DatabaseConfig, MySQLWriter
 from .market_regime import MarketRegimeClassifier
+from .weekly_channel_regime import WeeklyChannelClassifier
 from .utils.logger import setup_logger
 
 
@@ -355,6 +356,7 @@ class MA5MA20OpenMonitorRunner:
         threshold = _to_float(om_cfg.get("env_index_score_threshold"))
         self.env_index_score_threshold = threshold if threshold is not None else 2.0
         self.market_regime = MarketRegimeClassifier()
+        self.weekly_channel = WeeklyChannelClassifier(primary_code="sh.000001")
 
     def _resolve_volume_ratio_threshold(self) -> float:
         strat = get_section("strategy_ma5_ma20_trend") or {}
@@ -946,6 +948,9 @@ class MA5MA20OpenMonitorRunner:
         extra_columns = {
             "env_regime": "VARCHAR(32)",
             "env_position_hint": "DOUBLE",
+            "env_weekly_state": "VARCHAR(32)",
+            "env_weekly_position_hint": "DOUBLE",
+            "env_weekly_note": "VARCHAR(255)",
             "risk_tag": "VARCHAR(255)",
             "risk_note": "VARCHAR(255)",
             "volume_unit": "VARCHAR(16)",
@@ -1450,8 +1455,41 @@ class MA5MA20OpenMonitorRunner:
         payload = regime_result.to_payload()
         return payload
 
+    def _load_index_weekly_channel(self, latest_trade_date: str) -> dict[str, Any]:
+        """加载指数周线通道情景（从指数日线聚合为周线计算）。"""
+
+        if not self.index_codes or not self._table_exists("history_index_daily_kline"):
+            return {"state": None, "position_hint": None, "detail": {}, "primary_code": None}
+
+        stmt = (
+            text(
+                """
+                SELECT `code`, `date`, `open`, `high`, `low`, `close`, `volume`, `amount`
+                FROM history_index_daily_kline
+                WHERE `code` IN :codes AND `date` <= :d
+                ORDER BY `code`, `date`
+                """
+            )
+            .bindparams(bindparam("codes", expanding=True))
+        )
+        try:
+            with self.db_writer.engine.begin() as conn:
+                df = pd.read_sql_query(
+                    stmt, conn, params={"codes": self.index_codes, "d": latest_trade_date}
+                )
+        except Exception as exc:  # noqa: BLE001
+            self.logger.debug("读取指数日线用于周线通道失败：%s", exc)
+            return {"state": None, "position_hint": None, "detail": {}, "primary_code": None}
+
+        if df.empty:
+            return {"state": None, "position_hint": None, "detail": {}, "primary_code": None}
+
+        result = self.weekly_channel.classify(df)
+        return result.to_payload()
+
     def _build_environment_context(self, latest_trade_date: str) -> dict[str, Any]:
         index_trend = self._load_index_trend(latest_trade_date)
+        weekly_channel = self._load_index_weekly_channel(latest_trade_date)
         board_strength = self._load_board_spot_strength()
         board_map: dict[str, Any] = {}
         if not board_strength.empty and "board_name" in board_strength.columns:
@@ -1475,9 +1513,13 @@ class MA5MA20OpenMonitorRunner:
 
         env_context = {
             "index": index_trend,
+            "weekly": weekly_channel,
             "boards": board_map,
             "regime": index_trend.get("regime"),
             "position_hint": index_trend.get("position_hint"),
+            "weekly_state": weekly_channel.get("state") if isinstance(weekly_channel, dict) else None,
+            "weekly_position_hint": weekly_channel.get("position_hint") if isinstance(weekly_channel, dict) else None,
+            "weekly_note": weekly_channel.get("note") if isinstance(weekly_channel, dict) else None,
         }
 
         for key in [
@@ -1750,6 +1792,14 @@ class MA5MA20OpenMonitorRunner:
         env_position_hint = None
         if isinstance(env_context, dict):
             env_position_hint = _to_float(env_context.get("position_hint"))
+
+        env_weekly_state = None
+        env_weekly_position_hint = None
+        env_weekly_note = None
+        if isinstance(env_context, dict):
+            env_weekly_state = env_context.get("weekly_state")
+            env_weekly_position_hint = _to_float(env_context.get("weekly_position_hint"))
+            env_weekly_note = env_context.get("weekly_note")
         index_score = None
         if isinstance(env_context, dict):
             index_section = env_context.get("index", {}) if isinstance(env_context.get("index"), dict) else {}
@@ -1894,6 +1944,9 @@ class MA5MA20OpenMonitorRunner:
         env_index_scores: List[float | None] = []
         env_regimes: List[str | None] = []
         env_position_hints: List[float | None] = []
+        env_weekly_states: List[str | None] = []
+        env_weekly_position_hints: List[float | None] = []
+        env_weekly_notes: List[str | None] = []
         board_statuses: List[str | None] = []
         board_ranks: List[float | None] = []
         board_chg_pcts: List[float | None] = []
@@ -2359,6 +2412,9 @@ class MA5MA20OpenMonitorRunner:
             env_regimes.append(env_regime)
             env_position_hints.append(env_position_hint)
             env_index_scores.append(idx_score_float)
+            env_weekly_states.append(str(env_weekly_state) if env_weekly_state is not None else None)
+            env_weekly_position_hints.append(env_weekly_position_hint)
+            env_weekly_notes.append(str(env_weekly_note) if env_weekly_note is not None else None)
             board_statuses.append(board_status)
             board_ranks.append(board_rank)
             board_chg_pcts.append(board_chg)
@@ -2396,6 +2452,9 @@ class MA5MA20OpenMonitorRunner:
         merged["env_index_score"] = env_index_scores
         merged["env_regime"] = env_regimes
         merged["env_position_hint"] = env_position_hints
+        merged["env_weekly_state"] = env_weekly_states
+        merged["env_weekly_position_hint"] = env_weekly_position_hints
+        merged["env_weekly_note"] = env_weekly_notes
         merged["board_status"] = board_statuses
         merged["board_rank"] = board_ranks
         merged["board_chg_pct"] = board_chg_pcts
@@ -2448,6 +2507,9 @@ class MA5MA20OpenMonitorRunner:
             "env_index_score",
             "env_regime",
             "env_position_hint",
+            "env_weekly_state",
+            "env_weekly_position_hint",
+            "env_weekly_note",
             "industry",
             "board_name",
             "board_code",
