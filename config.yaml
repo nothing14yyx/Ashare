@@ -43,7 +43,7 @@ app:
     - sh.000905
     - sz.399001
     - sz.399006
-  index_history_days: 400
+  index_history_days: 900
 
   # 是否创建/更新股票-行业维表（基于 query_stock_industry）
   build_stock_industry_dim: true

@@ -166,11 +166,15 @@ class WeeklyChannelClassifier:
         return abs(float(x) - float(y)) / abs(float(y)) <= float(eps)
 
     def _classify_one(self, wk: pd.DataFrame) -> Dict[str, Any]:
-        wk = wk.copy()
+        # 分组后的 wk 可能继承了全表的原始 index（不是从 0 开始的连续 RangeIndex）
+        # 若直接 concat(lrc.reset_index(drop=True)) 会发生 index 对齐错位，导致出现
+        # close/week_end 为 None 但通道列有值的“幽灵行”。
+        wk = wk.copy().reset_index(drop=True)
         wk["ma30"] = _sma(wk["close"], self.ma_fast)
         wk["ma60"] = _sma(wk["close"], self.ma_slow)
         lrc = _linear_regression_channel(wk["close"], length=self.lrc_length, dev=self.lrc_dev)
-        wk = pd.concat([wk, lrc.reset_index(drop=True)], axis=1)
+        # wk 已 reset_index(drop=True)，lrc 的 index 与 wk 完全一致，直接 concat 即可
+        wk = pd.concat([wk, lrc], axis=1)
 
         last = wk.iloc[-1]
         close = float(last.get("close")) if pd.notna(last.get("close")) else None
@@ -248,7 +252,7 @@ class WeeklyChannelClassifier:
 
         detail: Dict[str, Dict[str, Any]] = {}
         for code, grp in wk.groupby("code", sort=False):
-            grp = grp.sort_values("week_end")
+            grp = grp.sort_values("week_end").reset_index(drop=True)
             if len(grp) < max(self.ma_slow, self.lrc_length):
                 # 数据不足时仍输出最新值，但 state/通道可能为 None
                 payload = self._classify_one(grp)
