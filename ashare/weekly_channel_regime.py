@@ -329,6 +329,27 @@ class WeeklyChannelClassifier:
             primary = sorted(detail.keys())[0]
         primary_payload = detail.get(primary, {}) if detail else {}
 
+        primary_weekly_bars: list[dict[str, Any]] = []
+        if not wk.empty and primary:
+            primary_df = wk[wk["code"] == primary].sort_values("week_end").tail(120)
+            if not primary_df.empty:
+                for _, row in primary_df.iterrows():
+                    try:
+                        week_end = pd.to_datetime(row.get("week_end")).date().isoformat()
+                    except Exception:
+                        week_end = str(row.get("week_end"))[:10]
+                    primary_weekly_bars.append(
+                        {
+                            "week_end": week_end,
+                            "open": float(row.get("open")) if pd.notna(row.get("open")) else None,
+                            "high": float(row.get("high")) if pd.notna(row.get("high")) else None,
+                            "low": float(row.get("low")) if pd.notna(row.get("low")) else None,
+                            "close": float(row.get("close")) if pd.notna(row.get("close")) else None,
+                            "volume": float(row.get("volume")) if pd.notna(row.get("volume")) else None,
+                            "amount": float(row.get("amount")) if pd.notna(row.get("amount")) else None,
+                        }
+                    )
+
         return WeeklyChannelResult(
             state=primary_payload.get("state"),
             position_hint=primary_payload.get("position_hint"),
@@ -340,5 +361,6 @@ class WeeklyChannelClassifier:
                 "note": primary_payload.get("note"),
                 "wk_vol_ratio_20": primary_payload.get("wk_vol_ratio_20"),
                 "slope_change_4w": primary_payload.get("slope_change_4w"),
+                "primary_weekly_bars": primary_weekly_bars,
             },
         )

@@ -39,6 +39,7 @@ from .config import get_section
 from .db import DatabaseConfig, MySQLWriter
 from .market_regime import MarketRegimeClassifier
 from .weekly_channel_regime import WeeklyChannelClassifier
+from .weekly_pattern_system import WeeklyPlanSystem
 from .utils.logger import setup_logger
 
 
@@ -364,6 +365,7 @@ class MA5MA20OpenMonitorRunner:
         self.env_index_score_threshold = threshold if threshold is not None else 2.0
         self.market_regime = MarketRegimeClassifier()
         self.weekly_channel = WeeklyChannelClassifier(primary_code="sh.000001")
+        self.weekly_plan_system = WeeklyPlanSystem()
 
     def _resolve_latest_closed_week_end(self, latest_trade_date: str) -> tuple[str, bool]:
         """确定最近一个已收盘的周末交易日（周线确认）。"""
@@ -1030,6 +1032,7 @@ class MA5MA20OpenMonitorRunner:
             "env_weekly_plan_b_if": "VARCHAR(255)",
             "env_weekly_plan_b_then": "VARCHAR(64)",
             "env_weekly_plan_b_recover_if": "VARCHAR(128)",
+            "env_weekly_plan_json": "TEXT",
             "risk_tag": "VARCHAR(255)",
             "risk_note": "VARCHAR(255)",
             "volume_unit": "VARCHAR(16)",
@@ -1601,83 +1604,29 @@ class MA5MA20OpenMonitorRunner:
     def _build_weekly_scenario(
         self, weekly_payload: dict[str, Any], index_trend: dict[str, Any] | None = None
     ) -> dict[str, Any]:
-        def _clip(text: str, limit: int = 255) -> str:
-            normalized = " ".join(str(text or "").split())
+        def _clip(text: str | None, limit: int = 255) -> str | None:
+            if text is None:
+                return None
+            normalized = " ".join(str(text).split())
             return normalized[:limit]
-
-        def _fmt_level(label: str, val: float | None) -> str:
-            if val is None:
-                return ""
-            return f"{label}{val:.2f}"
-
-        def _pick_levels(
-            structure_tags: list[str], position_tags: list[str], levels: dict[str, Any]
-        ) -> str:
-            candidates: list[str] = []
-            upper_val = _to_float(levels.get("upper")) if isinstance(levels, dict) else None
-            lower_val = _to_float(levels.get("lower")) if isinstance(levels, dict) else None
-            ma_fast_val = None
-            ma_slow_val = None
-            if isinstance(levels, dict):
-                ma_fast_val = _to_float(levels.get(f"ma{ma_fast}"))
-                if ma_fast_val is None:
-                    ma_fast_val = _to_float(levels.get("ma30"))
-                ma_slow_val = _to_float(levels.get(f"ma{ma_slow}"))
-                if ma_slow_val is None:
-                    ma_slow_val = _to_float(levels.get("ma60"))
-
-            struct_set = set(structure_tags)
-            pos_set = set(position_tags)
-            if "BREAKOUT_UP" in struct_set or "AT_UPPER_RAIL" in struct_set:
-                if upper_val is not None:
-                    candidates.append(_fmt_level("上轨", upper_val))
-            if "BREAKDOWN_DOWN" in struct_set or "AT_LOWER_RAIL" in struct_set:
-                if lower_val is not None:
-                    candidates.append(_fmt_level("下轨", lower_val))
-            if "SUPPORT_MA30_ZONE" in pos_set and ma_fast_val is not None:
-                candidates.append(_fmt_level(f"MA{ma_fast}", ma_fast_val))
-            if "SUPPORT_MA60_ZONE" in pos_set and ma_slow_val is not None:
-                candidates.append(_fmt_level(f"MA{ma_slow}", ma_slow_val))
-            if not candidates and ma_fast_val is not None:
-                candidates.append(_fmt_level(f"MA{ma_fast}", ma_fast_val))
-            if not candidates and ma_slow_val is not None:
-                candidates.append(_fmt_level(f"MA{ma_slow}", ma_slow_val))
-
-            if not candidates:
-                return ""
-            return "关键位:" + "/".join([c for c in candidates if c])
-
-        def _money_hint(money_proxy: dict[str, Any]) -> str:
-            if not isinstance(money_proxy, dict):
-                return ""
-            vol_ratio = _to_float(money_proxy.get("vol_ratio_20"))
-            slope_delta = _to_float(money_proxy.get("slope_change_4w"))
-            hints: list[str] = []
-            if vol_ratio is not None:
-                hints.append(f"周量比≈{vol_ratio:.2f}")
-            if slope_delta is not None:
-                hints.append(f"斜率变动≈{slope_delta:+.4f}")
-            if not hints:
-                return ""
-            return "；".join(hints[:2])
 
         scenario: dict[str, Any] = {
             "weekly_asof_trade_date": None,
             "weekly_week_closed": False,
             "weekly_current_week_closed": False,
-            "weekly_gating_enabled": True,
+            "weekly_gating_enabled": False,
             "weekly_structure_tags": [],
-            "weekly_position_tags": [],
-            "weekly_phase_tags": [],
             "weekly_confirm_tags": [],
-            "weekly_risk_score": 0.0,
-            "weekly_risk_level": "MEDIUM",
-            "weekly_confirm": False,
+            "weekly_risk_score": None,
+            "weekly_risk_level": "UNKNOWN",
+            "weekly_confirm": None,
             "weekly_key_levels": {},
             "weekly_money_proxy": {},
-            "weekly_plan_a": "",
-            "weekly_plan_b": "",
+            "weekly_plan_a": None,
+            "weekly_plan_b": None,
             "weekly_scene_code": None,
+            "weekly_bias": "NEUTRAL",
+            "weekly_status": "FORMING",
             "weekly_key_levels_str": None,
             "weekly_plan_a_if": None,
             "weekly_plan_a_then": None,
@@ -1686,350 +1635,49 @@ class MA5MA20OpenMonitorRunner:
             "weekly_plan_b_if": None,
             "weekly_plan_b_then": None,
             "weekly_plan_b_recover_if": None,
+            "weekly_plan_json": None,
         }
 
         if not isinstance(weekly_payload, dict):
-            scenario["weekly_gating_enabled"] = False
-            scenario["weekly_risk_level"] = "UNKNOWN"
-            scenario["weekly_risk_score"] = None
-            scenario["weekly_confirm"] = None
-            scenario["weekly_plan_a"] = _clip(
-                "周线数据不足/通道未成型：暂不启用周线过滤，按日线信号执行，仓位从轻。"
-            )
-            scenario["weekly_plan_b"] = _clip(
-                "等待周线通道/均线条件补全后再启用推演过滤。"
-            )
+            scenario["weekly_plan_a"] = "周线数据缺失，轻仓观望"
+            scenario["weekly_plan_b"] = "周线数据缺失，轻仓观望"
             return scenario
 
-        primary_code = weekly_payload.get("primary_code")
-        detail = weekly_payload.get("detail", {}) if isinstance(weekly_payload.get("detail"), dict) else {}
-        primary = detail.get(primary_code, {}) if primary_code else {}
+        plan = self.weekly_plan_system.build(weekly_payload, index_trend or {})
 
-        week_end = weekly_payload.get("weekly_asof_trade_date") or weekly_payload.get("week_end")
-        week_closed_asof = bool(weekly_payload.get("weekly_asof_week_closed", bool(week_end)))
-        current_week_closed = bool(weekly_payload.get("weekly_current_week_closed", False))
-        scenario["weekly_asof_trade_date"] = week_end
-        scenario["weekly_week_closed"] = week_closed_asof
-        scenario["weekly_current_week_closed"] = current_week_closed
+        scenario.update(plan)
+        scenario["weekly_asof_trade_date"] = plan.get("weekly_asof_trade_date")
+        scenario["weekly_week_closed"] = plan.get("weekly_week_closed", False)
+        scenario["weekly_current_week_closed"] = plan.get("weekly_current_week_closed", False)
+        scenario["weekly_gating_enabled"] = bool(plan.get("weekly_gating_enabled", False))
+        scenario["weekly_risk_score"] = _to_float(plan.get("weekly_risk_score"))
+        scenario["weekly_risk_level"] = plan.get("weekly_risk_level") or "UNKNOWN"
+        scenario["weekly_confirm"] = plan.get("weekly_confirm")
+        scenario["weekly_key_levels"] = plan.get("weekly_key_levels", {})
+        scenario["weekly_key_levels_str"] = _clip(plan.get("weekly_key_levels_str"), 255)
+        scenario["weekly_plan_a"] = _clip(plan.get("weekly_plan_a"), 255)
+        scenario["weekly_plan_b"] = _clip(plan.get("weekly_plan_b"), 255)
+        scenario["weekly_plan_a_if"] = _clip(plan.get("weekly_plan_a_if"), 255)
+        scenario["weekly_plan_a_then"] = _clip(plan.get("weekly_plan_a_then"), 64)
+        scenario["weekly_plan_a_confirm"] = _clip(plan.get("weekly_plan_a_confirm"), 128)
+        scenario["weekly_plan_a_exposure_cap"] = _to_float(plan.get("weekly_plan_a_exposure_cap"))
+        scenario["weekly_plan_b_if"] = _clip(plan.get("weekly_plan_b_if"), 255)
+        scenario["weekly_plan_b_then"] = _clip(plan.get("weekly_plan_b_then"), 64)
+        scenario["weekly_plan_b_recover_if"] = _clip(plan.get("weekly_plan_b_recover_if"), 128)
+        scenario["weekly_plan_json"] = _clip(plan.get("weekly_plan_json"), 2000)
 
-        close = _to_float(primary.get("close"))
-        high = _to_float(primary.get("high"))
-        low = _to_float(primary.get("low"))
-        upper = _to_float(primary.get("chan_upper"))
-        lower = _to_float(primary.get("chan_lower"))
-        ma30 = _to_float(primary.get("ma30"))
-        ma60 = _to_float(primary.get("ma60"))
-        channel_dir = str(primary.get("channel_dir") or "").upper() if primary.get("channel_dir") else None
-        prev_week_high = _to_float(primary.get("prev_high"))
-        wk_vol_ratio_20 = _to_float(primary.get("wk_vol_ratio_20"))
-        slope_change_4w = _to_float(primary.get("slope_change_4w"))
-        wk_volume = _to_float(primary.get("wk_volume"))
-        wk_amount = _to_float(primary.get("wk_amount"))
-        wk_vol_ma20 = _to_float(primary.get("wk_vol_ma20"))
-
-        pos_hint = _to_float(weekly_payload.get("position_hint"))
-        if pos_hint is None:
-            pos_hint = _to_float(primary.get("position_hint"))
-
-        touch_eps = getattr(self.weekly_channel, "touch_chan_eps", 0.005) or 0.005
-        near_ma_eps = getattr(self.weekly_channel, "near_ma_eps", 0.01) or 0.01
-        ma_fast = getattr(self.weekly_channel, "ma_fast", 30) or 30
-        ma_slow = getattr(self.weekly_channel, "ma_slow", 60) or 60
-
-        structure_tags: list[str] = []
-        position_tags: list[str] = []
-        phase_tags: list[str] = []
-        confirm_tags: list[str] = []
-
-        if wk_vol_ratio_20 is not None:
-            scenario["weekly_money_proxy"]["vol_ratio_20"] = wk_vol_ratio_20
-        if slope_change_4w is not None:
-            scenario["weekly_money_proxy"]["slope_change_4w"] = slope_change_4w
-        if wk_volume is not None:
-            scenario["weekly_money_proxy"]["wk_volume"] = wk_volume
-        if wk_amount is not None:
-            scenario["weekly_money_proxy"]["wk_amount"] = wk_amount
-        if wk_vol_ma20 is not None:
-            scenario["weekly_money_proxy"]["wk_vol_ma20"] = wk_vol_ma20
-
-        data_incomplete = close is None or upper is None or lower is None
-
-        if data_incomplete:
-            structure_tags.append("DATA_INCOMPLETE")
-
-        if channel_dir:
-            structure_tags.append(f"CHANNEL_{channel_dir}")
-
-        if close is not None and upper is not None and lower is not None:
-            if close > upper:
-                structure_tags.append("BREAKOUT_UP")
-            elif close < lower:
-                structure_tags.append("BREAKDOWN_DOWN")
-            else:
-                structure_tags.append("INSIDE_CHANNEL")
-
-        if low is not None and lower is not None and lower > 0:
-            if low <= lower * (1.0 + touch_eps):
-                structure_tags.append("AT_LOWER_RAIL")
-
-        if high is not None and upper is not None and upper > 0:
-            if high >= upper * (1.0 - touch_eps):
-                structure_tags.append("AT_UPPER_RAIL")
-
-        def _near_ma(val: float | None, ma: float | None, low_px: float | None) -> bool:
-            if ma is None or ma == 0:
-                return False
-            if val is not None and abs(val - ma) / abs(ma) <= near_ma_eps:
-                return True
-            if low_px is not None and low_px <= ma * (1.0 + near_ma_eps):
-                return True
-            return False
-
-        near_ma30 = _near_ma(close, ma30, low)
-        near_ma60 = _near_ma(close, ma60, low)
-
-        if "AT_LOWER_RAIL" in structure_tags and near_ma30:
-            position_tags.append("SUPPORT_MA30_ZONE")
-        if near_ma60:
-            position_tags.append("SUPPORT_MA60_ZONE")
-        if "AT_UPPER_RAIL" in structure_tags:
-            position_tags.append("UPPER_PRESSURE")
-
-        phase_determined = False
-        if channel_dir == "DOWN" and slope_change_4w is not None and slope_change_4w > 0:
-            if "SUPPORT_MA60_ZONE" in position_tags or "AT_LOWER_RAIL" in structure_tags:
-                phase_tags.extend(["IMPULSE_DOWN_LATE", "REVERSAL_RISK_HINT"])
-                phase_determined = True
-        if not phase_determined and channel_dir == "DOWN" and ma30 is not None and close is not None:
-            if close < ma30 and (slope_change_4w is None or slope_change_4w <= 0):
-                phase_tags.append("IMPULSE_DOWN_EARLY")
-                phase_determined = True
-        if not phase_determined and "BREAKOUT_UP" in structure_tags and channel_dir == "DOWN":
-            phase_tags.append("REBOUND_B_START_HINT")
-            phase_determined = True
-        if not phase_determined and channel_dir == "UP" and "AT_LOWER_RAIL" in structure_tags:
-            phase_tags.append("UPTREND_PULLBACK_BUY_ZONE_HINT")
-            phase_determined = True
-        if not phase_tags:
-            phase_tags.append("PHASE_UNKNOWN")
-
-        if wk_vol_ratio_20 is not None:
-            if wk_vol_ratio_20 >= 1.1:
-                confirm_tags.append("VOL_CONFIRM")
-            elif wk_vol_ratio_20 <= 0.9:
-                confirm_tags.append("VOL_WEAK")
-
-        if "BREAKOUT_UP" in structure_tags and prev_week_high is not None and close is not None:
-            if close >= prev_week_high:
-                confirm_tags.append("FOLLOW_THROUGH_OK")
-            else:
-                confirm_tags.append("FOLLOW_THROUGH_WEAK")
-        elif "BREAKOUT_UP" in structure_tags and high is not None and upper is not None and close is not None:
-            if high >= upper * (1.0 - touch_eps) and close < upper:
-                confirm_tags.append("FOLLOW_THROUGH_WEAK")
-
-        scenario["weekly_structure_tags"] = structure_tags
-        scenario["weekly_position_tags"] = position_tags
-        scenario["weekly_phase_tags"] = phase_tags
-        scenario["weekly_confirm_tags"] = confirm_tags
-
-        gating_enabled = not data_incomplete and close is not None and upper is not None and lower is not None
-        scenario["weekly_gating_enabled"] = gating_enabled
-
-        risk_level = "UNKNOWN"
-        risk_score = None
-
-        if gating_enabled:
-            risk_score = 0.0
-            risk_score += 45 if "BREAKDOWN_DOWN" in structure_tags else 0
-            risk_score += 25 if "SUPPORT_MA60_ZONE" in position_tags else 0
-            risk_score += 15 if "AT_LOWER_RAIL" in structure_tags else 0
-            risk_score += 10 if "VOL_WEAK" in confirm_tags else 0
-            risk_score += 10 if "FOLLOW_THROUGH_WEAK" in confirm_tags else 0
-            risk_score -= 15 if "BREAKOUT_UP" in structure_tags else 0
-            risk_score -= 10 if "VOL_CONFIRM" in confirm_tags else 0
-            if not current_week_closed:
-                risk_score += 8
-
-            risk_score = max(0.0, min(100.0, risk_score))
-            scenario["weekly_risk_score"] = risk_score
-
-            risk_level = "MEDIUM"
-            if risk_score >= 70:
-                risk_level = "HIGH"
-            elif risk_score < 40:
-                risk_level = "LOW"
-            scenario["weekly_risk_level"] = risk_level
-
-            confirm = False
-            if risk_level == "LOW":
-                confirm = True
-            elif risk_level == "MEDIUM":
-                confirm = any(
-                    tag in {"VOL_CONFIRM", "FOLLOW_THROUGH_OK"} for tag in confirm_tags
-                )
-            scenario["weekly_confirm"] = confirm
-        else:
-            scenario["weekly_risk_score"] = None
-            scenario["weekly_risk_level"] = "UNKNOWN"
-            scenario["weekly_confirm"] = None
-
-        scenario["weekly_key_levels"] = {
-            "upper": upper,
-            "lower": lower,
-            f"ma{ma_fast}": ma30,
-            f"ma{ma_slow}": ma60,
-            "ma30": ma30,
-            "ma60": ma60,
-        }
-
-        key_level_parts: list[str] = []
-        if upper is not None:
-            key_level_parts.append(f"upper={upper:.2f}")
-        if lower is not None:
-            key_level_parts.append(f"lower={lower:.2f}")
-        if ma30 is not None:
-            key_level_parts.append(f"ma_fast={ma30:.2f}")
-        if ma60 is not None:
-            key_level_parts.append(f"ma_slow={ma60:.2f}")
-        scenario["weekly_key_levels_str"] = ";".join(key_level_parts)[:255] if key_level_parts else None
-
-        if not gating_enabled:
-            scenario["weekly_plan_a"] = _clip(
-                "周线数据不足/通道未成型：暂不启用周线过滤，按日线信号执行，仓位从轻。"
-            )
-            scenario["weekly_plan_b"] = _clip(
-                "等待周线通道/均线条件补全后再启用推演过滤。"
-            )
-            return scenario
-
-        prefix = (
-            "本周未收盘，先按上周收盘情景推演；" if not current_week_closed else ""
-        )
-
-        struct_set = set(structure_tags)
-        pos_set = set(position_tags)
-        confirm_set = set(confirm_tags)
-
-        if "BREAKOUT_UP" in struct_set:
-            scene = "情景：周线突破上轨，反弹段机会增；"
-            scene_code = "BREAKOUT_UP"
-        elif "BREAKDOWN_DOWN" in struct_set:
-            scene = "情景：周线跌破下轨，趋势偏空；"
-            scene_code = "BREAKDOWN_DOWN"
-        elif "AT_LOWER_RAIL" in struct_set or "SUPPORT_MA30_ZONE" in pos_set:
-            scene = f"情景：下轨/MA{ma_fast} 支撑测试；"
-            scene_code = "SUPPORT_TEST"
-        elif "SUPPORT_MA60_ZONE" in pos_set:
-            scene = f"情景：MA{ma_slow} 深回撤区，关注止跌；"
-            scene_code = "DEEP_PULLBACK"
-        else:
-            scene = "情景：通道内震荡，等待方向；"
-            scene_code = "RANGE"
-
-        plan_a_trigger = f"若站回 MA{ma_fast} 且结构转强"
-        if "BREAKOUT_UP" in struct_set:
-            plan_a_trigger = "若周收盘站稳上轨/回踩不破上轨"
-        elif "AT_LOWER_RAIL" in struct_set or "SUPPORT_MA30_ZONE" in pos_set:
-            plan_a_trigger = f"若支撑区止跌并重回 MA{ma_fast} 上方"
-        elif "SUPPORT_MA60_ZONE" in pos_set:
-            plan_a_trigger = f"若 MA{ma_slow} 附近止跌并出现放量转强"
-
-        confirm_clause = ""
-        if {"VOL_CONFIRM", "FOLLOW_THROUGH_OK"} & confirm_set:
-            confirm_clause = "，且量能已确认"
-        elif {"VOL_WEAK", "FOLLOW_THROUGH_WEAK"} & confirm_set:
-            confirm_clause = "，需等待量能/跟随确认"
-
-        action_clause = "则分批试仓/跟随，优先回踩确认后再加"
-        pos_hint_clause = f"；仓位≤{pos_hint * 100:.0f}%" if pos_hint is not None else ""
-        levels_hint = _pick_levels(structure_tags, position_tags, scenario["weekly_key_levels"])
-        money_hint = _money_hint(scenario["weekly_money_proxy"])
-
-        tail_parts = [levels_hint, money_hint]
-        tail = "；".join([p for p in tail_parts if p])
-        if tail:
-            tail = f"；{tail}"
-
-        plan_a = f"{prefix}{scene}{plan_a_trigger}{confirm_clause}，{action_clause}{pos_hint_clause}{tail}"
-
-        plan_b_trigger = "若通道内走弱或再次跌破支撑"
-        if "BREAKDOWN_DOWN" in struct_set:
-            plan_b_trigger = "若周收盘继续弱于下轨"
-        elif "SUPPORT_MA60_ZONE" in pos_set and ("VOL_WEAK" in confirm_set or risk_level == "HIGH"):
-            plan_b_trigger = f"若 MA{ma_slow} 区仍无量承接"
-        elif risk_level == "MEDIUM" and not scenario.get("weekly_confirm"):
-            plan_b_trigger = "若未出现量能/跟随确认"
-
-        plan_b_action = "则信号降级观望（EXECUTE→WAIT），等待止跌+资金回流再恢复执行。"
-        plan_b = f"{prefix}{plan_b_trigger}，{plan_b_action}{tail}"
-
-        scenario["weekly_plan_a"] = _clip(plan_a)
-        scenario["weekly_plan_b"] = _clip(plan_b)
-        scenario["weekly_scene_code"] = scene_code
-
-        plan_a_if_tokens: list[str] = []
-        if "BREAKOUT_UP" in struct_set:
-            plan_a_if_tokens.append("IF_W_CLOSE_ABOVE_UPPER")
-        if "BREAKDOWN_DOWN" in struct_set:
-            plan_a_if_tokens.append("IF_W_CLOSE_BELOW_LOWER")
-        if "AT_LOWER_RAIL" in struct_set:
-            plan_a_if_tokens.append("IF_TOUCH_LOWER")
-        if "SUPPORT_MA30_ZONE" in pos_set:
-            plan_a_if_tokens.append("IF_NEAR_MA_FAST")
-        if "SUPPORT_MA60_ZONE" in pos_set:
-            plan_a_if_tokens.append("IF_NEAR_MA_SLOW")
-        if "VOL_CONFIRM" in confirm_set:
-            plan_a_if_tokens.append("IF_VOL_CONFIRM")
-        if "VOL_WEAK" in confirm_set:
-            plan_a_if_tokens.append("IF_VOL_WEAK")
-        if "FOLLOW_THROUGH_OK" in confirm_set:
-            plan_a_if_tokens.append("IF_FOLLOW_THROUGH_OK")
-        if "FOLLOW_THROUGH_WEAK" in confirm_set:
-            plan_a_if_tokens.append("IF_FOLLOW_THROUGH_WEAK")
-        if not current_week_closed:
-            plan_a_if_tokens.append("IF_CURRENT_WEEK_UNCLOSED")
-
-        plan_b_if_tokens: list[str] = []
-        if risk_level == "HIGH":
-            plan_b_if_tokens.append("IF_RISK_HIGH")
-        if risk_level == "MEDIUM" and not scenario.get("weekly_confirm"):
-            plan_b_if_tokens.append("IF_CONFIRM_MISSING")
-        if "BREAKDOWN_DOWN" in struct_set:
-            plan_b_if_tokens.append("IF_W_CLOSE_BELOW_LOWER")
-        if "VOL_WEAK" in confirm_set:
-            plan_b_if_tokens.append("IF_VOL_WEAK")
-
-        plan_a_then = "THEN_SCALE_IN"
-        if scene_code == "BREAKOUT_UP":
-            plan_a_then = "THEN_FOLLOW_REBOUND"
-        elif scene_code in {"SUPPORT_TEST", "DEEP_PULLBACK", "BREAKDOWN_DOWN"}:
-            plan_a_then = "THEN_TEST_POSITION"
-
-        plan_a_confirm = "NEED_CONFIRM"
-        if "VOL_CONFIRM" in confirm_set:
-            plan_a_confirm = "CONFIRMED_VOL"
-        elif "FOLLOW_THROUGH_OK" in confirm_set:
-            plan_a_confirm = "CONFIRMED_FOLLOW"
-
-        plan_b_then = "THEN_DOWNGRADE_WAIT"
-        plan_b_recover_tokens: list[str] = []
-        if scene_code in {"SUPPORT_TEST", "DEEP_PULLBACK", "RANGE", "BREAKOUT_UP"}:
-            plan_b_recover_tokens.append("RECOVER_RECLAIM_MA_FAST")
-        if "VOL_CONFIRM" not in confirm_set:
-            plan_b_recover_tokens.append("RECOVER_VOL_CONFIRM")
-        if scene_code == "BREAKDOWN_DOWN":
-            plan_b_recover_tokens.append("RECOVER_BACK_INSIDE_CHANNEL")
-
-        scenario["weekly_plan_a_if"] = _clip(";".join(plan_a_if_tokens)) if plan_a_if_tokens else None
-        scenario["weekly_plan_a_then"] = plan_a_then
-        scenario["weekly_plan_a_confirm"] = plan_a_confirm
-        scenario["weekly_plan_a_exposure_cap"] = pos_hint
-        scenario["weekly_plan_b_if"] = _clip(";".join(plan_b_if_tokens)) if plan_b_if_tokens else None
-        scenario["weekly_plan_b_then"] = plan_b_then
-        scenario["weekly_plan_b_recover_if"] = (
-            _clip(";".join(plan_b_recover_tokens)) if plan_b_recover_tokens else None
-        )
+        tags: list[str] = []
+        for key in ["weekly_structure_tags", "weekly_confirm_tags"]:
+            vals = plan.get(key)
+            if isinstance(vals, list):
+                tags.extend([str(v) for v in vals if str(v)])
+        if plan.get("weekly_bias"):
+            tags.append(f"BIAS_{plan['weekly_bias']}")
+        if plan.get("weekly_status"):
+            tags.append(f"STATUS_{plan['weekly_status']}")
+        scenario["weekly_structure_tags"] = plan.get("weekly_structure_tags", [])
+        scenario["weekly_confirm_tags"] = plan.get("weekly_confirm_tags", [])
+        scenario["weekly_tags"] = ";".join(tags)[:255] if tags else None
 
         return scenario
 
@@ -2086,6 +1734,9 @@ class MA5MA20OpenMonitorRunner:
             "weekly_plan_b_if": weekly_scenario.get("weekly_plan_b_if"),
             "weekly_plan_b_then": weekly_scenario.get("weekly_plan_b_then"),
             "weekly_plan_b_recover_if": weekly_scenario.get("weekly_plan_b_recover_if"),
+            "weekly_plan_json": weekly_scenario.get("weekly_plan_json"),
+            "weekly_bias": weekly_scenario.get("weekly_bias"),
+            "weekly_status": weekly_scenario.get("weekly_status"),
         }
 
         money_proxy = weekly_scenario.get("weekly_money_proxy") if isinstance(weekly_scenario, dict) else {}
@@ -2093,23 +1744,27 @@ class MA5MA20OpenMonitorRunner:
         if isinstance(money_proxy, dict):
             vol_ratio = money_proxy.get("vol_ratio_20")
             slope_delta = money_proxy.get("slope_change_4w")
+            obv_slope = money_proxy.get("obv_slope_13")
             if vol_ratio is not None:
                 proxy_parts.append(f"vol_ratio_20={vol_ratio:.2f}")
             if slope_delta is not None:
                 proxy_parts.append(f"slope_chg_4w={slope_delta:.4f}")
+            if obv_slope is not None:
+                proxy_parts.append(f"obv_slope_13={obv_slope:.2f}")
         env_context["weekly_money_proxy"] = ";".join(proxy_parts)[:255] if proxy_parts else None
 
         scenario_tags: list[str] = []
         if isinstance(weekly_scenario, dict):
-            for key in [
-                "weekly_structure_tags",
-                "weekly_position_tags",
-                "weekly_phase_tags",
-                "weekly_confirm_tags",
-            ]:
+            for key in ["weekly_structure_tags", "weekly_confirm_tags"]:
                 tags = weekly_scenario.get(key)
                 if isinstance(tags, list):
                     scenario_tags.extend([str(t) for t in tags if str(t)])
+            if weekly_scenario.get("weekly_bias"):
+                scenario_tags.append(f"BIAS_{weekly_scenario['weekly_bias']}")
+            if weekly_scenario.get("weekly_status"):
+                scenario_tags.append(f"STATUS_{weekly_scenario['weekly_status']}")
+            if weekly_scenario.get("weekly_tags") and not scenario_tags:
+                scenario_tags.extend(str(weekly_scenario.get("weekly_tags")).split(";"))
         env_context["weekly_tags"] = ";".join(scenario_tags)[:255] if scenario_tags else None
 
         for key in [
@@ -2406,6 +2061,9 @@ class MA5MA20OpenMonitorRunner:
         env_weekly_plan_b_if = None
         env_weekly_plan_b_then = None
         env_weekly_plan_b_recover_if = None
+        env_weekly_plan_json = None
+        env_weekly_bias = None
+        env_weekly_status = None
         if isinstance(env_context, dict):
             env_weekly_state = env_context.get("weekly_state")
             env_weekly_position_hint = _to_float(env_context.get("weekly_position_hint"))
@@ -2432,6 +2090,9 @@ class MA5MA20OpenMonitorRunner:
             env_weekly_plan_b_if = env_context.get("weekly_plan_b_if")
             env_weekly_plan_b_then = env_context.get("weekly_plan_b_then")
             env_weekly_plan_b_recover_if = env_context.get("weekly_plan_b_recover_if")
+            env_weekly_plan_json = env_context.get("weekly_plan_json")
+            env_weekly_bias = env_context.get("weekly_bias")
+            env_weekly_status = env_context.get("weekly_status")
         index_score = None
         if isinstance(env_context, dict):
             index_section = env_context.get("index", {}) if isinstance(env_context.get("index"), dict) else {}
@@ -2599,6 +2260,7 @@ class MA5MA20OpenMonitorRunner:
         env_weekly_plan_b_if_list: List[str | None] = []
         env_weekly_plan_b_then_list: List[str | None] = []
         env_weekly_plan_b_recover_if_list: List[str | None] = []
+        env_weekly_plan_json_list: List[str | None] = []
         board_statuses: List[str | None] = []
         board_ranks: List[float | None] = []
         board_chg_pcts: List[float | None] = []
@@ -3061,33 +2723,64 @@ class MA5MA20OpenMonitorRunner:
                 elif env_regime == "PULLBACK" and not risk_tags_split and reason == "OK":
                     reason = f"大盘处于回踩阶段{pos_hint_text}"
 
-            if (
-                action == "EXECUTE"
-                and status not in {"INVALID", "EXPIRED"}
-                and env_weekly_gating_enabled
-            ):
-                if env_weekly_risk_level == "HIGH":
-                    action = "WAIT"
-                    status = "WAIT"
-                    append_note = "周线风险高：观望/防守"
-                    status_reason = f"{status_reason}；{append_note}" if status_reason else append_note
-                    reason = f"{reason}；{append_note}" if reason and reason != "OK" else append_note
-                elif env_weekly_risk_level == "MEDIUM" and not env_weekly_confirm:
-                    action = "WAIT"
-                    status = "WAIT"
-                    append_note = "周线未确认：等待量能/周收盘确认"
-                    status_reason = f"{status_reason}；{append_note}" if status_reason else append_note
-                    reason = f"{reason}；{append_note}" if reason and reason != "OK" else append_note
-                elif env_weekly_risk_level == "LOW":
-                    plan_tail = ""
-                    if env_weekly_plan_a:
-                        plan_tail = str(env_weekly_plan_a)
-                    if env_weekly_plan_b:
-                        plan_b_text = str(env_weekly_plan_b)
-                        plan_tail = f"{plan_tail}；{plan_b_text}" if plan_tail else plan_b_text
-                    if plan_tail:
-                        combined = f"{reason}；{plan_tail}" if reason and reason != "OK" else plan_tail
-                        reason = combined[:255]
+            if action == "EXECUTE" and status not in {"INVALID", "EXPIRED"}:
+                plan_tail = ""
+                if env_weekly_plan_a:
+                    plan_tail = str(env_weekly_plan_a)
+                if env_weekly_plan_b:
+                    plan_b_text = str(env_weekly_plan_b)
+                    plan_tail = f"{plan_tail}；{plan_b_text}" if plan_tail else plan_b_text
+                exposure_hint = (
+                    f"（周线仓位≤{env_weekly_plan_a_exposure_cap*100:.0f}%）"
+                    if env_weekly_plan_a_exposure_cap is not None
+                    else ""
+                )
+                if not env_weekly_gating_enabled:
+                    append_note = "周线数据不足，轻仓"
+                    if reason and reason != "OK":
+                        reason = f"{reason}；{append_note}"
+                    else:
+                        reason = append_note
+                else:
+                    if env_weekly_risk_level == "HIGH":
+                        action = "WAIT"
+                        status = "WAIT"
+                        append_note = "周线风险高：观望/防守"
+                        status_reason = f"{status_reason}；{append_note}" if status_reason else append_note
+                        reason = f"{reason}；{append_note}" if reason and reason != "OK" else append_note
+                    elif env_weekly_risk_level == "MEDIUM":
+                        if env_weekly_bias == "BEARISH" and env_weekly_status in {
+                            "BREAKOUT_DOWN",
+                            "CONFIRMED",
+                            "FORMING",
+                        }:
+                            action = "WAIT"
+                            status = "WAIT"
+                            append_note = "周线偏空/未修复，等待"
+                            status_reason = (
+                                f"{status_reason}；{append_note}" if status_reason else append_note
+                            )
+                            reason = (
+                                f"{reason}；{append_note}"
+                                if reason and reason != "OK"
+                                else append_note
+                            )
+                        else:
+                            if plan_tail:
+                                combined = (
+                                    f"{reason}；{plan_tail}{exposure_hint}"
+                                    if reason and reason != "OK"
+                                    else f"{plan_tail}{exposure_hint}"
+                                )
+                                reason = combined[:255]
+                    elif env_weekly_risk_level == "LOW":
+                        if plan_tail:
+                            combined = (
+                                f"{reason}；{plan_tail}{exposure_hint}"
+                                if reason and reason != "OK"
+                                else f"{plan_tail}{exposure_hint}"
+                            )
+                            reason = combined[:255]
 
             env_regimes.append(env_regime)
             env_position_hints.append(env_position_hint)
@@ -3159,6 +2852,11 @@ class MA5MA20OpenMonitorRunner:
                 if env_weekly_plan_b_recover_if is not None
                 else None
             )
+            env_weekly_plan_json_list.append(
+                str(env_weekly_plan_json)[:2000]
+                if env_weekly_plan_json is not None
+                else None
+            )
 
             actions.append(action)
             reasons.append(reason)
@@ -3206,6 +2904,7 @@ class MA5MA20OpenMonitorRunner:
         merged["env_weekly_plan_b_if"] = env_weekly_plan_b_if_list
         merged["env_weekly_plan_b_then"] = env_weekly_plan_b_then_list
         merged["env_weekly_plan_b_recover_if"] = env_weekly_plan_b_recover_if_list
+        merged["env_weekly_plan_json"] = env_weekly_plan_json_list
         merged["board_status"] = board_statuses
         merged["board_rank"] = board_ranks
         merged["board_chg_pct"] = board_chg_pcts
@@ -3281,6 +2980,7 @@ class MA5MA20OpenMonitorRunner:
             "env_weekly_plan_b_if",
             "env_weekly_plan_b_then",
             "env_weekly_plan_b_recover_if",
+            "env_weekly_plan_json",
             "industry",
             "board_name",
             "board_code",
@@ -3481,18 +3181,21 @@ class MA5MA20OpenMonitorRunner:
         weekly_scenario = env_context.get("weekly_scenario", {}) if isinstance(env_context, dict) else {}
         if isinstance(weekly_scenario, dict):
             struct_tags = ",".join(weekly_scenario.get("weekly_structure_tags", []) or [])
-            pos_tags = ",".join(weekly_scenario.get("weekly_position_tags", []) or [])
-            phase_tags = ",".join(weekly_scenario.get("weekly_phase_tags", []) or [])
             confirm_tags = ",".join(weekly_scenario.get("weekly_confirm_tags", []) or [])
+            scene_code = weekly_scenario.get("weekly_scene_code")
+            bias = weekly_scenario.get("weekly_bias")
+            status = weekly_scenario.get("weekly_status")
+            key_levels_short = str(weekly_scenario.get("weekly_key_levels_str") or "")[:120]
             self.logger.info(
-                "周线情景：asof=%s current_week_closed=%s risk=%s(%.1f) 结构=%s 位置=%s 阶段=%s 确认=%s",
+                "周线情景：asof=%s current_week_closed=%s risk=%s(%.1f) scene=%s bias=%s status=%s levels=%s 确认标签=%s",
                 weekly_scenario.get("weekly_asof_trade_date"),
                 weekly_scenario.get("weekly_current_week_closed"),
                 weekly_scenario.get("weekly_risk_level"),
                 _to_float(weekly_scenario.get("weekly_risk_score")) or 0.0,
-                struct_tags,
-                pos_tags,
-                phase_tags,
+                scene_code,
+                bias,
+                status,
+                key_levels_short,
                 confirm_tags,
             )
             plan_a = str(weekly_scenario.get("weekly_plan_a") or "").strip()[:200]
@@ -3501,6 +3204,18 @@ class MA5MA20OpenMonitorRunner:
                 self.logger.info("周线 PlanA：%s", plan_a)
             if plan_b:
                 self.logger.info("周线 PlanB：%s", plan_b)
+            plan_a_if = weekly_scenario.get("weekly_plan_a_if")
+            plan_b_if = weekly_scenario.get("weekly_plan_b_if")
+            plan_a_confirm = weekly_scenario.get("weekly_plan_a_confirm")
+            plan_b_recover = weekly_scenario.get("weekly_plan_b_recover_if")
+            self.logger.info(
+                "周线 Plan tokens: A_if=%s A_then=%s A_confirm=%s B_if=%s B_recover=%s",
+                str(plan_a_if or "")[:120],
+                str(weekly_scenario.get("weekly_plan_a_then") or "")[:64],
+                str(plan_a_confirm or "")[:64],
+                str(plan_b_if or "")[:120],
+                str(plan_b_recover or "")[:120],
+            )
         result = self._evaluate(
             signals, quotes, latest_snapshots, latest_trade_date, env_context
         )
