@@ -174,6 +174,7 @@ class WeeklyChannelClassifier:
         wk = wk.copy().reset_index(drop=True)
         wk["ma30"] = _sma(wk["close"], self.ma_fast)
         wk["ma60"] = _sma(wk["close"], self.ma_slow)
+        wk["vol_ma20"] = _sma(wk["volume"], 20)
         lrc = _linear_regression_channel(wk["close"], length=self.lrc_length, dev=self.lrc_dev)
         # wk 已 reset_index(drop=True)，lrc 的 index 与 wk 完全一致，直接 concat 即可
         wk = pd.concat([wk, lrc], axis=1)
@@ -187,6 +188,26 @@ class WeeklyChannelClassifier:
         slope = float(last.get("lrc_slope")) if pd.notna(last.get("lrc_slope")) else None
         ma30 = float(last.get("ma30")) if pd.notna(last.get("ma30")) else None
         ma60 = float(last.get("ma60")) if pd.notna(last.get("ma60")) else None
+        volume = float(last.get("volume")) if pd.notna(last.get("volume")) else None
+        amount = float(last.get("amount")) if pd.notna(last.get("amount")) else None
+        vol_ma20 = float(last.get("vol_ma20")) if pd.notna(last.get("vol_ma20")) else None
+
+        wk_vol_ratio_20 = None
+        if volume is not None and vol_ma20 not in (None, 0):
+            wk_vol_ratio_20 = volume / vol_ma20 if vol_ma20 else None
+
+        prev_high = None
+        if len(wk) >= 2:
+            prev_row = wk.iloc[-2]
+            prev_high = float(prev_row.get("high")) if pd.notna(prev_row.get("high")) else None
+
+        slope_change_4w = None
+        slope_shift = wk["lrc_slope"].shift(4)
+        if not slope_shift.empty:
+            last_slope = wk["lrc_slope"].iloc[-1]
+            prev_slope = slope_shift.iloc[-1]
+            if pd.notna(last_slope) and pd.notna(prev_slope):
+                slope_change_4w = float(last_slope - prev_slope)
 
         state = "INSIDE_CHANNEL"
         note = "仍在通道内运行，等待周收盘选择方向"
@@ -270,6 +291,12 @@ class WeeklyChannelClassifier:
             "chan_pos": chan_pos,
             "high": high,
             "low": low,
+            "wk_volume": volume,
+            "wk_amount": amount,
+            "wk_vol_ma20": vol_ma20,
+            "wk_vol_ratio_20": wk_vol_ratio_20,
+            "slope_change_4w": slope_change_4w,
+            "prev_high": prev_high,
             "channel_dir": (
                 "DOWN" if (slope is not None and slope < 0) else "UP" if (slope is not None and slope > 0) else None
             ),
@@ -311,5 +338,7 @@ class WeeklyChannelClassifier:
                 "week_end": primary_payload.get("week_end"),
                 "chan_pos": primary_payload.get("chan_pos"),
                 "note": primary_payload.get("note"),
+                "wk_vol_ratio_20": primary_payload.get("wk_vol_ratio_20"),
+                "slope_change_4w": primary_payload.get("slope_change_4w"),
             },
         )
