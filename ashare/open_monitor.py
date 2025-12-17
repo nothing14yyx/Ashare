@@ -206,6 +206,10 @@ class OpenMonitorParams:
     interval_minutes: int = 5
     dedupe_bucket_minutes: int = 5
 
+    # 同一批次内同一 code 只保留“最新 date（信号日）”那条 BUY 信号。
+    # 目的：避免同一批次出现重复 code（例如同一只股票在 12-09 与 12-11 都触发 BUY）。
+    unique_code_latest_date_only: bool = True
+
     @classmethod
     def from_config(cls) -> "OpenMonitorParams":
         sec = get_section("open_monitor") or {}
@@ -326,6 +330,9 @@ class OpenMonitorParams:
             output_subdir=str(sec.get("output_subdir", cls.output_subdir)).strip() or cls.output_subdir,
             interval_minutes=interval_minutes,
             dedupe_bucket_minutes=dedupe_bucket_minutes,
+            unique_code_latest_date_only=_get_bool(
+                "unique_code_latest_date_only", cls.unique_code_latest_date_only
+            ),
         )
 
 
@@ -1263,6 +1270,24 @@ class MA5MA20OpenMonitorRunner:
 
         df["code"] = df["code"].astype(str)
         df["date_str"] = df["date"].astype(str).str[:10]
+
+        # 严格去重：同一 code 只保留最新信号日（date）那条记录。
+        # 这能避免同一批次 open_monitor 出现重复 code（但信号日/入选原因不同）的情况。
+        if self.params.unique_code_latest_date_only:
+            before = len(df)
+            df["_date_dt"] = pd.to_datetime(df["date_str"], errors="coerce")
+            df = df.sort_values(by=["code", "_date_dt"], ascending=[True, False])
+            df = df.drop_duplicates(subset=["code"], keep="first")
+            df = df.drop(columns=["_date_dt"], errors="ignore")
+            dropped = before - len(df)
+            if dropped > 0:
+                self.logger.info(
+                    "同一 code 多次触发 BUY：已按最新信号日去重 %s 条（保留 %s 条）。",
+                    dropped,
+                    len(df),
+                )
+            # 同步更新 signal_dates（仅用于日志展示/后续涨跌幅回补循环），避免误解。
+            signal_dates = sorted(df["date_str"].dropna().unique().tolist(), reverse=True)
         min_date = df["date_str"].min()
         trade_age_map = self._load_trade_age_map(latest_trade_date, str(min_date), monitor_date)
         df["signal_age"] = df["date_str"].map(trade_age_map)
