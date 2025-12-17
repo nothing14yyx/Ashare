@@ -1152,7 +1152,12 @@ class MA5MA20OpenMonitorRunner:
     def _load_recent_buy_signals(self) -> Tuple[str | None, List[str], pd.DataFrame]:
         table = self.params.signals_table
         monitor_date = dt.date.today().isoformat()
-        lookback = max(int(self.params.signal_lookback_days or 0), 1)
+        lookback = max(
+            int(self.params.signal_lookback_days or 0),
+            int(self.params.cross_valid_days or 0),
+            int(self.params.pullback_valid_days or 0),
+            1,
+        )
 
         try:
             with self.db_writer.engine.begin() as conn:
@@ -2126,9 +2131,43 @@ class MA5MA20OpenMonitorRunner:
 
             valid_days = pullback_valid_days if self._is_pullback_signal(signal_reason) else cross_valid_days
 
+            # comment: feat: 止损参考价取 stop_ref 与 signal_stop_ref 的更严格值 防止低开导致止损线被动放宽
+            stop_loss_ref = None
+            stop_candidates = [v for v in (stop_ref, signal_stop_ref) if v is not None]
+            if stop_candidates:
+                stop_loss_ref = max(stop_candidates)
+            structural_failure_reason = None
             if ma5 is not None and ma20 is not None and ma5 < ma20:
+                structural_failure_reason = "盘中结构失效：MA5 下穿 MA20"
+            elif (
+                price_now is not None
+                and ma20 is not None
+                and atr14 is not None
+                and price_now < ma20 - 0.3 * atr14
+            ):
+                threshold = ma20 - 0.3 * atr14
+                structural_failure_reason = (
+                    f"盘中结构失效：最新价 {price_now:.2f} 低于 MA20-0.3ATR 阈值 {threshold:.2f}"
+                )
+            elif macd_hist is not None and macd_hist < 0:
+                structural_failure_reason = "盘中结构失效：MACD 柱子转负"
+            elif price_now is not None and stop_loss_ref is not None and price_now <= stop_loss_ref:
+                stop_parts: list[str] = []
+                if stop_ref is not None:
+                    stop_parts.append(f"entry 止损 {stop_ref:.2f}")
+                if signal_stop_ref is not None:
+                    stop_parts.append(f"信号日止损 {signal_stop_ref:.2f}")
+                stop_detail = "，".join(stop_parts)
+                detail_suffix = f"（取较高者：{stop_detail}）" if stop_detail else ""
+                structural_failure_reason = (
+                    f"盘中结构失效：最新价 {price_now:.2f} 跌破止损参考价 {stop_loss_ref:.2f}{detail_suffix}"
+                )
+
+            if structural_failure_reason:
                 status = "INVALID"
-                status_reason = "MA5 下穿 MA20（死叉）"
+                status_reason = structural_failure_reason
+                action = "SKIP"
+                reason = structural_failure_reason
             elif (
                 price_now is not None
                 and ma20 is not None
@@ -2138,14 +2177,7 @@ class MA5MA20OpenMonitorRunner:
             ):
                 status = "INVALID"
                 status_reason = "价格跌破 MA20 且前一交易日放量"
-            elif (
-                price_now is not None
-                and signal_stop_ref is not None
-                and price_now < signal_stop_ref
-            ):
-                status = "INVALID"
-                status_reason = "跌破 ATR 止损参考价"
-            elif valid_days > 0 and signal_age is not None and signal_age >= valid_days:
+            elif valid_days > 0 and signal_age is not None and signal_age > valid_days:
                 if strength_trend == "ENHANCING" or (
                     strength_score is not None and strength_score >= 2
                 ):
