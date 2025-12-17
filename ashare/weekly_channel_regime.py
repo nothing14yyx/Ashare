@@ -4,8 +4,8 @@ from __future__ import annotations
 
 设计目标：
 - 尽量把“手动画通道”的主观部分，替换成可重复的计算方法；
-- 输出“情景（state）+ 仓位提示（position_hint）+ 关键价位（upper/lower/MA30/MA60）”，
-  便于在 open_monitor / 报告里展示或做过滤。
+- 输出“情景（state）+ 仓位提示（position_hint）+ 通道位置百分比（chan_pos）+ 关键价位
+  （upper/lower/MA30/MA60）”，便于在 open_monitor / 报告里展示或做过滤。
 
 注意：
 - 这里不做艾略特波浪计数（主观性强），只保留可客观落地的条件判断；
@@ -191,6 +191,12 @@ class WeeklyChannelClassifier:
         state = "INSIDE_CHANNEL"
         note = "仍在通道内运行，等待周收盘选择方向"
 
+        chan_pos = None
+        chan_pos_clamped = None
+        if close is not None and upper is not None and lower is not None and upper > lower:
+            chan_pos = (close - lower) / (upper - lower)
+            chan_pos_clamped = min(max(chan_pos, 0.0), 1.0)
+
         near_lower = (
             lower is not None
             and (
@@ -229,7 +235,21 @@ class WeeklyChannelClassifier:
             "EXTREME_NEAR_MA60_ZONE": 0.2,
             "CHANNEL_BREAKDOWN": 0.0,
         }
-        position_hint = position_hint_map.get(state)
+
+        position_hint = chan_pos_clamped
+        if state == "CHANNEL_BREAKOUT_UP":
+            base = position_hint_map.get(state)
+            position_hint = base if position_hint is None else max(position_hint, base)
+        elif state == "CHANNEL_BREAKDOWN":
+            position_hint = 0.0
+        elif state == "EXTREME_NEAR_MA60_ZONE":
+            position_hint = 0.3 if position_hint is None else min(position_hint, 0.3)
+        elif state == "LOWER_RAIL_NEAR_MA30_ZONE":
+            position_hint = 0.4 if position_hint is None else min(position_hint, 0.4)
+        elif state == "NEAR_LOWER_RAIL":
+            position_hint = 0.5 if position_hint is None else min(position_hint, 0.5)
+        elif position_hint is None:
+            position_hint = position_hint_map.get(state)
 
         week_end = last.get("week_end")
         week_end_str = None
@@ -247,6 +267,7 @@ class WeeklyChannelClassifier:
             "chan_upper": upper,
             "chan_lower": lower,
             "chan_slope": slope,
+            "chan_pos": chan_pos,
             "high": high,
             "low": low,
             "channel_dir": (
@@ -288,6 +309,7 @@ class WeeklyChannelClassifier:
             context={
                 "primary_code": primary if detail else None,
                 "week_end": primary_payload.get("week_end"),
+                "chan_pos": primary_payload.get("chan_pos"),
                 "note": primary_payload.get("note"),
             },
         )
