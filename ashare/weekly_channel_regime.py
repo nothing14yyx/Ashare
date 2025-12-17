@@ -144,6 +144,7 @@ class WeeklyChannelClassifier:
         lrc_length: int = 52,
         lrc_dev: float = 2.0,
         touch_chan_eps: float = 0.005,
+        near_lower_eps: float = 0.02,
         near_ma_eps: float = 0.01,
         ma_fast: int = 30,
         ma_slow: int = 60,
@@ -152,6 +153,7 @@ class WeeklyChannelClassifier:
         self.lrc_length = max(int(lrc_length), 2)
         self.lrc_dev = float(lrc_dev)
         self.touch_chan_eps = float(touch_chan_eps)
+        self.near_lower_eps = float(near_lower_eps)
         self.near_ma_eps = float(near_ma_eps)
         self.ma_fast = max(int(ma_fast), 1)
         self.ma_slow = max(int(ma_slow), 1)
@@ -178,6 +180,7 @@ class WeeklyChannelClassifier:
 
         last = wk.iloc[-1]
         close = float(last.get("close")) if pd.notna(last.get("close")) else None
+        high = float(last.get("high")) if pd.notna(last.get("high")) else None
         low = float(last.get("low")) if pd.notna(last.get("low")) else None
         upper = float(last.get("lrc_upper")) if pd.notna(last.get("lrc_upper")) else None
         lower = float(last.get("lrc_lower")) if pd.notna(last.get("lrc_lower")) else None
@@ -188,20 +191,29 @@ class WeeklyChannelClassifier:
         state = "INSIDE_CHANNEL"
         note = "仍在通道内运行，等待周收盘选择方向"
 
+        near_lower = (
+            lower is not None
+            and (
+                (close is not None and self._near(close, lower, self.near_lower_eps))
+                or (low is not None and low <= lower * (1.0 + self.touch_chan_eps))
+            )
+        )
+        near_ma30 = self._near(close, ma30, self.near_ma_eps) or (
+            ma30 is not None and low is not None and low <= ma30 * (1.0 + self.near_ma_eps)
+        )
+
         if upper is not None and close is not None and close > upper:
             state = "CHANNEL_BREAKOUT_UP"
             note = "周收盘价上破通道上轨"
         elif lower is not None and close is not None and close < lower:
             state = "CHANNEL_BREAKDOWN"
             note = "周收盘价跌破通道下轨"
-        elif (
-            lower is not None
-            and low is not None
-            and low <= lower * (1.0 + self.touch_chan_eps)
-            and self._near(close, ma30, self.near_ma_eps)
-        ):
+        elif near_lower and near_ma30:
             state = "LOWER_RAIL_NEAR_MA30_ZONE"
             note = "触及/接近下轨且在30周线附近（反弹观察区）"
+        elif near_lower:
+            state = "NEAR_LOWER_RAIL"
+            note = "靠近通道下轨（下轨反弹观察区）"
         elif (
             self._near(close, ma60, self.near_ma_eps)
             or (ma60 is not None and low is not None and low <= ma60 * (1.0 + self.near_ma_eps))
@@ -212,6 +224,7 @@ class WeeklyChannelClassifier:
         position_hint_map = {
             "CHANNEL_BREAKOUT_UP": 0.8,
             "INSIDE_CHANNEL": 0.6,
+            "NEAR_LOWER_RAIL": 0.5,
             "LOWER_RAIL_NEAR_MA30_ZONE": 0.4,
             "EXTREME_NEAR_MA60_ZONE": 0.2,
             "CHANNEL_BREAKDOWN": 0.0,
@@ -234,6 +247,8 @@ class WeeklyChannelClassifier:
             "chan_upper": upper,
             "chan_lower": lower,
             "chan_slope": slope,
+            "high": high,
+            "low": low,
             "channel_dir": (
                 "DOWN" if (slope is not None and slope < 0) else "UP" if (slope is not None and slope > 0) else None
             ),
