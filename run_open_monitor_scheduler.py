@@ -20,8 +20,9 @@ import datetime as dt
 from datetime import timedelta
 import time
 
-from ashare.open_monitor import MA5MA20OpenMonitorRunner
 from ashare.config import get_section
+from ashare.env_snapshot_utils import resolve_weekly_asof_date
+from ashare.open_monitor import MA5MA20OpenMonitorRunner
 
 
 def _next_run_at(now: dt.datetime, interval_min: int) -> dt.datetime:
@@ -119,6 +120,12 @@ def main() -> None:
         action="store_true",
         help="只执行一次就退出（仍会按整点边界对齐）",
     )
+    parser.add_argument(
+        "--include-current-week",
+        action="store_true",
+        dest="include_current_week",
+        help="周线 asof_date 是否包含当前形成周（默认使用最近已收盘周）",
+    )
     args = parser.parse_args()
 
     runner = MA5MA20OpenMonitorRunner()
@@ -127,11 +134,46 @@ def main() -> None:
     if interval_min <= 0:
         raise ValueError("interval must be positive")
 
+    snapshot_bucket = "PREOPEN"
+    ensured_monitor_date: str | None = None
+
+    def _ensure_env_snapshot(now: dt.datetime) -> str:
+        nonlocal ensured_monitor_date
+
+        trade_day = _next_trading_day(now.date(), runner)
+        monitor_date = trade_day.isoformat()
+        if ensured_monitor_date == monitor_date:
+            return monitor_date
+
+        env_context = runner.load_env_snapshot_context(monitor_date, None)
+        if env_context:
+            ensured_monitor_date = monitor_date
+            return monitor_date
+
+        try:
+            asof_date = resolve_weekly_asof_date(args.include_current_week)
+        except ValueError as exc:
+            logger.warning("解析周线 asof_date 失败，跳过环境快照：%s", exc)
+            return monitor_date
+
+        checked_at = dt.datetime.now()
+        runner.build_and_persist_env_snapshot(
+            asof_date,
+            monitor_date=monitor_date,
+            dedupe_bucket=snapshot_bucket,
+            checked_at=checked_at,
+        )
+        ensured_monitor_date = monitor_date
+        return monitor_date
+
+    _ensure_env_snapshot(dt.datetime.now())
+
     logger.info("开盘监测调度器启动：interval=%s 分钟（整点对齐）", interval_min)
 
     try:
         while True:
             now = dt.datetime.now()
+            monitor_date = _ensure_env_snapshot(now)
             run_at = _next_run_at(now, interval_min)
             if not _in_trading_window(run_at):
                 next_start = _next_trading_start(run_at, runner)
