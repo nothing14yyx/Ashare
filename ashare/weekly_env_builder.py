@@ -191,8 +191,108 @@ class WeeklyEnvironmentBuilder:
         except Exception:
             return False
 
-    def load_board_spot_strength(self) -> pd.DataFrame:
-        """读取板块强弱（实时）。"""
+    def load_board_spot_strength_from_db(
+        self, latest_trade_date: str | None, checked_at: dt.datetime | None
+    ) -> pd.DataFrame:
+        """优先从数据库读取板块强弱快照。"""
+
+        if not self.board_env_enabled or not self.board_spot_enabled:
+            return pd.DataFrame()
+
+        table = "board_industry_spot"
+        if not self._table_exists(table):
+            return pd.DataFrame()
+
+        target_ts = checked_at or dt.datetime.now()
+        latest_ts = None
+        stmt_latest = text(
+            f"""
+            SELECT MAX(`ts`) AS ts
+            FROM `{table}`
+            WHERE `ts` <= :ts
+            """
+        )
+        try:
+            with self.db_writer.engine.begin() as conn:
+                latest_df = pd.read_sql_query(stmt_latest, conn, params={"ts": target_ts})
+        except Exception as exc:  # noqa: BLE001
+            self.logger.debug("读取板块快照时间失败：%s", exc)
+            latest_df = pd.DataFrame()
+
+        if not latest_df.empty:
+            latest_ts = latest_df.iloc[0].get("ts")
+
+        if latest_ts is None and latest_trade_date:
+            try:
+                trade_date = dt.datetime.strptime(latest_trade_date, "%Y-%m-%d").date()
+            except Exception:
+                trade_date = None
+            if trade_date is not None:
+                stmt_trade_date = text(
+                    f"""
+                    SELECT MAX(`ts`) AS ts
+                    FROM `{table}`
+                    WHERE DATE(`ts`) = :trade_date
+                    """
+                )
+                try:
+                    with self.db_writer.engine.begin() as conn:
+                        trade_df = pd.read_sql_query(
+                            stmt_trade_date, conn, params={"trade_date": trade_date}
+                        )
+                    if not trade_df.empty:
+                        latest_ts = trade_df.iloc[0].get("ts")
+                except Exception as exc:  # noqa: BLE001
+                    self.logger.debug("按交易日读取板块快照失败：%s", exc)
+
+        if latest_ts is None:
+            return pd.DataFrame()
+
+        stmt_fetch = text(
+            f"""
+            SELECT * FROM `{table}`
+            WHERE `ts` = :ts
+            """
+        )
+        try:
+            with self.db_writer.engine.begin() as conn:
+                df = pd.read_sql_query(stmt_fetch, conn, params={"ts": latest_ts})
+        except Exception as exc:  # noqa: BLE001
+            self.logger.debug("读取板块快照明细失败：%s", exc)
+            return pd.DataFrame()
+
+        if df.empty:
+            return pd.DataFrame()
+
+        rename_map = {}
+        for col in df.columns:
+            if "代码" in col and "board_code" not in rename_map:
+                rename_map[col] = "board_code"
+            if "名称" in col and "board_name" not in rename_map and "板块" in col:
+                rename_map[col] = "board_name"
+            if col in {"涨跌幅", "涨跌幅(%)", "chg_pct", "change_rate", "pct_chg"}:
+                rename_map[col] = "chg_pct"
+
+        df = df.rename(columns=rename_map)
+        if "board_code" in df.columns:
+            df["board_code"] = df["board_code"].astype(str)
+        if "chg_pct" in df.columns:
+            df["chg_pct"] = pd.to_numeric(df["chg_pct"], errors="coerce")
+
+        if "rank" not in df.columns or df["rank"].isna().all():
+            if "chg_pct" in df.columns:
+                df = df.sort_values(by="chg_pct", ascending=False)
+            df["rank"] = range(1, len(df) + 1)
+        return df
+
+    def load_board_spot_strength(
+        self, latest_trade_date: str | None = None, checked_at: dt.datetime | None = None
+    ) -> pd.DataFrame:
+        """读取板块强弱，优先数据库失败再实时。"""
+
+        db_df = self.load_board_spot_strength_from_db(latest_trade_date, checked_at)
+        if not db_df.empty:
+            return db_df
 
         if not self.board_env_enabled or not self.board_spot_enabled:
             return pd.DataFrame()
@@ -377,11 +477,13 @@ class WeeklyEnvironmentBuilder:
 
         return scenario
 
-    def build_environment_context(self, latest_trade_date: str) -> dict[str, Any]:
+    def build_environment_context(
+        self, latest_trade_date: str, *, checked_at: dt.datetime | None = None
+    ) -> dict[str, Any]:
         index_trend = self.load_index_trend(latest_trade_date)
         weekly_channel = self.load_index_weekly_channel(latest_trade_date)
         weekly_scenario = self.build_weekly_scenario(weekly_channel, index_trend)
-        board_strength = self.load_board_spot_strength()
+        board_strength = self.load_board_spot_strength(latest_trade_date, checked_at)
         board_map: dict[str, Any] = {}
         if not board_strength.empty and "board_name" in board_strength.columns:
             total = len(board_strength)
