@@ -175,6 +175,7 @@ class OpenMonitorParams:
     max_gap_up_atr_mult: float = 1.5   # 动态高开阈值：gap_up > min(max_gap_up_pct, atr_mult*ATR/昨收) → skip
     max_gap_down_pct: float = -0.03    # 今开相对昨收跌幅 < -3% → skip
     min_open_vs_ma20_pct: float = 0.0  # 今开 < MA20*(1+min_open_vs_ma20_pct) → skip（默认需站上 MA20）
+    pullback_min_open_vs_ma20_pct: float = -0.01  # 回踩形态允许略低于 MA20 入场
     limit_up_trigger_pct: float = 9.7  # 涨跌幅 >= 9.7% → 视为涨停/接近涨停，skip
 
     # 追高过滤：入场价相对 MA5 乖离过大
@@ -300,6 +301,12 @@ class OpenMonitorParams:
             min_open_vs_ma20_pct=_normalize_ratio_pct(
                 _get_float("min_open_vs_ma20_pct", cls.min_open_vs_ma20_pct),
                 "min_open_vs_ma20_pct",
+            ),
+            pullback_min_open_vs_ma20_pct=_normalize_ratio_pct(
+                _get_float(
+                    "pullback_min_open_vs_ma20_pct", cls.pullback_min_open_vs_ma20_pct
+                ),
+                "pullback_min_open_vs_ma20_pct",
             ),
             limit_up_trigger_pct=_normalize_percent_value(
                 _get_float("limit_up_trigger_pct", cls.limit_up_trigger_pct),
@@ -1044,6 +1051,21 @@ class MA5MA20OpenMonitorRunner:
             "risk_note": "VARCHAR(255)",
             "volume_unit": "VARCHAR(16)",
             "entry_exposure_cap": "DOUBLE",
+            "signal_kind": "VARCHAR(16)",
+            "signal_close": "DOUBLE",
+            "asof_close": "DOUBLE",
+            "signal_ma5": "DOUBLE",
+            "signal_ma20": "DOUBLE",
+            "signal_ma60": "DOUBLE",
+            "signal_ma250": "DOUBLE",
+            "signal_vol_ratio": "DOUBLE",
+            "signal_macd_hist": "DOUBLE",
+            "asof_ma5": "DOUBLE",
+            "asof_ma20": "DOUBLE",
+            "asof_ma60": "DOUBLE",
+            "asof_ma250": "DOUBLE",
+            "asof_vol_ratio": "DOUBLE",
+            "asof_macd_hist": "DOUBLE",
         }
 
         with self.db_writer.engine.begin() as conn:
@@ -2223,6 +2245,7 @@ class MA5MA20OpenMonitorRunner:
         max_up_atr_mult = self.params.max_gap_up_atr_mult
         max_down = self.params.max_gap_down_pct
         min_vs_ma20 = self.params.min_open_vs_ma20_pct
+        pullback_min_vs_ma20 = self.params.pullback_min_open_vs_ma20_pct
         limit_up_trigger = self.params.limit_up_trigger_pct
 
         max_entry_vs_ma5 = self.params.max_entry_vs_ma5_pct
@@ -2239,6 +2262,7 @@ class MA5MA20OpenMonitorRunner:
         reasons: List[str] = []
         statuses: List[str] = []
         status_reasons: List[str] = []
+        signal_kinds: List[str] = []
         stop_refs: List[float | None] = []
         signal_stop_refs: List[float | None] = []
         valid_days_list: List[int | None] = []
@@ -2449,6 +2473,7 @@ class MA5MA20OpenMonitorRunner:
             signal_day_pct = row.get("_signal_day_pct_change")
             signal_reason = str(row.get("reason") or "")
             signal_age = row.get("signal_age")
+            is_pullback = self._is_pullback_signal(signal_reason)
 
             used_latest_as_entry = False
             if entry_px is None or entry_px <= 0:
@@ -2511,7 +2536,7 @@ class MA5MA20OpenMonitorRunner:
                 strength_delta = strength_score - prev_strength
             strength_trend = _classify_strength_trend(strength_score, prev_strength)
 
-            valid_days = pullback_valid_days if self._is_pullback_signal(signal_reason) else cross_valid_days
+            valid_days = pullback_valid_days if is_pullback else cross_valid_days
 
             # comment: feat: 止损参考价取 stop_ref 与 signal_stop_ref 的更严格值 防止低开导致止损线被动放宽
             stop_loss_ref = None
@@ -2519,8 +2544,12 @@ class MA5MA20OpenMonitorRunner:
             if stop_candidates:
                 stop_loss_ref = max(stop_candidates)
             structural_failure_reason = None
+            structural_downgrade_reason = None
             if ma5 is not None and ma20 is not None and ma5 < ma20:
-                structural_failure_reason = "盘中结构失效：MA5 下穿 MA20"
+                if is_pullback:
+                    structural_downgrade_reason = "盘中结构观察：MA5 下穿 MA20（回踩形态降级观察）"
+                else:
+                    structural_failure_reason = "盘中结构失效：MA5 下穿 MA20"
             elif (
                 price_now is not None
                 and ma20 is not None
@@ -2532,7 +2561,10 @@ class MA5MA20OpenMonitorRunner:
                     f"盘中结构失效：最新价 {price_now:.2f} 低于 MA20-0.3ATR 阈值 {threshold:.2f}"
                 )
             elif macd_hist is not None and macd_hist < 0:
-                structural_failure_reason = "盘中结构失效：MACD 柱子转负"
+                if is_pullback:
+                    structural_downgrade_reason = "盘中结构观察：MACD 柱子转负（回踩形态降级观察）"
+                else:
+                    structural_failure_reason = "盘中结构失效：MACD 柱子转负"
             elif price_now is not None and stop_loss_ref is not None and price_now <= stop_loss_ref:
                 stop_parts: list[str] = []
                 if stop_ref is not None:
@@ -2550,70 +2582,79 @@ class MA5MA20OpenMonitorRunner:
                 status_reason = structural_failure_reason
                 action = "SKIP"
                 reason = structural_failure_reason
-            elif (
-                price_now is not None
-                and ma20 is not None
-                and vol_ratio is not None
-                and vol_ratio >= vol_threshold
-                and price_now < ma20
-            ):
-                status = "INVALID"
-                status_reason = "价格跌破 MA20 且前一交易日放量"
-            elif valid_days > 0 and signal_age is not None and signal_age > valid_days:
-                if strength_trend == "ENHANCING" or (
-                    strength_score is not None and strength_score >= 2
-                ):
-                    status = "WAIT"
-                    status_reason = (
-                        f"超过有效期 {valid_days} 个交易日但强度走强，继续观察"
-                    )
-                else:
-                    status = "EXPIRED"
-                    status_reason = f"超过有效期 {valid_days} 个交易日"
-            elif (
-                price_now is not None
-                and ma5 is not None
-                and max_entry_vs_ma5 > 0
-                and price_now > ma5 * (1.0 + max_entry_vs_ma5)
-            ):
-                status = "EXPIRED"
-                status_reason = "入场价/最新价相对 MA5 乖离过大"
-            elif price_now is not None and signal_close is not None and price_now > signal_close:
-                gain = (price_now - signal_close) / signal_close
-                atr_base = atr14 if atr14 is not None else row.get("atr14")
-                atr_gain = None
-                if atr_base is not None and atr_base > 0:
-                    atr_gain = (price_now - signal_close) / atr_base
-                if atr_gain is not None and atr_gain > expire_atr_mult:
-                    status = "EXPIRED"
-                    status_reason = f"信号后拉升超过 ATR×{expire_atr_mult:.2f}"
-                elif gain > expire_pct_threshold:
-                    status = "EXPIRED"
-                    status_reason = f"信号后涨幅 {gain*100:.2f}% 超过阈值"
-            else:
-                trend_ok = (
-                    current_close is not None
-                    and ma60 is not None
-                    and ma250 is not None
-                    and ma20 is not None
-                    and current_close > ma60
-                    and current_close > ma250
-                    and ma20 > ma60 > ma250
-                )
-                macd_ok = macd_hist is not None and macd_hist > 0
-                vol_ok = vol_ratio is not None and vol_ratio >= vol_threshold
 
-                if not trend_ok:
-                    status = "INVALID"
-                    status_reason = "多头排列/趋势破坏"
-                elif (not macd_ok) or (not vol_ok):
+            if not structural_failure_reason:
+                if structural_downgrade_reason and status == "ACTIVE":
                     status = "WAIT"
-                    weak_reasons = []
-                    if not macd_ok:
-                        weak_reasons.append("MACD 动能转弱")
-                    if not vol_ok:
-                        weak_reasons.append("量能不足")
-                    status_reason = "；".join(weak_reasons) if weak_reasons else "继续观察"
+                    status_reason = structural_downgrade_reason
+                if (
+                    price_now is not None
+                    and ma20 is not None
+                    and vol_ratio is not None
+                    and vol_ratio >= vol_threshold
+                    and price_now < ma20
+                ):
+                    if is_pullback:
+                        status = "WAIT"
+                        status_reason = "价格跌破 MA20 且前一交易日放量（回踩形态观察）"
+                    else:
+                        status = "INVALID"
+                        status_reason = "价格跌破 MA20 且前一交易日放量"
+                elif valid_days > 0 and signal_age is not None and signal_age > valid_days:
+                    if strength_trend == "ENHANCING" or (
+                        strength_score is not None and strength_score >= 2
+                    ):
+                        status = "WAIT"
+                        status_reason = (
+                            f"超过有效期 {valid_days} 个交易日但强度走强，继续观察"
+                        )
+                    else:
+                        status = "EXPIRED"
+                        status_reason = f"超过有效期 {valid_days} 个交易日"
+                elif (
+                    price_now is not None
+                    and ma5 is not None
+                    and max_entry_vs_ma5 > 0
+                    and price_now > ma5 * (1.0 + max_entry_vs_ma5)
+                ):
+                    status = "EXPIRED"
+                    status_reason = "入场价/最新价相对 MA5 乖离过大"
+                elif price_now is not None and signal_close is not None and price_now > signal_close:
+                    gain = (price_now - signal_close) / signal_close
+                    atr_base = atr14 if atr14 is not None else row.get("atr14")
+                    atr_gain = None
+                    if atr_base is not None and atr_base > 0:
+                        atr_gain = (price_now - signal_close) / atr_base
+                    if atr_gain is not None and atr_gain > expire_atr_mult:
+                        status = "EXPIRED"
+                        status_reason = f"信号后拉升超过 ATR×{expire_atr_mult:.2f}"
+                    elif gain > expire_pct_threshold:
+                        status = "EXPIRED"
+                        status_reason = f"信号后涨幅 {gain*100:.2f}% 超过阈值"
+                else:
+                    trend_ok = (
+                        current_close is not None
+                        and ma60 is not None
+                        and ma250 is not None
+                        and ma20 is not None
+                        and current_close > ma60
+                        and current_close > ma250
+                        and ma20 > ma60 > ma250
+                    )
+                    macd_ok = macd_hist is not None and macd_hist > 0
+                    vol_ok = vol_ratio is not None and vol_ratio >= vol_threshold
+
+                    if not trend_ok:
+                        status = "INVALID"
+                        status_reason = "多头排列/趋势破坏"
+                    elif (not macd_ok) or (not vol_ok):
+                        status = "WAIT"
+                        weak_reasons = []
+                        if not macd_ok:
+                            weak_reasons.append("MACD 动能转弱")
+                        if not vol_ok:
+                            weak_reasons.append("量能不足")
+                        status_reason = "；".join(weak_reasons) if weak_reasons else "继续观察"
 
             if status == "ACTIVE" and strength_score is not None:
                 if strength_score < 0:
@@ -2661,7 +2702,14 @@ class MA5MA20OpenMonitorRunner:
                 reason = f"低开 {gap*100:.2f}% 低于阈值 {max_down*100:.2f}%"
 
             if action == "EXECUTE" and (ma20 is not None) and (entry_px is not None):
-                threshold = ma20 * (1.0 + min_vs_ma20)
+                threshold = ma20 * (
+                    1.0
+                    + (
+                        pullback_min_vs_ma20
+                        if is_pullback
+                        else min_vs_ma20
+                    )
+                )
                 if entry_px < threshold:
                     action = "SKIP"
                     px_label = "入场价(最新)" if used_latest_as_entry else "入场价"
@@ -2936,6 +2984,7 @@ class MA5MA20OpenMonitorRunner:
             reasons.append(reason)
             statuses.append(status)
             status_reasons.append(status_reason)
+            signal_kinds.append("PULLBACK" if is_pullback else "CROSS")
             stop_refs.append(_to_float(stop_ref))
             signal_stop_refs.append(_to_float(signal_stop_ref))
             valid_days_list.append(valid_days)
@@ -2993,6 +3042,30 @@ class MA5MA20OpenMonitorRunner:
         merged["used_ma60"] = used_ma60_list
         merged["used_vol_ratio"] = used_vol_ratio_list
         merged["used_macd_hist"] = used_macd_hist_list
+        merged["signal_kind"] = signal_kinds
+
+        merged["signal_close"] = merged.get("close")
+        merged["asof_close"] = merged.get("latest_close")
+        if "asof_close" in merged.columns:
+            merged["asof_close"] = merged["asof_close"].where(
+                merged["asof_close"].notna(), merged.get("close")
+            )
+        else:
+            merged["asof_close"] = merged.get("close")
+
+        merged["signal_ma5"] = merged.get("ma5")
+        merged["signal_ma20"] = merged.get("ma20")
+        merged["signal_ma60"] = merged.get("ma60")
+        merged["signal_ma250"] = merged.get("ma250")
+        merged["signal_macd_hist"] = merged.get("macd_hist")
+        merged["signal_vol_ratio"] = merged.get("vol_ratio")
+
+        merged["asof_ma5"] = merged.get("used_ma5")
+        merged["asof_ma20"] = merged.get("used_ma20")
+        merged["asof_ma60"] = merged.get("used_ma60")
+        merged["asof_ma250"] = merged.get("used_ma250")
+        merged["asof_macd_hist"] = merged.get("used_macd_hist")
+        merged["asof_vol_ratio"] = merged.get("used_vol_ratio")
 
         keep_cols = [
             "monitor_date",
@@ -3003,6 +3076,8 @@ class MA5MA20OpenMonitorRunner:
             "code",
             "name",
             "close",
+            "signal_close",
+            "asof_close",
             "open",
             "latest",
             "pct_change",
@@ -3018,13 +3093,25 @@ class MA5MA20OpenMonitorRunner:
             "ma20",
             "ma60",
             "ma250",
+            "signal_ma5",
+            "signal_ma20",
+            "signal_ma60",
+            "signal_ma250",
             "vol_ratio",
             "macd_hist",
+            "signal_vol_ratio",
+            "signal_macd_hist",
             "used_ma5",
             "used_ma20",
             "used_ma60",
+            "asof_ma5",
+            "asof_ma20",
+            "asof_ma60",
+            "asof_ma250",
             "used_vol_ratio",
             "used_macd_hist",
+            "asof_vol_ratio",
+            "asof_macd_hist",
             "kdj_k",
             "kdj_d",
             "atr14",
@@ -3071,6 +3158,7 @@ class MA5MA20OpenMonitorRunner:
             "strength_note",
             "risk_tag",
             "risk_note",
+            "signal_kind",
             "signal",
             "reason",
             "candidate_status",
