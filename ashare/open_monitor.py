@@ -64,11 +64,7 @@ def _to_float(value: Any) -> float | None:  # noqa: ANN401
 SNAPSHOT_HASH_EXCLUDE = {
     "checked_at",
     "dedupe_bucket",
-    "used_ma5",
-    "used_ma20",
-    "used_ma60",
-    "used_vol_ratio",
-    "used_macd_hist",
+    "live_checked_at",
 }
 
 VOLUME_UNIT_SHARES = "股"
@@ -912,7 +908,7 @@ class MA5MA20OpenMonitorRunner:
     def _ensure_indexable_columns(self, table: str) -> None:
         dedupe_columns = {
             "monitor_date": 32,
-            "date": 32,
+            "sig_date": 32,
             "code": 32,
             "snapshot_hash": 64,
             "dedupe_bucket": 32,
@@ -957,6 +953,7 @@ class MA5MA20OpenMonitorRunner:
         # 会导致 SQL 侧的筛选/排序出现隐式转换或字符串比较问题。
         # 这里强制修正为数值列，保持与代码中的 float 计算一致。
         self._ensure_numeric_column(table, "intraday_vol_ratio", "DOUBLE NULL")
+        self._ensure_numeric_column(table, "live_intraday_vol_ratio", "DOUBLE NULL")
 
         index_name = "ux_open_monitor_dedupe"
         if not self._index_exists(table, index_name):
@@ -968,7 +965,7 @@ class MA5MA20OpenMonitorRunner:
                         text(
                             f"""
                             CREATE UNIQUE INDEX `{index_name}`
-                            ON `{table}` (`monitor_date`, `date`, `code`, `dedupe_bucket`, `snapshot_hash`)
+                            ON `{table}` (`monitor_date`, `sig_date`, `code`, `dedupe_bucket`, `snapshot_hash`)
                             """
                         )
                     )
@@ -1051,21 +1048,27 @@ class MA5MA20OpenMonitorRunner:
             "risk_note": "VARCHAR(255)",
             "volume_unit": "VARCHAR(16)",
             "entry_exposure_cap": "DOUBLE",
+            "sig_date": "VARCHAR(10)",
+            "asof_trade_date": "VARCHAR(10)",
             "signal_kind": "VARCHAR(16)",
-            "signal_close": "DOUBLE",
+            "sig_close": "DOUBLE",
             "asof_close": "DOUBLE",
-            "signal_ma5": "DOUBLE",
-            "signal_ma20": "DOUBLE",
-            "signal_ma60": "DOUBLE",
-            "signal_ma250": "DOUBLE",
-            "signal_vol_ratio": "DOUBLE",
-            "signal_macd_hist": "DOUBLE",
+            "sig_ma5": "DOUBLE",
+            "sig_ma20": "DOUBLE",
+            "sig_ma60": "DOUBLE",
+            "sig_ma250": "DOUBLE",
+            "sig_vol_ratio": "DOUBLE",
+            "sig_macd_hist": "DOUBLE",
+            "sig_atr14": "DOUBLE",
+            "sig_stop_ref": "DOUBLE",
             "asof_ma5": "DOUBLE",
             "asof_ma20": "DOUBLE",
             "asof_ma60": "DOUBLE",
             "asof_ma250": "DOUBLE",
             "asof_vol_ratio": "DOUBLE",
             "asof_macd_hist": "DOUBLE",
+            "asof_atr14": "DOUBLE",
+            "asof_stop_ref": "DOUBLE",
         }
 
         with self.db_writer.engine.begin() as conn:
@@ -1092,10 +1095,10 @@ class MA5MA20OpenMonitorRunner:
 
         stmt = text(
             f"""
-            SELECT `monitor_date`, `date`, `code`, `dedupe_bucket`, `snapshot_hash`
+            SELECT `monitor_date`, `sig_date`, `code`, `dedupe_bucket`, `snapshot_hash`
             FROM `{table}`
             WHERE `monitor_date` = :d AND `code` IN :codes AND `dedupe_bucket` = :b
-            """
+        """
         ).bindparams(bindparam("codes", expanding=True))
 
         try:
@@ -1374,13 +1377,13 @@ class MA5MA20OpenMonitorRunner:
                 df[col] = None
 
         df["code"] = df["code"].astype(str)
-        df["date_str"] = df["date"].astype(str).str[:10]
+        df["sig_date"] = df["date"].astype(str).str[:10]
 
         # 严格去重：同一 code 只保留最新信号日（date）那条记录。
         # 这能避免同一批次 open_monitor 出现重复 code（但信号日/入选原因不同）的情况。
         if self.params.unique_code_latest_date_only:
             before = len(df)
-            df["_date_dt"] = pd.to_datetime(df["date_str"], errors="coerce")
+            df["_date_dt"] = pd.to_datetime(df["sig_date"], errors="coerce")
             df = df.sort_values(by=["code", "_date_dt"], ascending=[True, False])
             df = df.drop_duplicates(subset=["code"], keep="first")
             df = df.drop(columns=["_date_dt"], errors="ignore")
@@ -1392,19 +1395,35 @@ class MA5MA20OpenMonitorRunner:
                     len(df),
                 )
             # 同步更新 signal_dates（仅用于日志展示/后续涨跌幅回补循环），避免误解。
-            signal_dates = sorted(df["date_str"].dropna().unique().tolist(), reverse=True)
-        min_date = df["date_str"].min()
+            signal_dates = sorted(df["sig_date"].dropna().unique().tolist(), reverse=True)
+        min_date = df["sig_date"].min()
         trade_age_map = self._load_trade_age_map(latest_trade_date, str(min_date), monitor_date)
-        df["signal_age"] = df["date_str"].map(trade_age_map)
+        df["signal_age"] = df["sig_date"].map(trade_age_map)
 
         try:
             for d in signal_dates:
-                codes = df.loc[df["date_str"] == d, "code"].dropna().unique().tolist()
+                codes = df.loc[df["sig_date"] == d, "code"].dropna().unique().tolist()
                 pct_map = self._load_signal_day_pct_change(d, codes)
-                mask = df["date_str"] == d
+                mask = df["sig_date"] == d
                 df.loc[mask, "_signal_day_pct_change"] = df.loc[mask, "code"].map(pct_map)
         except Exception:
             df["_signal_day_pct_change"] = None
+
+        signal_prefix_map = {
+            "close": "sig_close",
+            "ma5": "sig_ma5",
+            "ma20": "sig_ma20",
+            "ma60": "sig_ma60",
+            "ma250": "sig_ma250",
+            "vol_ratio": "sig_vol_ratio",
+            "macd_hist": "sig_macd_hist",
+            "atr14": "sig_atr14",
+            "stop_ref": "sig_stop_ref",
+        }
+        df = df.rename(columns={k: v for k, v in signal_prefix_map.items() if k in df.columns})
+        for src, target in signal_prefix_map.items():
+            if target not in df.columns:
+                df[target] = None
         return latest_trade_date, signal_dates, df
 
     def _load_latest_snapshots(self, latest_trade_date: str, codes: List[str]) -> pd.DataFrame:
@@ -2001,6 +2020,20 @@ class MA5MA20OpenMonitorRunner:
             return pd.DataFrame()
 
         q = quotes.copy()
+        live_rename_map = {
+            "open": "live_open",
+            "high": "live_high",
+            "low": "live_low",
+            "latest": "live_latest",
+            "volume": "live_volume",
+            "amount": "live_amount",
+            "pct_change": "live_pct_change",
+            "gap_pct": "live_gap_pct",
+            "intraday_vol_ratio": "live_intraday_vol_ratio",
+            "checked_at": "live_checked_at",
+            "prev_close": "prev_close",
+        }
+        q = q.rename(columns={k: v for k, v in live_rename_map.items() if k in q.columns})
         checked_at_ts = dt.datetime.now()
         dedupe_bucket = self._calc_dedupe_bucket(checked_at_ts)
         avg_volume_map = self._load_avg_volume(
@@ -2011,31 +2044,32 @@ class MA5MA20OpenMonitorRunner:
         if q.empty:
             out = signals.copy()
             out["monitor_date"] = dt.date.today().isoformat()
-            out["open"] = None
-            out["latest"] = None
-            out["high"] = None
-            out["low"] = None
-            out["pct_change"] = None
-            out["volume"] = None
-            out["amount"] = None
+            out["live_open"] = None
+            out["live_latest"] = None
+            out["live_high"] = None
+            out["live_low"] = None
+            out["live_pct_change"] = None
+            out["live_gap_pct"] = None
+            out["live_volume"] = None
+            out["live_amount"] = None
+            out["live_intraday_vol_ratio"] = None
+            out["live_checked_at"] = checked_at_ts
+            out["asof_trade_date"] = latest_trade_date
+            out["asof_close"] = out.get("sig_close")
+            out["asof_ma5"] = out.get("sig_ma5")
+            out["asof_ma20"] = out.get("sig_ma20")
+            out["asof_ma60"] = out.get("sig_ma60")
+            out["asof_ma250"] = out.get("sig_ma250")
+            out["asof_vol_ratio"] = out.get("sig_vol_ratio")
+            out["asof_macd_hist"] = out.get("sig_macd_hist")
             out["volume_unit"] = VOLUME_UNIT_SHARES
             out["avg_volume_20"] = None
-            out["intraday_vol_ratio"] = None
-            out["gap_pct"] = None
             out["action"] = "UNKNOWN"
             out["action_reason"] = "行情数据不可用"
             out["candidate_status"] = "UNKNOWN"
             out["status_reason"] = "行情数据不可用"
             out["checked_at"] = checked_at_ts
             out["dedupe_bucket"] = dedupe_bucket
-            for col in [
-                "used_ma5",
-                "used_ma20",
-                "used_ma60",
-                "used_vol_ratio",
-                "used_macd_hist",
-            ]:
-                out[col] = None
             return out
 
         q["code"] = q["code"].astype(str)
@@ -2131,9 +2165,11 @@ class MA5MA20OpenMonitorRunner:
 
         if not latest_snapshots.empty:
             snap = latest_snapshots.copy()
-            rename_map = {c: f"latest_{c}" for c in snap.columns if c not in {"code"}}
+            rename_map = {c: f"asof_{c}" for c in snap.columns if c not in {"code"}}
             snap = snap.rename(columns=rename_map)
             merged = merged.merge(snap, on="code", how="left")
+
+        merged["asof_trade_date"] = latest_trade_date
 
         if avg_volume_map:
             merged["avg_volume_20"] = merged["code"].map(avg_volume_map)
@@ -2141,34 +2177,33 @@ class MA5MA20OpenMonitorRunner:
             merged["avg_volume_20"] = None
 
         float_cols = [
-            "close",
-            "prev_close",
-            "ma5",
-            "ma20",
-            "ma60",
-            "ma250",
-            "vol_ratio",
-            "macd_hist",
-            "atr14",
-            "stop_ref",
-            "open",
-            "latest",
-            "high",
-            "low",
-            "pct_change",
-            "volume",
-            "amount",
+            "sig_close",
+            "sig_ma5",
+            "sig_ma20",
+            "sig_ma60",
+            "sig_ma250",
+            "sig_vol_ratio",
+            "sig_macd_hist",
+            "sig_atr14",
+            "sig_stop_ref",
+            "asof_close",
+            "asof_ma5",
+            "asof_ma20",
+            "asof_ma60",
+            "asof_ma250",
+            "asof_vol_ratio",
+            "asof_macd_hist",
+            "asof_atr14",
+            "asof_stop_ref",
+            "live_open",
+            "live_latest",
+            "live_high",
+            "live_low",
+            "live_pct_change",
+            "live_volume",
+            "live_amount",
             "avg_volume_20",
             "_signal_day_pct_change",
-            "latest_close",
-            "latest_ma5",
-            "latest_ma20",
-            "latest_ma60",
-            "latest_ma250",
-            "latest_vol_ratio",
-            "latest_macd_hist",
-            "latest_atr14",
-            "latest_stop_ref",
             "signal_strength",
             "strength_delta",
         ]
@@ -2199,7 +2234,7 @@ class MA5MA20OpenMonitorRunner:
             return vol
 
         def _calc_intraday_vol_ratio(row: pd.Series) -> float | None:
-            vol = _normalize_intraday_volume(row.get("volume"), row.get("avg_volume_20"))
+            vol = _normalize_intraday_volume(row.get("live_volume"), row.get("avg_volume_20"))
             avg_vol = row.get("avg_volume_20")
             effective_minutes = max(minutes_elapsed, 5)
             if (
@@ -2216,22 +2251,20 @@ class MA5MA20OpenMonitorRunner:
                 return None
             return scaled / avg_vol
 
-        merged["intraday_vol_ratio"] = merged.apply(_calc_intraday_vol_ratio, axis=1)
-        if "latest_vol_ratio" in merged.columns:
-            merged["latest_vol_ratio"] = merged["intraday_vol_ratio"].where(
-                merged["intraday_vol_ratio"].notna(), merged["latest_vol_ratio"]
-            )
-        else:
-            merged["latest_vol_ratio"] = merged["intraday_vol_ratio"]
+        merged["live_intraday_vol_ratio"] = merged.apply(
+            _calc_intraday_vol_ratio, axis=1
+        )
+        if "asof_vol_ratio" not in merged.columns:
+            merged["asof_vol_ratio"] = None
 
         def _calc_gap(row: pd.Series) -> float | None:
             ref_close = row.get("prev_close")
             if ref_close is None:
-                ref_close = row.get("close")
+                ref_close = row.get("sig_close")
 
-            px = row.get("open")
+            px = row.get("live_open")
             if px is None or px <= 0:
-                px = row.get("latest")
+                px = row.get("live_latest")
 
             if ref_close is None or px is None:
                 return None
@@ -2239,7 +2272,7 @@ class MA5MA20OpenMonitorRunner:
                 return None
             return (px - ref_close) / ref_close
 
-        merged["gap_pct"] = merged.apply(_calc_gap, axis=1)
+        merged["live_gap_pct"] = merged.apply(_calc_gap, axis=1)
 
         max_up = self.params.max_gap_up_pct
         max_up_atr_mult = self.params.max_gap_up_atr_mult
@@ -2264,7 +2297,7 @@ class MA5MA20OpenMonitorRunner:
         status_reasons: List[str] = []
         signal_kinds: List[str] = []
         stop_refs: List[float | None] = []
-        signal_stop_refs: List[float | None] = []
+        sig_stop_refs: List[float | None] = []
         valid_days_list: List[int | None] = []
         entry_exposure_caps: List[float | None] = []
         env_index_scores: List[float | None] = []
@@ -2302,18 +2335,39 @@ class MA5MA20OpenMonitorRunner:
         strength_deltas: List[float | None] = []
         strength_trends: List[str | None] = []
         strength_notes: List[str | None] = []
-        used_ma5_list: List[float | None] = []
-        used_ma20_list: List[float | None] = []
-        used_ma60_list: List[float | None] = []
-        used_vol_ratio_list: List[float | None] = []
-        used_macd_hist_list: List[float | None] = []
+        asof_ma5_list: List[float | None] = []
+        asof_ma20_list: List[float | None] = []
+        asof_ma60_list: List[float | None] = []
+        asof_ma250_list: List[float | None] = []
+        asof_vol_ratio_list: List[float | None] = []
+        asof_macd_hist_list: List[float | None] = []
 
-        def _prefer_latest(row: pd.Series, key: str) -> float | None:
-            latest_val = row.get(f"latest_{key}")
-            if latest_val is not None and not pd.isna(latest_val):
-                return latest_val
-            val = row.get(key)
-            return None if pd.isna(val) else val
+        def _coalesce(row: pd.Series, *cols: str) -> float | None:
+            for col in cols:
+                val = row.get(col)
+                if val is not None and not pd.isna(val):
+                    return val
+            return None
+
+        def _dec(row: pd.Series, key: str) -> float | None:
+            return _coalesce(row, f"asof_{key}", f"sig_{key}")
+
+        def _px_now(row: pd.Series) -> float | None:
+            return _coalesce(
+                row,
+                "live_latest",
+                "live_open",
+                "asof_close",
+                "sig_close",
+            )
+
+        def _vol_ratio_dec(row: pd.Series) -> float | None:
+            return _coalesce(
+                row,
+                "live_intraday_vol_ratio",
+                "asof_vol_ratio",
+                "sig_vol_ratio",
+            )
 
         def _calc_signal_strength(
             row: pd.Series,
@@ -2324,13 +2378,15 @@ class MA5MA20OpenMonitorRunner:
             score = 0.0
             notes: list[str] = []
 
-            ma5 = _prefer_latest(row, "ma5")
-            ma20 = _prefer_latest(row, "ma20")
-            ma60 = _prefer_latest(row, "ma60")
-            vol_ratio_val = _prefer_latest(row, "vol_ratio")
-            atr14_val = _prefer_latest(row, "atr14")
-            macd_hist_signal = _to_float(row.get("macd_hist"))
-            macd_hist_now = _to_float(row.get("latest_macd_hist"))
+            ma5 = _dec(row, "ma5")
+            ma20 = _dec(row, "ma20")
+            ma60 = _dec(row, "ma60")
+            vol_ratio_val = _vol_ratio_dec(row)
+            atr14_val = _dec(row, "atr14")
+            macd_hist_signal = _to_float(row.get("sig_macd_hist"))
+            macd_hist_now = _to_float(row.get("live_macd_hist"))
+            if macd_hist_now is None:
+                macd_hist_now = _to_float(row.get("asof_macd_hist"))
             if macd_hist_now is None:
                 macd_hist_now = macd_hist_signal
 
@@ -2450,26 +2506,26 @@ class MA5MA20OpenMonitorRunner:
             risk_note = str(row.get("risk_note") or "").strip()
             risk_tags_split = [t.strip() for t in risk_tag_raw.split("|") if t.strip()]
 
-            open_px = row.get("open")
-            latest_px = row.get("latest")
+            open_px = row.get("live_open")
+            latest_px = row.get("live_latest")
             entry_px = open_px
-            ma20 = _prefer_latest(row, "ma20")
-            ma5 = _prefer_latest(row, "ma5")
-            ma60 = _prefer_latest(row, "ma60")
-            ma250 = _prefer_latest(row, "ma250")
-            vol_ratio = _prefer_latest(row, "vol_ratio")
-            macd_hist = _prefer_latest(row, "macd_hist")
-            atr14 = _prefer_latest(row, "atr14")
+            ma20 = _dec(row, "ma20")
+            ma5 = _dec(row, "ma5")
+            ma60 = _dec(row, "ma60")
+            ma250 = _dec(row, "ma250")
+            vol_ratio = _vol_ratio_dec(row)
+            macd_hist = _dec(row, "macd_hist")
+            atr14 = _dec(row, "atr14")
 
-            signal_stop_ref = _prefer_latest(row, "stop_ref")
-            signal_close = row.get("close")
-            current_close = _prefer_latest(row, "close")
+            signal_stop_ref = _dec(row, "stop_ref")
+            signal_close = row.get("sig_close")
+            current_close = _coalesce(row, "asof_close", "sig_close")
             ref_close = row.get("prev_close")
             if ref_close is None:
                 ref_close = signal_close
 
-            gap = row.get("gap_pct")
-            pct = row.get("pct_change")
+            gap = row.get("live_gap_pct")
+            pct = row.get("live_pct_change")
             signal_day_pct = row.get("_signal_day_pct_change")
             signal_reason = str(row.get("reason") or "")
             signal_age = row.get("signal_age")
@@ -2489,15 +2545,7 @@ class MA5MA20OpenMonitorRunner:
             if entry_px is not None and atr14 is not None and atr14 > 0 and stop_atr_mult > 0:
                 stop_ref = entry_px - stop_atr_mult * atr14
 
-            def _current_price() -> float | None:
-                px = latest_px
-                if px is None or px <= 0:
-                    px = open_px
-                if px is None or px <= 0:
-                    px = current_close
-                return px
-
-            price_now = _current_price()
+            price_now = _px_now(row)
 
             board_candidates: list[str] = []
             for key in [
@@ -2917,11 +2965,12 @@ class MA5MA20OpenMonitorRunner:
             strength_trends.append(strength_trend)
             strength_notes.append(strength_note or None)
             entry_exposure_caps.append(entry_exposure_cap)
-            used_ma5_list.append(_to_float(ma5))
-            used_ma20_list.append(_to_float(ma20))
-            used_ma60_list.append(_to_float(ma60))
-            used_vol_ratio_list.append(_to_float(vol_ratio))
-            used_macd_hist_list.append(_to_float(macd_hist))
+            asof_ma5_list.append(_to_float(ma5))
+            asof_ma20_list.append(_to_float(ma20))
+            asof_ma60_list.append(_to_float(ma60))
+            asof_ma250_list.append(_to_float(ma250))
+            asof_vol_ratio_list.append(_to_float(vol_ratio))
+            asof_macd_hist_list.append(_to_float(macd_hist))
 
             env_weekly_asof_trade_dates.append(env_weekly_asof_trade_date)
             env_weekly_week_closed_list.append(
@@ -2986,18 +3035,17 @@ class MA5MA20OpenMonitorRunner:
             status_reasons.append(status_reason)
             signal_kinds.append("PULLBACK" if is_pullback else "CROSS")
             stop_refs.append(_to_float(stop_ref))
-            signal_stop_refs.append(_to_float(signal_stop_ref))
+            sig_stop_refs.append(_to_float(signal_stop_ref))
             valid_days_list.append(valid_days)
 
         merged["monitor_date"] = dt.date.today().isoformat()
-        merged["latest_trade_date"] = latest_trade_date
         merged["volume_unit"] = VOLUME_UNIT_SHARES
         merged["action"] = actions
         merged["action_reason"] = reasons
         merged["candidate_status"] = statuses
         merged["status_reason"] = status_reasons
         merged["stop_ref"] = stop_refs
-        merged["signal_stop_ref"] = signal_stop_refs
+        merged["sig_stop_ref"] = sig_stop_refs
         merged["valid_days"] = valid_days_list
         merged["entry_exposure_cap"] = entry_exposure_caps
         merged["checked_at"] = checked_at_ts
@@ -3037,86 +3085,82 @@ class MA5MA20OpenMonitorRunner:
         merged["strength_delta"] = strength_deltas
         merged["strength_trend"] = strength_trends
         merged["strength_note"] = strength_notes
-        merged["used_ma5"] = used_ma5_list
-        merged["used_ma20"] = used_ma20_list
-        merged["used_ma60"] = used_ma60_list
-        merged["used_vol_ratio"] = used_vol_ratio_list
-        merged["used_macd_hist"] = used_macd_hist_list
         merged["signal_kind"] = signal_kinds
 
-        merged["signal_close"] = merged.get("close")
-        merged["asof_close"] = merged.get("latest_close")
-        if "asof_close" in merged.columns:
-            merged["asof_close"] = merged["asof_close"].where(
-                merged["asof_close"].notna(), merged.get("close")
+        merged["asof_trade_date"] = latest_trade_date
+        merged["asof_ma5"] = asof_ma5_list
+        merged["asof_ma20"] = asof_ma20_list
+        merged["asof_ma60"] = asof_ma60_list
+        merged["asof_ma250"] = asof_ma250_list
+        merged["asof_macd_hist"] = asof_macd_hist_list
+        merged["asof_vol_ratio"] = asof_vol_ratio_list
+        if "asof_close" not in merged.columns:
+            merged["asof_close"] = merged.get("sig_close")
+
+        if (
+            "asof_ma250" in merged.columns
+            and merged.get("asof_ma250") is not None
+            and pd.to_numeric(merged.get("asof_ma250"), errors="coerce").isna().all()
+        ):
+            latest_ma250_series = None
+            if "asof_ma250" in merged.columns:
+                latest_ma250_series = pd.to_numeric(
+                    merged.get("asof_ma250"), errors="coerce"
+                )
+            signal_ma250_series = pd.to_numeric(
+                merged.get("sig_ma250"), errors="coerce"
             )
-        else:
-            merged["asof_close"] = merged.get("close")
-
-        merged["signal_ma5"] = merged.get("ma5")
-        merged["signal_ma20"] = merged.get("ma20")
-        merged["signal_ma60"] = merged.get("ma60")
-        merged["signal_ma250"] = merged.get("ma250")
-        merged["signal_macd_hist"] = merged.get("macd_hist")
-        merged["signal_vol_ratio"] = merged.get("vol_ratio")
-
-        merged["asof_ma5"] = merged.get("used_ma5")
-        merged["asof_ma20"] = merged.get("used_ma20")
-        merged["asof_ma60"] = merged.get("used_ma60")
-        merged["asof_ma250"] = merged.get("used_ma250")
-        merged["asof_macd_hist"] = merged.get("used_macd_hist")
-        merged["asof_vol_ratio"] = merged.get("used_vol_ratio")
+            has_ma250 = False
+            if latest_ma250_series is not None:
+                has_ma250 = latest_ma250_series.notna().any()
+            if not has_ma250 and not signal_ma250_series.isna().all():
+                has_ma250 = True
+            if has_ma250:
+                self.logger.warning(
+                    "asof_ma250 计算为空：请检查 ma250 列合并/命名是否正确。"
+                )
 
         keep_cols = [
             "monitor_date",
-            "latest_trade_date",
-            "date",
+            "sig_date",
             "signal_age",
             "valid_days",
             "code",
             "name",
-            "close",
-            "signal_close",
-            "asof_close",
-            "open",
-            "latest",
-            "pct_change",
-            "gap_pct",
-            "high",
-            "low",
-            "volume",
-            "amount",
+            "asof_trade_date",
             "volume_unit",
             "avg_volume_20",
-            "intraday_vol_ratio",
-            "ma5",
-            "ma20",
-            "ma60",
-            "ma250",
-            "signal_ma5",
-            "signal_ma20",
-            "signal_ma60",
-            "signal_ma250",
-            "vol_ratio",
-            "macd_hist",
-            "signal_vol_ratio",
-            "signal_macd_hist",
-            "used_ma5",
-            "used_ma20",
-            "used_ma60",
+            "live_open",
+            "live_high",
+            "live_low",
+            "live_latest",
+            "live_volume",
+            "live_amount",
+            "live_gap_pct",
+            "live_pct_change",
+            "live_intraday_vol_ratio",
+            "live_checked_at",
+            "sig_close",
+            "sig_ma5",
+            "sig_ma20",
+            "sig_ma60",
+            "sig_ma250",
+            "sig_vol_ratio",
+            "sig_macd_hist",
+            "sig_atr14",
+            "sig_stop_ref",
+            "asof_close",
             "asof_ma5",
             "asof_ma20",
             "asof_ma60",
             "asof_ma250",
-            "used_vol_ratio",
-            "used_macd_hist",
             "asof_vol_ratio",
             "asof_macd_hist",
+            "asof_atr14",
+            "asof_stop_ref",
             "kdj_k",
             "kdj_d",
-            "atr14",
             "stop_ref",
-            "signal_stop_ref",
             "entry_exposure_cap",
             "env_index_score",
             "env_regime",
@@ -3169,6 +3213,7 @@ class MA5MA20OpenMonitorRunner:
             "dedupe_bucket",
             "snapshot_hash",
         ]
+
         for col in keep_cols:
             if col not in merged.columns:
                 merged[col] = None
@@ -3214,7 +3259,7 @@ class MA5MA20OpenMonitorRunner:
 
         df["snapshot_hash"] = df.apply(lambda row: make_snapshot_hash(row.to_dict()), axis=1)
         df = df.drop_duplicates(
-            subset=["monitor_date", "date", "code", "dedupe_bucket", "snapshot_hash"]
+            subset=["monitor_date", "sig_date", "code", "dedupe_bucket", "snapshot_hash"]
         )
 
         # 增量模式：不删除旧记录，保留每次运行的历史快照（checked_at 会区分）
@@ -3296,14 +3341,15 @@ class MA5MA20OpenMonitorRunner:
 
         export_df = df.copy()
         export_df = export_df.drop(columns=["snapshot_hash"], errors="ignore")
-        export_df["gap_pct"] = export_df["gap_pct"].apply(_to_float)
+        gap_col = "live_gap_pct" if "live_gap_pct" in export_df.columns else "gap_pct"
+        export_df[gap_col] = export_df[gap_col].apply(_to_float)
         # CSV 里把“状态正常且可执行”放在最前面，方便你开盘快速扫一眼
         action_rank = {"EXECUTE": 0, "WAIT": 1, "SKIP": 2, "UNKNOWN": 3}
         status_rank = {"ACTIVE": 0, "WAIT": 1, "EXPIRED": 2, "INVALID": 3, "UNKNOWN": 4}
         export_df["_action_rank"] = export_df["action"].map(action_rank).fillna(99)
         export_df["_status_rank"] = export_df["candidate_status"].map(status_rank).fillna(99)
         export_df = export_df.sort_values(
-            by=["_status_rank", "_action_rank", "gap_pct"], ascending=[True, True, True]
+            by=["_status_rank", "_action_rank", gap_col], ascending=[True, True, True]
         )
         export_df = export_df.drop(columns=["_action_rank", "_status_rank"], errors="ignore")
         if self.params.export_top_n > 0:
@@ -3392,12 +3438,21 @@ class MA5MA20OpenMonitorRunner:
         self.logger.info("开盘监测结果统计：%s", summary)
 
         exec_df = result[result["action"] == "EXECUTE"].copy()
-        exec_df["gap_pct"] = exec_df["gap_pct"].apply(_to_float)
-        exec_df = exec_df.sort_values(by="gap_pct", ascending=True)
+        gap_col = "live_gap_pct" if "live_gap_pct" in exec_df.columns else "gap_pct"
+        exec_df[gap_col] = exec_df[gap_col].apply(_to_float)
+        exec_df = exec_df.sort_values(by=gap_col, ascending=True)
         top_n = min(30, len(exec_df))
         if top_n > 0:
             preview = exec_df[
-                ["code", "name", "close", "open", "latest", "gap_pct", "action_reason"]
+                [
+                    "code",
+                    "name",
+                    "sig_close",
+                    "live_open",
+                    "live_latest",
+                    gap_col,
+                    "action_reason",
+                ]
             ].head(top_n)
             self.logger.info(
                 "可执行清单 Top%s（按 gap 由小到大）：\n%s",
@@ -3406,12 +3461,20 @@ class MA5MA20OpenMonitorRunner:
             )
 
         wait_df = result[result["action"] == "WAIT"].copy()
-        wait_df["gap_pct"] = wait_df["gap_pct"].apply(_to_float)
-        wait_df = wait_df.sort_values(by="gap_pct", ascending=True)
+        wait_df[gap_col] = wait_df[gap_col].apply(_to_float)
+        wait_df = wait_df.sort_values(by=gap_col, ascending=True)
         wait_top = min(10, len(wait_df))
         if wait_top > 0:
             wait_preview = wait_df[
-                ["code", "name", "close", "open", "latest", "gap_pct", "status_reason"]
+                [
+                    "code",
+                    "name",
+                    "sig_close",
+                    "live_open",
+                    "live_latest",
+                    gap_col,
+                    "status_reason",
+                ]
             ].head(wait_top)
             self.logger.info(
                 "WAIT 观察清单 Top%s（按 gap 由小到大）：\n%s",
