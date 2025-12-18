@@ -2457,6 +2457,9 @@ class MA5MA20OpenMonitorRunner:
             risk_tags_split = [t.strip() for t in risk_tag_raw.split("|") if t.strip()]
             weekly_gate_action = weekly_gate_policy or "NOT_APPLIED"
 
+            pct = row.get("live_pct_change")
+            live_intraday_vol_ratio = row.get("live_intraday_vol_ratio")
+
             if (
                 pct is not None
                 and pct <= -0.04
@@ -2491,7 +2494,6 @@ class MA5MA20OpenMonitorRunner:
                 ref_close = signal_close
 
             gap = row.get("live_gap_pct")
-            pct = row.get("live_pct_change")
             signal_day_pct = row.get("_signal_day_pct_change")
             signal_reason = str(row.get("sig_reason") or "")
             signal_age = row.get("signal_age")
