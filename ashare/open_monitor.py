@@ -191,6 +191,9 @@ class OpenMonitorParams:
     # 输出模式：FULL 保留全部字段，COMPACT 只保留核心字段
     output_mode: str = "COMPACT"
 
+    # 环境快照持久化：默认关闭，防止 open_monitor 写入 env 表
+    persist_env_snapshot: bool = False
+
     @classmethod
     def from_config(cls) -> "OpenMonitorParams":
         sec = get_section("open_monitor") or {}
@@ -326,6 +329,9 @@ class OpenMonitorParams:
             or cls.env_snapshot_table,
             output_mode=str(sec.get("output_mode", cls.output_mode)).strip().upper()
             or cls.output_mode,
+            persist_env_snapshot=_get_bool(
+                "persist_env_snapshot", cls.persist_env_snapshot
+            ),
         )
 
 
@@ -1191,6 +1197,8 @@ class MA5MA20OpenMonitorRunner:
             "weekly_note": weekly_scenario.get("weekly_note"),
             "regime": row.get("env_regime"),
             "position_hint": row.get("env_position_hint"),
+            "position_hint_raw": row.get("env_position_hint_raw"),
+            "effective_position_hint": row.get("env_position_hint"),
             "weekly_gate_policy": (
                 row.get("env_weekly_gate_policy")
                 or row.get("env_weekly_gate_action")
@@ -3531,7 +3539,11 @@ class MA5MA20OpenMonitorRunner:
                 and str(env_context.get("dedupe_bucket") or "") == str(dedupe_bucket)
             )
 
-        if env_context and not env_snapshot_matched_bucket:
+        if (
+            self.params.persist_env_snapshot
+            and env_context
+            and not env_snapshot_matched_bucket
+        ):
             self._persist_env_snapshot(
                 env_context,
                 monitor_date,
