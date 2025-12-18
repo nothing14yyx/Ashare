@@ -100,7 +100,7 @@ class WeeklyEnvironmentBuilder:
 
         trade_date = _parse_date(latest_trade_date)
         if trade_date is None:
-            return latest_trade_date, True
+            return latest_trade_date, False
 
         week_start = trade_date - dt.timedelta(days=trade_date.weekday())
         week_end = week_start + dt.timedelta(days=6)
@@ -120,9 +120,6 @@ class WeeklyEnvironmentBuilder:
                     break
 
             if last_trade_day_in_week:
-                if trade_date == last_trade_day_in_week:
-                    return trade_date.isoformat(), True
-
                 prev_week_last: dt.date | None = None
                 prev_candidate = week_start - dt.timedelta(days=1)
                 for _ in range(30):
@@ -131,15 +128,20 @@ class WeeklyEnvironmentBuilder:
                         break
                     prev_candidate -= dt.timedelta(days=1)
 
-                if prev_week_last:
-                    return prev_week_last.isoformat(), False
+                week_end_asof = (
+                    trade_date
+                    if trade_date == last_trade_day_in_week
+                    else prev_week_last or last_trade_day_in_week
+                )
+                return week_end_asof.isoformat(), trade_date == week_end_asof
 
         fallback_friday = week_start + dt.timedelta(days=4)
         if trade_date >= fallback_friday:
-            return fallback_friday.isoformat(), trade_date == fallback_friday
+            week_end_asof = fallback_friday
+            return week_end_asof.isoformat(), trade_date == week_end_asof
 
         prev_friday = fallback_friday - dt.timedelta(days=7)
-        return prev_friday.isoformat(), False
+        return prev_friday.isoformat(), trade_date == prev_friday
 
     def load_index_trend(self, latest_trade_date: str) -> Dict[str, Any]:
         """加载指数趋势情景。"""
@@ -324,6 +326,7 @@ class WeeklyEnvironmentBuilder:
             "weekly_plan_b_then": None,
             "weekly_plan_b_recover_if": None,
             "weekly_plan_json": None,
+            "weekly_note": None,
         }
 
         if not isinstance(weekly_payload, dict):
@@ -356,6 +359,8 @@ class WeeklyEnvironmentBuilder:
         scenario["weekly_plan_b_then"] = self._clip(plan.get("weekly_plan_b_then"), 64)
         scenario["weekly_plan_b_recover_if"] = self._clip(plan.get("weekly_plan_b_recover_if"), 128)
         scenario["weekly_plan_json"] = self._clip(plan.get("weekly_plan_json"), 2000)
+        if not scenario["weekly_current_week_closed"]:
+            scenario["weekly_note"] = "本周未收盘，等待区间破位/突破（周收盘有效）"
 
         tags: list[str] = []
         for key in ["weekly_structure_tags", "weekly_confirm_tags"]:
@@ -413,6 +418,12 @@ class WeeklyEnvironmentBuilder:
                 else min(position_hint_raw, weekly_cap)
             )
 
+        weekly_note = None
+        if isinstance(weekly_scenario, dict):
+            weekly_note = weekly_scenario.get("weekly_note")
+        if weekly_note is None and isinstance(weekly_channel, dict):
+            weekly_note = weekly_channel.get("note")
+
         env_context = {
             "index": index_trend,
             "weekly": weekly_channel,
@@ -425,7 +436,7 @@ class WeeklyEnvironmentBuilder:
             "effective_position_hint": effective_position_hint,
             "weekly_state": weekly_channel.get("state") if isinstance(weekly_channel, dict) else None,
             "weekly_position_hint": weekly_channel.get("position_hint") if isinstance(weekly_channel, dict) else None,
-            "weekly_note": weekly_channel.get("note") if isinstance(weekly_channel, dict) else None,
+            "weekly_note": weekly_note,
             "weekly_scenario": weekly_scenario,
             "weekly_asof_trade_date": weekly_scenario.get("weekly_asof_trade_date"),
             "weekly_week_closed": weekly_scenario.get("weekly_week_closed"),
