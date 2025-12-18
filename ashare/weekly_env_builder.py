@@ -303,9 +303,11 @@ class WeeklyEnvironmentBuilder:
             "weekly_gating_enabled": False,
             "weekly_structure_tags": [],
             "weekly_confirm_tags": [],
+            "weekly_money_tags": [],
             "weekly_risk_score": None,
             "weekly_risk_level": "UNKNOWN",
-            "weekly_confirm": None,
+            "weekly_confirm": False,
+            "weekly_direction_confirmed": False,
             "weekly_key_levels": {},
             "weekly_money_proxy": {},
             "weekly_plan_a": None,
@@ -339,6 +341,9 @@ class WeeklyEnvironmentBuilder:
         scenario["weekly_risk_score"] = to_float(plan.get("weekly_risk_score"))
         scenario["weekly_risk_level"] = plan.get("weekly_risk_level") or "UNKNOWN"
         scenario["weekly_confirm"] = plan.get("weekly_confirm")
+        scenario["weekly_direction_confirmed"] = bool(
+            plan.get("weekly_direction_confirmed", False)
+        )
         scenario["weekly_key_levels"] = plan.get("weekly_key_levels", {})
         scenario["weekly_key_levels_str"] = self._clip(plan.get("weekly_key_levels_str"), 255)
         scenario["weekly_plan_a"] = self._clip(plan.get("weekly_plan_a"), 255)
@@ -425,6 +430,10 @@ class WeeklyEnvironmentBuilder:
             "weekly_plan_json": weekly_scenario.get("weekly_plan_json"),
             "weekly_bias": weekly_scenario.get("weekly_bias"),
             "weekly_status": weekly_scenario.get("weekly_status"),
+            "weekly_direction_confirmed": weekly_scenario.get(
+                "weekly_direction_confirmed"
+            ),
+            "weekly_money_tags": weekly_scenario.get("weekly_money_tags"),
         }
 
         money_proxy = weekly_scenario.get("weekly_money_proxy") if isinstance(weekly_scenario, dict) else {}

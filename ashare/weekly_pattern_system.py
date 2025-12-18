@@ -76,6 +76,7 @@ class PatternCandidate:
     key_levels: Dict[str, float]
     structure_tags: List[str]
     confirm_tags: List[str]
+    money_tags: List[str]
     description: str
 
 
@@ -184,6 +185,7 @@ class WeeklyPlanSystem:
             key_levels={},
             structure_tags=tags,
             confirm_tags=[],
+            money_tags=[],
             description="冲击后横盘整理，留意突破",  # 简短描述
         )
 
@@ -204,6 +206,7 @@ class WeeklyPlanSystem:
                         key_levels={"neckline": neckline} if neckline else {},
                         structure_tags=["DOUBLE_TOP"],
                         confirm_tags=[],
+                        money_tags=[],
                         description="双顶观察，关注颈线跌破",
                     )
         if len(lows) >= 2:
@@ -222,6 +225,7 @@ class WeeklyPlanSystem:
                         key_levels={"neckline": neckline} if neckline else {},
                         structure_tags=["DOUBLE_BOTTOM"],
                         confirm_tags=[],
+                        money_tags=[],
                         description="双底观察，关注颈线突破",
                     )
         return None
@@ -245,6 +249,7 @@ class WeeklyPlanSystem:
             key_levels={"neckline": neckline},
             structure_tags=["HS_TOP"],
             confirm_tags=[],
+            money_tags=[],
             description="头肩顶雏形，关注颈线跌破",
         )
 
@@ -345,6 +350,7 @@ class WeeklyPlanSystem:
             key_levels=key_levels,
             structure_tags=[scene] + tags,
             confirm_tags=[],
+            money_tags=[],
             description="形态识别完成，等待突破",
         )
 
@@ -378,6 +384,7 @@ class WeeklyPlanSystem:
         last_close = float(df["close"].iloc[-1]) if not df.empty else None
         wk_vol_ratio = df["wk_vol_ratio_20"].iloc[-1] if not df.empty else np.nan
         confirm_tags = list(candidate.confirm_tags)
+        money_tags = list(candidate.money_tags)
         structure_tags = list(candidate.structure_tags)
         status = candidate.status
         scene = candidate.scene
@@ -417,10 +424,11 @@ class WeeklyPlanSystem:
         elif pd.notna(wk_vol_ratio) and wk_vol_ratio < 0.9:
             confirm_tags.append("VOL_WEAK")
 
-        confirm_signals = self._collect_confirm_signals(
+        confirm_signals, money_signals = self._collect_confirm_signals(
             df, key_levels, wk_vol_ratio, slope_change
         )
         confirm_tags.extend(confirm_signals)
+        money_tags.extend(money_signals)
         confirmed = confirmed or bool(confirm_signals)
 
         if status in {"BREAKOUT_UP", "BREAKOUT_DOWN"} and confirmed:
@@ -430,6 +438,7 @@ class WeeklyPlanSystem:
             confirm_tags.append("IF_CURRENT_WEEK_UNCLOSED")
 
         confirm_tags = list(dict.fromkeys(confirm_tags))
+        money_tags = list(dict.fromkeys(money_tags))
 
         score = candidate.score
         if status == "CONFIRMED":
@@ -445,6 +454,7 @@ class WeeklyPlanSystem:
             key_levels=key_levels,
             structure_tags=structure_tags,
             confirm_tags=confirm_tags,
+            money_tags=money_tags,
             description=candidate.description,
         )
 
@@ -454,8 +464,9 @@ class WeeklyPlanSystem:
         key_levels: Dict[str, float],
         wk_vol_ratio: float | None,
         slope_change: float | None = None,
-    ) -> List[str]:
+    ) -> Tuple[List[str], List[str]]:
         confirm_tags: List[str] = []
+        money_tags: List[str] = []
         vol_threshold = self.confirm_vol_ratio_threshold
         if pd.notna(wk_vol_ratio) and wk_vol_ratio >= vol_threshold:
             confirm_tags.append("VOL_CONFIRM")
@@ -463,9 +474,9 @@ class WeeklyPlanSystem:
         obv_slope = float(df["obv_slope_13"].iloc[-1]) if not df.empty else None
         vol_not_weak = pd.isna(wk_vol_ratio) or wk_vol_ratio >= 0.9
         if obv_slope is not None and not pd.isna(obv_slope) and obv_slope > 0:
-            confirm_tags.append("OBV_SLOPE_UP")
+            money_tags.append("OBV_SLOPE_UP")
         elif slope_change is not None and not pd.isna(slope_change) and slope_change > 0 and vol_not_weak:
-            confirm_tags.append("MONEY_FLOW_TURNING_UP")
+            money_tags.append("MONEY_FLOW_TURNING_UP")
 
         upper = key_levels.get("upper")
         if upper is not None and len(df) >= 2:
@@ -476,7 +487,7 @@ class WeeklyPlanSystem:
                 if last_close > upper * (1 + self.break_eps * 0.5) and recent_low >= hold_threshold:
                     confirm_tags.append("RETEST_HELD")
 
-        return confirm_tags
+        return confirm_tags, money_tags
 
     def _risk(self, bias: str, status: str, confirmed: bool) -> Tuple[float, str]:
         score = 50.0
@@ -509,17 +520,20 @@ class WeeklyPlanSystem:
         scene_code: str,
         bias: str,
         status: str,
-        confirmed: bool,
+        direction_confirmed: bool,
         key_levels: Dict[str, float],
         current_week_closed: bool,
+        gate_policy: str | None = None,
     ) -> Tuple[str, str, str | None, str, str, float | None, str | None, str, str | None]:
         plan_a_if: List[str] = []
         plan_b_if: List[str] = []
         plan_b_recover: List[str] = []
-        plan_a_confirm = "VOL_CONFIRM_REQUIRED" if not confirmed else "CONFIRMED"
+        plan_a_confirm = "VOL_CONFIRM_REQUIRED" if not direction_confirmed else "CONFIRMED"
         plan_a_then = "THEN_FOLLOW_BREAKOUT_UP" if bias == "BULLISH" else "THEN_DEFEND"
         plan_b_then = "THEN_DOWNGRADE_WAIT"
         exposure_cap = None
+
+        gate_policy_norm = str(gate_policy or "").upper() or None
 
         if status in {"FORMING"}:
             plan_a_if.append("IF_WAIT_RANGE_BREAK")
@@ -527,9 +541,11 @@ class WeeklyPlanSystem:
             plan_a_if.append("IF_BREAKOUT_UP")
         if status == "BREAKOUT_DOWN":
             plan_a_if.append("IF_BREAKDOWN")
+        if gate_policy_norm == "WAIT" and "IF_WAIT_RANGE_BREAK" not in plan_a_if:
+            plan_a_if.append("IF_WAIT_RANGE_BREAK")
         if not current_week_closed:
             plan_a_if.append("IF_CURRENT_WEEK_UNCLOSED")
-        if confirmed:
+        if direction_confirmed:
             plan_a_if.append("IF_CONFIRMED")
         if "VOL_CONFIRM" in plan_a_if:
             plan_a_confirm = "VOL_CONFIRM_REQUIRED"
@@ -601,10 +617,12 @@ class WeeklyPlanSystem:
             "weekly_key_levels_str": None,
             "weekly_structure_tags": [],
             "weekly_confirm_tags": [],
+            "weekly_money_tags": [],
             "weekly_money_proxy": {},
             "weekly_risk_score": None,
             "weekly_risk_level": "UNKNOWN",
-            "weekly_confirm": None,
+            "weekly_confirm": False,
+            "weekly_direction_confirmed": False,
             "weekly_gating_enabled": False,
             "weekly_plan_a": None,
             "weekly_plan_b": None,
@@ -651,20 +669,15 @@ class WeeklyPlanSystem:
             slope_delta = weekly_payload.get("context", {}).get("slope_change_4w")
 
         candidate = self._detect_pattern(df, weekly_closed, slope_delta)
+        gate_policy = weekly_payload.get("weekly_gate_policy")
+        if gate_policy is None and isinstance(index_trend, dict):
+            gate_policy = index_trend.get("weekly_gate_policy")
 
-        confirm_signal_set = {
-            t
-            for t in candidate.confirm_tags
-            if t
-            in {
-                "VOL_CONFIRM",
-                "OBV_SLOPE_UP",
-                "MONEY_FLOW_TURNING_UP",
-                "RETEST_HELD",
-            }
-        }
-        confirmed = candidate.status in {"CONFIRMED"} or bool(confirm_signal_set)
-        risk_score, risk_level = self._risk(candidate.bias, candidate.status, confirmed)
+        direction_confirmed = candidate.status == "CONFIRMED"
+        structure_status = "CONFIRMED" if direction_confirmed else "FORMING"
+        risk_score, risk_level = self._risk(
+            candidate.bias, candidate.status, direction_confirmed
+        )
 
         key_levels = dict(candidate.key_levels)
         if not key_levels.get("ma_fast"):
@@ -701,9 +714,10 @@ class WeeklyPlanSystem:
             f"{candidate.scene}_{candidate.status}",
             candidate.bias,
             candidate.status,
-            confirmed,
+            direction_confirmed,
             key_levels,
             current_week_closed,
+            gate_policy,
         )
 
         if exposure_cap is None:
@@ -728,15 +742,17 @@ class WeeklyPlanSystem:
             {
                 "weekly_scene_code": f"{candidate.scene}_{candidate.status}",
                 "weekly_bias": candidate.bias,
-                "weekly_status": candidate.status,
+                "weekly_status": structure_status,
                 "weekly_key_levels": key_levels,
                 "weekly_key_levels_str": key_levels_str,
                 "weekly_structure_tags": candidate.structure_tags,
                 "weekly_confirm_tags": candidate.confirm_tags,
+                "weekly_money_tags": candidate.money_tags,
                 "weekly_money_proxy": money_proxy,
                 "weekly_risk_score": risk_score,
                 "weekly_risk_level": risk_level,
-                "weekly_confirm": confirmed,
+                "weekly_confirm": direction_confirmed,
+                "weekly_direction_confirmed": direction_confirmed,
                 "weekly_gating_enabled": True,
                 "weekly_plan_a": plan_a,
                 "weekly_plan_b": plan_b,
@@ -752,6 +768,10 @@ class WeeklyPlanSystem:
                 "weekly_current_week_closed": current_week_closed,
             }
         )
-        plan["weekly_plan_json"] = _clip_text(pd.Series(plan).to_json(force_ascii=False), 2000)
+        plan_payload = dict(plan)
+        plan_payload.pop("weekly_plan_json", None)
+        plan["weekly_plan_json"] = _clip_text(
+            pd.Series(plan_payload).to_json(force_ascii=False), 2000
+        )
         return plan
 

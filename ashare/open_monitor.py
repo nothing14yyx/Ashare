@@ -1154,6 +1154,8 @@ class MA5MA20OpenMonitorRunner:
         _backfill("weekly_plan_b_recover_if")
         _backfill("weekly_structure_tags")
         _backfill("weekly_confirm_tags")
+        _backfill("weekly_money_tags")
+        _backfill("weekly_direction_confirmed")
         _backfill("weekly_key_levels")
 
         env_context: dict[str, Any] = {
@@ -1169,6 +1171,10 @@ class MA5MA20OpenMonitorRunner:
             ),
             "weekly_bias": weekly_scenario.get("weekly_bias"),
             "weekly_status": weekly_scenario.get("weekly_status"),
+            "weekly_direction_confirmed": weekly_scenario.get(
+                "weekly_direction_confirmed"
+            ),
+            "weekly_money_tags": weekly_scenario.get("weekly_money_tags"),
             "weekly_gating_enabled": bool(
                 weekly_scenario.get("weekly_gating_enabled", False)
             ),
@@ -2119,6 +2125,15 @@ class MA5MA20OpenMonitorRunner:
             )
             env_weekly_bias = env_context.get("weekly_bias")
             env_weekly_status = env_context.get("weekly_status")
+
+        if (
+            env_weekly_gating_enabled
+            and env_weekly_plan_a_exposure_cap is not None
+            and env_position_hint is not None
+        ):
+            env_position_hint = min(env_position_hint, env_weekly_plan_a_exposure_cap)
+        elif env_weekly_gating_enabled and env_weekly_plan_a_exposure_cap is not None:
+            env_position_hint = env_weekly_plan_a_exposure_cap
         index_score = None
         if isinstance(env_context, dict):
             index_section = env_context.get("index", {}) if isinstance(env_context.get("index"), dict) else {}
