@@ -960,10 +960,29 @@ class MA5MA20OpenMonitorRunner:
         if not isinstance(weekly_scenario, dict):
             weekly_scenario = {}
 
+        def _is_empty_env_value(value: Any) -> bool:
+            if value is None:
+                return True
+            if isinstance(value, str):
+                return value == ""
+            if isinstance(value, dict):
+                return len(value) == 0
+            if isinstance(value, (list, tuple, set)):
+                return len(value) == 0
+
+            size = getattr(value, "size", None)
+            if isinstance(size, int):
+                return size == 0
+
+            try:
+                return len(value) == 0  # type: ignore[arg-type]
+            except Exception:
+                return False
+
         def _get_env(key: str) -> Any:  # noqa: ANN401
             if isinstance(env_context, dict):
                 value = env_context.get(key, None)
-                if value not in (None, "", [], {}):
+                if not _is_empty_env_value(value):
                     return value
             return weekly_scenario.get(key)
 
