@@ -1215,7 +1215,9 @@ class MA5MA20OpenMonitorRunner:
             return env_context
 
         if allow_fallback and dedupe_bucket is not None:
-            return self._load_env_snapshot_context(monitor_date, None)
+            env_context = self._load_env_snapshot_context(monitor_date, None)
+            if env_context:
+                return env_context
 
         if allow_fallback:
             try:
@@ -1226,6 +1228,11 @@ class MA5MA20OpenMonitorRunner:
 
             if not asof_date:
                 return None
+
+            self.logger.info(
+                "当日环境快照缺失，尝试回退到最近已收盘周 asof_date=%s",
+                asof_date,
+            )
 
             env_context = self._load_env_snapshot_context(
                 asof_date, f"WEEKLY_{asof_date}"
@@ -3429,15 +3436,16 @@ class MA5MA20OpenMonitorRunner:
             monitor_date, dedupe_bucket, allow_fallback=True
         )
         if env_context:
-            if self.weekly_env_fallback_asof_date:
-                self.logger.info(
-                    "已回退到 asof_date=%s 的周线环境。",
-                    self.weekly_env_fallback_asof_date,
-                )
             loaded_bucket = str(env_context.get("dedupe_bucket") or "")
             env_snapshot_bucket = loaded_bucket or env_snapshot_bucket
             env_snapshot_matched_bucket = bool(loaded_bucket == str(dedupe_bucket))
-            if env_snapshot_matched_bucket:
+            if self.weekly_env_fallback_asof_date:
+                self.logger.info(
+                    "已加载周线回退环境（asof_date=%s，dedupe_bucket=%s）",
+                    self.weekly_env_fallback_asof_date,
+                    env_snapshot_bucket,
+                )
+            elif env_snapshot_matched_bucket:
                 self.logger.info(
                     "已加载环境快照（monitor_date=%s, dedupe_bucket=%s）",
                     monitor_date,
