@@ -13,7 +13,7 @@ from __future__ import annotations
 """
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -344,6 +344,7 @@ class WeeklyChannelClassifier:
             return WeeklyChannelResult(state=None, position_hint=None, detail={}, context={})
 
         detail: Dict[str, Dict[str, Any]] = {}
+        weekly_bars_by_code: Dict[str, list[dict[str, Any]]] = {}
         for code, grp in wk.groupby("code", sort=False):
             grp = grp.sort_values("week_end").reset_index(drop=True)
             if len(grp) < max(self.ma_slow, self.lrc_length):
@@ -352,6 +353,26 @@ class WeeklyChannelClassifier:
             else:
                 payload = self._classify_one(grp)
             detail[str(code)] = payload
+
+            code_weekly_bars: list[dict[str, Any]] = []
+            if not grp.empty:
+                for _, row in grp.tail(120).iterrows():
+                    try:
+                        week_end = pd.to_datetime(row.get("week_end")).date().isoformat()
+                    except Exception:
+                        week_end = str(row.get("week_end"))[:10]
+                    code_weekly_bars.append(
+                        {
+                            "week_end": week_end,
+                            "open": float(row.get("open")) if pd.notna(row.get("open")) else None,
+                            "high": float(row.get("high")) if pd.notna(row.get("high")) else None,
+                            "low": float(row.get("low")) if pd.notna(row.get("low")) else None,
+                            "close": float(row.get("close")) if pd.notna(row.get("close")) else None,
+                            "volume": float(row.get("volume")) if pd.notna(row.get("volume")) else None,
+                            "amount": float(row.get("amount")) if pd.notna(row.get("amount")) else None,
+                        }
+                    )
+            weekly_bars_by_code[str(code)] = code_weekly_bars
 
         # 选一个“主参考指数”输出整体 state（便于 open_monitor 直接引用）
         primary = self.primary_code
@@ -392,5 +413,6 @@ class WeeklyChannelClassifier:
                 "wk_vol_ratio_20": primary_payload.get("wk_vol_ratio_20"),
                 "slope_change_4w": primary_payload.get("slope_change_4w"),
                 "primary_weekly_bars": primary_weekly_bars,
+                "weekly_bars_by_code": weekly_bars_by_code,
             },
         )

@@ -265,6 +265,25 @@ class WeeklyEnvironmentBuilder:
         payload["weekly_asof_trade_date"] = week_end_asof
         payload["weekly_current_week_closed"] = current_week_closed
         payload["weekly_asof_week_closed"] = True
+
+        weekly_bars_by_code = {}
+        if isinstance(result.context, dict):
+            raw_weekly_bars = result.context.get("weekly_bars_by_code")
+            if isinstance(raw_weekly_bars, dict):
+                weekly_bars_by_code = {
+                    str(code): bars
+                    for code, bars in raw_weekly_bars.items()
+                    if isinstance(bars, list)
+                }
+
+        merged_weekly_windows: list[dict[str, Any]] = []
+        for code, bars in weekly_bars_by_code.items():
+            for item in bars:
+                if isinstance(item, dict):
+                    merged_weekly_windows.append({"code": code, **item})
+
+        payload["weekly_windows_by_code"] = weekly_bars_by_code
+        payload["weekly_windows_merged"] = merged_weekly_windows
         return payload
 
     @staticmethod
@@ -376,6 +395,8 @@ class WeeklyEnvironmentBuilder:
         env_context = {
             "index": index_trend,
             "weekly": weekly_channel,
+            "weekly_windows": weekly_channel.get("weekly_windows_merged"),
+            "weekly_windows_by_code": weekly_channel.get("weekly_windows_by_code"),
             "boards": board_map,
             "regime": index_trend.get("regime"),
             "position_hint": index_trend.get("position_hint"),

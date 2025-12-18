@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+from pathlib import Path
 
 from ashare.env_snapshot_utils import resolve_weekly_asof_date
 from ashare.open_monitor import MA5MA20OpenMonitorRunner
@@ -47,7 +48,26 @@ def main() -> None:
         checked_at=checked_at,
     )
 
-    output = {"env_snapshot": env_context or {}, "asof_trade_date": asof_date}
+    output_dir = Path("output/index_weekly_channel")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    weekly_windows: list[dict] = []
+    weekly_windows_by_code: dict = {}
+    if isinstance(env_context, dict):
+        weekly_windows = env_context.get("weekly_windows") or []
+        weekly_windows_by_code = env_context.get("weekly_windows_by_code") or {}
+
+    output = {
+        "env_snapshot": env_context or {},
+        "asof_trade_date": asof_date,
+        "weekly_windows": weekly_windows,
+        "weekly_windows_by_code": weekly_windows_by_code,
+    }
+
+    output_path = output_dir / f"index_weekly_channel_{asof_date}.json"
+    with output_path.open("w", encoding="utf-8") as f:
+        json.dump(output, f, ensure_ascii=False, indent=2)
+
     print(json.dumps(output, ensure_ascii=False, indent=2))
 
 
