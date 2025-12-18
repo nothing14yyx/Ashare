@@ -1040,20 +1040,12 @@ class MA5MA20OpenMonitorRunner:
         self, monitor_date: str, dedupe_bucket: str | None = None
     ) -> dict[str, Any] | None:
         table = self.params.env_snapshot_table
-        if not (
-            table
-            and monitor_date
-            and dedupe_bucket
-            and self._table_exists(table)
-        ):
+        if not (table and monitor_date and self._table_exists(table)):
             return None
 
         self._ensure_env_snapshot_schema(table)
 
         def _load_latest(match_bucket: bool) -> pd.DataFrame:
-            if match_bucket and not dedupe_bucket:
-                return pd.DataFrame()
-
             bucket_clause = "`dedupe_bucket` = :b AND" if match_bucket else ""
             stmt = text(
                 f"""
@@ -1065,16 +1057,19 @@ class MA5MA20OpenMonitorRunner:
             )
 
             params: dict[str, Any] = {"d": monitor_date}
-            if match_bucket:
+            if match_bucket and dedupe_bucket is not None:
                 params["b"] = dedupe_bucket
+            elif match_bucket:
+                return pd.DataFrame()
 
             with self.db_writer.engine.begin() as conn:
                 return pd.read_sql_query(stmt, conn, params=params)
 
         try:
-            df = _load_latest(match_bucket=True)
-            if df.empty:
+            if dedupe_bucket is None:
                 df = _load_latest(match_bucket=False)
+            else:
+                df = _load_latest(match_bucket=True)
         except Exception as exc:  # noqa: BLE001
             self.logger.debug("读取环境快照失败：%s", exc)
             return None
@@ -1124,9 +1119,28 @@ class MA5MA20OpenMonitorRunner:
                 row.get("env_weekly_gate_policy")
                 or row.get("env_weekly_gate_action")
             ),
+            "dedupe_bucket": row.get("dedupe_bucket"),
         }
 
         return env_context
+
+    def load_env_snapshot_context(
+        self,
+        monitor_date: str,
+        dedupe_bucket: str | None = None,
+        *,
+        allow_fallback: bool = True,
+    ) -> dict[str, Any] | None:
+        """公开的环境快照读取接口，必要时可回退到当日最新。"""
+
+        env_context = self._load_env_snapshot_context(monitor_date, dedupe_bucket)
+        if env_context:
+            return env_context
+
+        if allow_fallback and dedupe_bucket is not None:
+            return self._load_env_snapshot_context(monitor_date, None)
+
+        return None
 
     def _resolve_env_weekly_gate_policy(
         self, env_context: dict[str, Any] | None
@@ -3168,6 +3182,8 @@ class MA5MA20OpenMonitorRunner:
         checked_at = dt.datetime.now()
         monitor_date = checked_at.date().isoformat()
         dedupe_bucket = self._calc_dedupe_bucket(checked_at)
+        env_snapshot_bucket = dedupe_bucket
+        env_snapshot_matched_bucket = False
 
         latest_trade_date, signal_dates, signals = self._load_recent_buy_signals()
         if not latest_trade_date or signals.empty:
@@ -3183,20 +3199,25 @@ class MA5MA20OpenMonitorRunner:
             self.logger.info("实时行情已获取：%s 条", len(quotes))
 
         latest_snapshots = self._load_latest_snapshots(latest_trade_date, codes)
-        env_context = self._load_env_snapshot_context(monitor_date, dedupe_bucket)
+        env_context = self.load_env_snapshot_context(
+            monitor_date, dedupe_bucket, allow_fallback=True
+        )
         if env_context:
-            self.logger.info(
-                "已加载环境快照（monitor_date=%s, dedupe_bucket=%s）",
-                monitor_date,
-                dedupe_bucket,
-            )
-        else:
-            env_context = self._load_env_snapshot_context(monitor_date, None)
-            if env_context:
+            loaded_bucket = str(env_context.get("dedupe_bucket") or "")
+            env_snapshot_bucket = loaded_bucket or env_snapshot_bucket
+            env_snapshot_matched_bucket = bool(loaded_bucket == str(dedupe_bucket))
+            if env_snapshot_matched_bucket:
                 self.logger.info(
-                    "已加载当日最新环境快照（monitor_date=%s，未匹配 dedupe_bucket=%s）",
+                    "已加载环境快照（monitor_date=%s, dedupe_bucket=%s）",
+                    monitor_date,
+                    env_snapshot_bucket,
+                )
+            else:
+                self.logger.info(
+                    "已加载当日最新环境快照（monitor_date=%s，未匹配 dedupe_bucket=%s，实际=%s）",
                     monitor_date,
                     dedupe_bucket,
+                    env_snapshot_bucket,
                 )
         if not env_context:
             self.logger.warning(
@@ -3258,12 +3279,16 @@ class MA5MA20OpenMonitorRunner:
         if not result.empty and "dedupe_bucket" in result.columns:
             dedupe_bucket_val = str(result.iloc[0].get("dedupe_bucket") or "").strip()
             dedupe_bucket = dedupe_bucket_val or dedupe_bucket
+            env_snapshot_matched_bucket = bool(
+                env_context
+                and str(env_context.get("dedupe_bucket") or "") == str(dedupe_bucket)
+            )
 
-        if env_context:
+        if env_context and not env_snapshot_matched_bucket:
             self._persist_env_snapshot(
                 env_context,
                 monitor_date,
-                dedupe_bucket,
+                dedupe_bucket or env_snapshot_bucket,
                 checked_at,
                 weekly_gate_policy,
             )
