@@ -21,7 +21,6 @@ from datetime import timedelta
 import time
 
 from ashare.config import get_section
-from ashare.env_snapshot_utils import resolve_weekly_asof_date
 from ashare.open_monitor import MA5MA20OpenMonitorRunner
 
 
@@ -145,23 +144,16 @@ def main() -> None:
         if ensured_monitor_date == monitor_date:
             return monitor_date
 
-        env_context = runner.load_env_snapshot_context(monitor_date, None)
+        env_context = runner.load_env_snapshot_context(
+            monitor_date, None, allow_fallback=True
+        )
         if env_context:
             ensured_monitor_date = monitor_date
             return monitor_date
 
-        try:
-            asof_date = resolve_weekly_asof_date(args.include_current_week)
-        except ValueError as exc:
-            logger.warning("解析周线 asof_date 失败，跳过环境快照：%s", exc)
-            return monitor_date
-
-        checked_at = dt.datetime.now()
-        runner.build_and_persist_env_snapshot(
-            asof_date,
-            monitor_date=monitor_date,
-            dedupe_bucket=snapshot_bucket,
-            checked_at=checked_at,
+        logger.warning(
+            "未找到环境快照（monitor_date=%s），请先运行 run_index_weekly_channel 产出环境。",
+            monitor_date,
         )
         ensured_monitor_date = monitor_date
         return monitor_date
