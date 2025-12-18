@@ -1006,6 +1006,7 @@ class MA5MA20OpenMonitorRunner:
                     `env_weekly_plan_a_exposure_cap` DOUBLE NULL,
                     `env_weekly_bias` VARCHAR(16) NULL,
                     `env_weekly_status` VARCHAR(32) NULL,
+                    `env_weekly_gating_enabled` TINYINT(1) NULL,
                     `env_weekly_tags` VARCHAR(255) NULL,
                     `env_weekly_money_proxy` VARCHAR(255) NULL,
                     `env_weekly_note` VARCHAR(255) NULL,
@@ -1033,24 +1034,9 @@ class MA5MA20OpenMonitorRunner:
             "env_weekly_note": "VARCHAR(255)",
             "env_regime": "VARCHAR(32)",
             "env_position_hint": "DOUBLE",
+            "env_weekly_gating_enabled": "TINYINT(1)",
         }.items():
             self._ensure_column(table, col, f"{ddl} NULL")
-
-        index_name = "ux_env_snapshot_bucket"
-        if not self._index_exists(table, index_name):
-            try:
-                with self.db_writer.engine.begin() as conn:
-                    conn.execute(
-                        text(
-                            f"""
-                            CREATE UNIQUE INDEX `{index_name}`
-                            ON `{table}` (`monitor_date`, `dedupe_bucket`)
-                            """
-                        )
-                    )
-                self.logger.info("表 %s 已创建唯一索引 %s。", table, index_name)
-            except Exception as exc:  # noqa: BLE001
-                self.logger.warning("创建环境快照唯一索引失败：%s", exc)
 
     def _delete_existing_env_snapshot(self, table: str, monitor_date: str, bucket: str) -> None:
         if not (table and monitor_date and bucket and self._table_exists(table)):
@@ -1109,19 +1095,32 @@ class MA5MA20OpenMonitorRunner:
         )
         payload["env_weekly_bias"] = _get_env("weekly_bias")
         payload["env_weekly_status"] = _get_env("weekly_status")
+        payload["env_weekly_gating_enabled"] = bool(
+            _get_env("weekly_gating_enabled")
+        )
         payload["env_weekly_tags"] = _get_env("weekly_tags")
         payload["env_weekly_money_proxy"] = _get_env("weekly_money_proxy")
         payload["env_weekly_note"] = _get_env("weekly_note")
         payload["env_regime"] = _get_env("regime")
         payload["env_position_hint"] = _to_float(_get_env("position_hint"))
 
-        df = pd.DataFrame([payload])
-
         self._ensure_env_snapshot_schema(table)
-        self._delete_existing_env_snapshot(table, monitor_date, dedupe_bucket)
+        columns = list(payload.keys())
+        update_cols = [c for c in columns if c not in {"monitor_date", "dedupe_bucket"}]
+        col_clause = ", ".join(f"`{c}`" for c in columns)
+        value_clause = ", ".join(f":{c}" for c in columns)
+        update_clause = ", ".join(f"`{c}` = VALUES(`{c}`)" for c in update_cols)
+        stmt = text(
+            f"""
+            INSERT INTO `{table}` ({col_clause})
+            VALUES ({value_clause})
+            ON DUPLICATE KEY UPDATE {update_clause}
+            """
+        )
 
         try:
-            self.db_writer.write_dataframe(df, table, if_exists="append")
+            with self.db_writer.engine.begin() as conn:
+                conn.execute(stmt, payload)
             self.logger.info(
                 "环境快照已写入表 %s（monitor_date=%s, dedupe_bucket=%s）",
                 table,
@@ -1130,6 +1129,29 @@ class MA5MA20OpenMonitorRunner:
             )
         except Exception as exc:  # noqa: BLE001
             self.logger.warning("写入环境快照失败：%s", exc)
+
+    @staticmethod
+    def _resolve_env_weekly_gate_policy(env_context: dict[str, Any] | None) -> str | None:
+        if not env_context:
+            return None
+
+        gating_enabled = bool(env_context.get("weekly_gating_enabled"))
+        risk_level = str(env_context.get("weekly_risk_level") or "").upper()
+        status = str(env_context.get("weekly_status") or "").upper()
+
+        if not gating_enabled:
+            return "ALLOW"
+
+        if risk_level == "HIGH":
+            return "WAIT"
+
+        if risk_level == "MEDIUM" and status == "FORMING":
+            return "WAIT"
+
+        if risk_level in {"LOW", "MEDIUM"}:
+            return "ALLOW"
+
+        return None
 
     def _ensure_monitor_columns(self, table: str) -> None:
         if not table or not self._table_exists(table):
@@ -3473,14 +3495,10 @@ class MA5MA20OpenMonitorRunner:
 
         dedupe_bucket = self._calc_dedupe_bucket(checked_at)
         monitor_date = dt.date.today().isoformat()
-        weekly_gate_action = None
+        weekly_gate_action = self._resolve_env_weekly_gate_policy(env_context)
         if not result.empty and "dedupe_bucket" in result.columns:
             dedupe_bucket_val = str(result.iloc[0].get("dedupe_bucket") or "").strip()
             dedupe_bucket = dedupe_bucket_val or dedupe_bucket
-        if not result.empty and "env_weekly_gate_action" in result.columns:
-            gate_series = result["env_weekly_gate_action"].dropna().astype(str)
-            if not gate_series.empty:
-                weekly_gate_action = gate_series.mode().iloc[0]
 
         self._persist_env_snapshot(
             env_context, monitor_date, dedupe_bucket, checked_at, weekly_gate_action
