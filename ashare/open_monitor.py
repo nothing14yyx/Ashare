@@ -33,9 +33,12 @@ from typing import Any, Dict, List, Tuple
 import pandas as pd
 from sqlalchemy import bindparam, text
 
+from .baostock_core import BaostockDataFetcher
+from .baostock_session import BaostockSession
 from .config import get_section
 from .db import DatabaseConfig, MySQLWriter
 from .env_snapshot_utils import resolve_weekly_asof_date
+from .ma5_ma20_trend_strategy import _atr, _macd
 from .utils.convert import to_float as _to_float
 from .utils.logger import setup_logger
 from .weekly_env_builder import WeeklyEnvironmentBuilder
@@ -249,6 +252,10 @@ class OpenMonitorParams:
     # 输出控制
     write_to_db: bool = True
 
+    # 指数快照配置
+    index_code: str = "sh.000001"
+    index_hist_lookback_days: int = 250
+
     # 增量写入：
     # - True：每次运行都 append（保留历史快照，便于对比）
     # - False：按 monitor_date+code 先删后写（只保留当天最新一份）
@@ -375,6 +382,11 @@ class OpenMonitorParams:
             limit_up_trigger_pct=_normalize_percent_value(
                 _get_float("limit_up_trigger_pct", cls.limit_up_trigger_pct),
                 "limit_up_trigger_pct",
+            ),
+            index_code=str(sec.get("index_code", cls.index_code)).strip()
+            or cls.index_code,
+            index_hist_lookback_days=_get_int(
+                "index_hist_lookback_days", cls.index_hist_lookback_days
             ),
 
             max_entry_vs_ma5_pct=_normalize_ratio_pct(
@@ -1012,6 +1024,26 @@ class MA5MA20OpenMonitorRunner:
                     `env_regime` VARCHAR(32) NULL,
                     `env_position_hint` DOUBLE NULL,
                     `env_position_hint_raw` DOUBLE NULL,
+                    `env_index_code` VARCHAR(16) NULL,
+                    `env_index_asof_trade_date` VARCHAR(10) NULL,
+                    `env_index_asof_close` DOUBLE NULL,
+                    `env_index_asof_ma20` DOUBLE NULL,
+                    `env_index_asof_ma60` DOUBLE NULL,
+                    `env_index_asof_macd_hist` DOUBLE NULL,
+                    `env_index_asof_atr14` DOUBLE NULL,
+                    `env_index_live_trade_date` VARCHAR(10) NULL,
+                    `env_index_live_open` DOUBLE NULL,
+                    `env_index_live_high` DOUBLE NULL,
+                    `env_index_live_low` DOUBLE NULL,
+                    `env_index_live_latest` DOUBLE NULL,
+                    `env_index_live_pct_change` DOUBLE NULL,
+                    `env_index_live_volume` DOUBLE NULL,
+                    `env_index_live_amount` DOUBLE NULL,
+                    `env_index_dev_ma20_atr` DOUBLE NULL,
+                    `env_index_gate_action` VARCHAR(16) NULL,
+                    `env_index_gate_reason` VARCHAR(255) NULL,
+                    `env_index_position_cap` DOUBLE NULL,
+                    `env_final_gate_action` VARCHAR(16) NULL,
                     PRIMARY KEY (`monitor_date`, `dedupe_bucket`)
                 )
                 """
@@ -1037,6 +1069,26 @@ class MA5MA20OpenMonitorRunner:
             "env_position_hint_raw": "DOUBLE",
             "env_weekly_gating_enabled": "TINYINT(1)",
             "env_weekly_gate_policy": "VARCHAR(16)",
+            "env_index_code": "VARCHAR(16)",
+            "env_index_asof_trade_date": "VARCHAR(10)",
+            "env_index_asof_close": "DOUBLE",
+            "env_index_asof_ma20": "DOUBLE",
+            "env_index_asof_ma60": "DOUBLE",
+            "env_index_asof_macd_hist": "DOUBLE",
+            "env_index_asof_atr14": "DOUBLE",
+            "env_index_live_trade_date": "VARCHAR(10)",
+            "env_index_live_open": "DOUBLE",
+            "env_index_live_high": "DOUBLE",
+            "env_index_live_low": "DOUBLE",
+            "env_index_live_latest": "DOUBLE",
+            "env_index_live_pct_change": "DOUBLE",
+            "env_index_live_volume": "DOUBLE",
+            "env_index_live_amount": "DOUBLE",
+            "env_index_dev_ma20_atr": "DOUBLE",
+            "env_index_gate_action": "VARCHAR(16)",
+            "env_index_gate_reason": "VARCHAR(255)",
+            "env_index_position_cap": "DOUBLE",
+            "env_final_gate_action": "VARCHAR(16)",
         }.items():
             self._ensure_column(table, col, f"{ddl} NULL")
 
@@ -1115,6 +1167,33 @@ class MA5MA20OpenMonitorRunner:
             env_position_hint = _to_float(_get_env("position_hint"))
         payload["env_position_hint"] = env_position_hint
         payload["env_position_hint_raw"] = _to_float(_get_env("position_hint_raw"))
+        index_snapshot = {}
+        if isinstance(env_context, dict):
+            raw_index_snapshot = env_context.get("index_intraday")
+            if isinstance(raw_index_snapshot, dict):
+                index_snapshot = raw_index_snapshot
+        payload["env_index_code"] = index_snapshot.get("env_index_code")
+        payload["env_index_asof_trade_date"] = index_snapshot.get("env_index_asof_trade_date")
+        payload["env_index_asof_close"] = _to_float(index_snapshot.get("env_index_asof_close"))
+        payload["env_index_asof_ma20"] = _to_float(index_snapshot.get("env_index_asof_ma20"))
+        payload["env_index_asof_ma60"] = _to_float(index_snapshot.get("env_index_asof_ma60"))
+        payload["env_index_asof_macd_hist"] = _to_float(index_snapshot.get("env_index_asof_macd_hist"))
+        payload["env_index_asof_atr14"] = _to_float(index_snapshot.get("env_index_asof_atr14"))
+        payload["env_index_live_trade_date"] = index_snapshot.get("env_index_live_trade_date")
+        payload["env_index_live_open"] = _to_float(index_snapshot.get("env_index_live_open"))
+        payload["env_index_live_high"] = _to_float(index_snapshot.get("env_index_live_high"))
+        payload["env_index_live_low"] = _to_float(index_snapshot.get("env_index_live_low"))
+        payload["env_index_live_latest"] = _to_float(index_snapshot.get("env_index_live_latest"))
+        payload["env_index_live_pct_change"] = _to_float(index_snapshot.get("env_index_live_pct_change"))
+        payload["env_index_live_volume"] = _to_float(index_snapshot.get("env_index_live_volume"))
+        payload["env_index_live_amount"] = _to_float(index_snapshot.get("env_index_live_amount"))
+        payload["env_index_dev_ma20_atr"] = _to_float(index_snapshot.get("env_index_dev_ma20_atr"))
+        payload["env_index_gate_action"] = index_snapshot.get("env_index_gate_action")
+        payload["env_index_gate_reason"] = index_snapshot.get("env_index_gate_reason")
+        payload["env_index_position_cap"] = _to_float(index_snapshot.get("env_index_position_cap"))
+        payload["env_final_gate_action"] = self._merge_gate_actions(
+            env_weekly_gate_policy, index_snapshot.get("env_index_gate_action")
+        )
 
         self._ensure_env_snapshot_schema(table)
         columns = list(payload.keys())
@@ -1292,6 +1371,29 @@ class MA5MA20OpenMonitorRunner:
             ),
             "dedupe_bucket": row.get("dedupe_bucket"),
         }
+        index_snapshot = {
+            "env_index_code": row.get("env_index_code"),
+            "env_index_asof_trade_date": row.get("env_index_asof_trade_date"),
+            "env_index_asof_close": row.get("env_index_asof_close"),
+            "env_index_asof_ma20": row.get("env_index_asof_ma20"),
+            "env_index_asof_ma60": row.get("env_index_asof_ma60"),
+            "env_index_asof_macd_hist": row.get("env_index_asof_macd_hist"),
+            "env_index_asof_atr14": row.get("env_index_asof_atr14"),
+            "env_index_live_trade_date": row.get("env_index_live_trade_date"),
+            "env_index_live_open": row.get("env_index_live_open"),
+            "env_index_live_high": row.get("env_index_live_high"),
+            "env_index_live_low": row.get("env_index_live_low"),
+            "env_index_live_latest": row.get("env_index_live_latest"),
+            "env_index_live_pct_change": row.get("env_index_live_pct_change"),
+            "env_index_live_volume": row.get("env_index_live_volume"),
+            "env_index_live_amount": row.get("env_index_live_amount"),
+            "env_index_dev_ma20_atr": row.get("env_index_dev_ma20_atr"),
+            "env_index_gate_action": row.get("env_index_gate_action"),
+            "env_index_gate_reason": row.get("env_index_gate_reason"),
+            "env_index_position_cap": row.get("env_index_position_cap"),
+            "env_final_gate_action": row.get("env_final_gate_action"),
+        }
+        env_context["index_intraday"] = index_snapshot
 
         return env_context
 
@@ -1356,6 +1458,26 @@ class MA5MA20OpenMonitorRunner:
             "env_index_score": "DOUBLE",
             "env_regime": "VARCHAR(32)",
             "env_position_hint": "DOUBLE",
+            "env_index_code": "VARCHAR(16)",
+            "env_index_asof_trade_date": "VARCHAR(10)",
+            "env_index_asof_close": "DOUBLE",
+            "env_index_asof_ma20": "DOUBLE",
+            "env_index_asof_ma60": "DOUBLE",
+            "env_index_asof_macd_hist": "DOUBLE",
+            "env_index_asof_atr14": "DOUBLE",
+            "env_index_live_trade_date": "VARCHAR(10)",
+            "env_index_live_open": "DOUBLE",
+            "env_index_live_high": "DOUBLE",
+            "env_index_live_low": "DOUBLE",
+            "env_index_live_latest": "DOUBLE",
+            "env_index_live_pct_change": "DOUBLE",
+            "env_index_live_volume": "DOUBLE",
+            "env_index_live_amount": "DOUBLE",
+            "env_index_dev_ma20_atr": "DOUBLE",
+            "env_index_gate_action": "VARCHAR(16)",
+            "env_index_gate_reason": "VARCHAR(255)",
+            "env_index_position_cap": "DOUBLE",
+            "env_final_gate_action": "VARCHAR(16)",
             "env_weekly_asof_trade_date": "VARCHAR(10)",
             "env_weekly_risk_level": "VARCHAR(16)",
             "env_weekly_scene": "VARCHAR(32)",
@@ -1903,6 +2025,91 @@ class MA5MA20OpenMonitorRunner:
         df["code"] = df["code"].astype(str)
         return df
 
+    def _load_index_history(self, latest_trade_date: str) -> dict[str, Any]:
+        code = str(self.params.index_code or "").strip()
+        if not code or not latest_trade_date:
+            return {}
+
+        table = "history_index_daily_kline"
+        lookback = max(int(self.params.index_hist_lookback_days or 0), 1)
+        df = pd.DataFrame()
+        start_date = None
+        try:
+            end_date = pd.to_datetime(latest_trade_date).date()
+            start_date = (end_date - dt.timedelta(days=lookback * 3)).isoformat()
+        except Exception:
+            end_date = None
+
+        if self._table_exists(table) and end_date is not None and start_date is not None:
+            stmt = text(
+                f"""
+                SELECT `date`,`open`,`high`,`low`,`close`,`volume`,`amount`
+                FROM `{table}`
+                WHERE `code` = :code AND `date` BETWEEN :start_date AND :end_date
+                ORDER BY `date`
+                """
+            )
+            try:
+                with self.db_writer.engine.begin() as conn:
+                    df = pd.read_sql_query(
+                        stmt,
+                        conn,
+                        params={
+                            "code": code,
+                            "start_date": start_date,
+                            "end_date": latest_trade_date,
+                        },
+                    )
+            except Exception as exc:  # noqa: BLE001
+                self.logger.debug("读取指数日线失败，将尝试 Baostock：%s", exc)
+
+        if df.empty and end_date is not None and start_date is not None:
+            try:
+                client = BaostockDataFetcher(BaostockSession())
+                df = client.get_kline(code, start_date, latest_trade_date)
+            except Exception as exc:  # noqa: BLE001
+                self.logger.debug("Baostock 指数日线兜底失败：%s", exc)
+
+        if df.empty:
+            return {"index_code": code}
+
+        df = df.copy()
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        df = df.dropna(subset=["date"])
+        df = df.sort_values("date")
+        if len(df) > lookback:
+            df = df.tail(lookback)
+
+        for col in ["open", "high", "low", "close", "volume", "amount"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        if "preclose" not in df.columns:
+            df["preclose"] = df["close"].shift(1)
+
+        dif, dea, hist = _macd(df["close"])
+        df["macd_hist"] = hist
+        df["atr14"] = _atr(df["high"], df["low"], df["preclose"])
+        df["ma20"] = df["close"].rolling(20, min_periods=1).mean()
+        df["ma60"] = df["close"].rolling(60, min_periods=1).mean()
+
+        asof_row = df.iloc[-1]
+        asof_trade_date = asof_row.get("date")
+        asof_trade_date_str = (
+            asof_trade_date.date().isoformat() if not pd.isna(asof_trade_date) else None
+        )
+
+        return {
+            "index_code": code,
+            "asof_trade_date": asof_trade_date_str,
+            "asof_close": _to_float(asof_row.get("close")),
+            "asof_ma20": _to_float(asof_row.get("ma20")),
+            "asof_ma60": _to_float(asof_row.get("ma60")),
+            "asof_macd_hist": _to_float(asof_row.get("macd_hist")),
+            "asof_atr14": _to_float(asof_row.get("atr14")),
+            "history": df,
+        }
+
     def _load_previous_strength(
         self, codes: List[str], as_of: dt.datetime | None = None
     ) -> Dict[str, float]:
@@ -2056,6 +2263,18 @@ class MA5MA20OpenMonitorRunner:
             return self._fetch_quotes_akshare(codes)
         # 兼容：auto 视为 eastmoney
         return self._fetch_quotes_eastmoney(codes)
+
+    def _fetch_index_live_quote(self) -> dict[str, Any]:
+        code = str(self.params.index_code or "").strip()
+        if not code:
+            return {}
+        df = self._fetch_quotes([code])
+        if df.empty:
+            return {"index_code": code}
+        row = df.iloc[0].to_dict()
+        row["index_code"] = code
+        row["live_trade_date"] = dt.date.today().isoformat()
+        return row
 
     def _fetch_quotes_akshare(self, codes: List[str]) -> pd.DataFrame:
         try:
@@ -2213,6 +2432,116 @@ class MA5MA20OpenMonitorRunner:
     # -------------------------
     # Evaluate
     # -------------------------
+    @staticmethod
+    def _merge_gate_actions(*actions: str | None) -> str | None:
+        severity = {
+            "STOP": 3,
+            "WAIT": 2,
+            "ALLOW_SMALL": 1,
+            "ALLOW": 0,
+            "GO": 0,
+            "NOT_APPLIED": -1,
+            None: -1,
+        }
+        normalized = []
+        for action in actions:
+            if action is None:
+                normalized.append((severity[None], None))
+                continue
+            action_norm = str(action).strip().upper()
+            score = severity.get(action_norm, 0)
+            normalized.append((score, action_norm))
+        if not normalized:
+            return None
+        normalized.sort(key=lambda x: x[0], reverse=True)
+        return normalized[0][1]
+
+    def _build_index_env_snapshot(
+        self,
+        asof_indicators: dict[str, Any],
+        live_quote: dict[str, Any],
+    ) -> dict[str, Any]:
+        snapshot: dict[str, Any] = {}
+        if isinstance(asof_indicators, dict):
+            snapshot.update(
+                {
+                    "env_index_code": asof_indicators.get("index_code"),
+                    "env_index_asof_trade_date": asof_indicators.get("asof_trade_date"),
+                    "env_index_asof_close": _to_float(asof_indicators.get("asof_close")),
+                    "env_index_asof_ma20": _to_float(asof_indicators.get("asof_ma20")),
+                    "env_index_asof_ma60": _to_float(asof_indicators.get("asof_ma60")),
+                    "env_index_asof_macd_hist": _to_float(
+                        asof_indicators.get("asof_macd_hist")
+                    ),
+                    "env_index_asof_atr14": _to_float(asof_indicators.get("asof_atr14")),
+                }
+            )
+        if isinstance(live_quote, dict):
+            snapshot.update(
+                {
+                    "env_index_live_trade_date": live_quote.get("live_trade_date")
+                    or dt.date.today().isoformat(),
+                    "env_index_live_open": _to_float(live_quote.get("live_open") or live_quote.get("open")),
+                    "env_index_live_high": _to_float(live_quote.get("live_high") or live_quote.get("high")),
+                    "env_index_live_low": _to_float(live_quote.get("live_low") or live_quote.get("low")),
+                    "env_index_live_latest": _to_float(
+                        live_quote.get("live_latest") or live_quote.get("latest")
+                    ),
+                    "env_index_live_pct_change": _to_float(
+                        live_quote.get("live_pct_change") or live_quote.get("pct_change")
+                    ),
+                    "env_index_live_volume": _to_float(
+                        live_quote.get("live_volume") or live_quote.get("volume")
+                    ),
+                    "env_index_live_amount": _to_float(
+                        live_quote.get("live_amount") or live_quote.get("amount")
+                    ),
+                }
+            )
+
+        live_latest = snapshot.get("env_index_live_latest")
+        asof_ma20 = snapshot.get("env_index_asof_ma20")
+        asof_ma60 = snapshot.get("env_index_asof_ma60")
+        asof_atr14 = snapshot.get("env_index_asof_atr14")
+        asof_macd_hist = snapshot.get("env_index_asof_macd_hist")
+
+        dev_ma20_atr = None
+        if (
+            live_latest is not None
+            and asof_ma20 is not None
+            and asof_atr14 is not None
+            and asof_atr14 != 0
+        ):
+            dev_ma20_atr = (live_latest - asof_ma20) / max(asof_atr14, 1e-6)
+
+        gate_action = "GO"
+        gate_reason_parts: list[str] = []
+        if live_latest is not None and asof_ma60 is not None and live_latest < asof_ma60:
+            gate_action = "WAIT"
+            gate_reason_parts.append("指数低于MA60")
+
+        if (
+            live_latest is not None
+            and asof_ma20 is not None
+            and asof_ma60 is not None
+            and live_latest < asof_ma20
+            and asof_ma20 < asof_ma60
+        ):
+            gate_action = "STOP"
+            gate_reason_parts.append("指数跌破MA20且MA20<MA60")
+
+        if asof_macd_hist is not None and asof_macd_hist < 0 and gate_action != "STOP":
+            gate_action = "WAIT"
+            gate_reason_parts.append("MACD柱子为负")
+
+        position_cap = {"GO": 1.0, "WAIT": 0.5, "STOP": 0.0}.get(gate_action, 1.0)
+
+        snapshot["env_index_dev_ma20_atr"] = _to_float(dev_ma20_atr)
+        snapshot["env_index_gate_action"] = gate_action
+        snapshot["env_index_gate_reason"] = "；".join(gate_reason_parts) or None
+        snapshot["env_index_position_cap"] = position_cap
+        return snapshot
+
     def _is_pullback_signal(self, signal_reason: str) -> bool:
         reason_text = str(signal_reason or "")
         lower = reason_text.lower()
@@ -2286,6 +2615,26 @@ class MA5MA20OpenMonitorRunner:
             out["runup_ref_source"] = None
             out["status_tags"] = None
             out["status_tags_json"] = None
+            out["env_index_code"] = None
+            out["env_index_asof_trade_date"] = None
+            out["env_index_asof_close"] = None
+            out["env_index_asof_ma20"] = None
+            out["env_index_asof_ma60"] = None
+            out["env_index_asof_macd_hist"] = None
+            out["env_index_asof_atr14"] = None
+            out["env_index_live_trade_date"] = None
+            out["env_index_live_open"] = None
+            out["env_index_live_high"] = None
+            out["env_index_live_low"] = None
+            out["env_index_live_latest"] = None
+            out["env_index_live_pct_change"] = None
+            out["env_index_live_volume"] = None
+            out["env_index_live_amount"] = None
+            out["env_index_dev_ma20_atr"] = None
+            out["env_index_gate_action"] = None
+            out["env_index_gate_reason"] = None
+            out["env_index_position_cap"] = None
+            out["env_final_gate_action"] = None
             out["summary_line"] = "INACTIVE/UNKNOWN UNKNOWN | 行情数据不可用"
             out["action"] = "UNKNOWN"
             out["action_reason"] = "行情数据不可用"
@@ -2355,6 +2704,12 @@ class MA5MA20OpenMonitorRunner:
             if env_position_hint is None:
                 env_position_hint = _to_float(env_context.get("position_hint"))
 
+        index_intraday: dict[str, Any] = {}
+        if isinstance(env_context, dict):
+            raw_index = env_context.get("index_intraday") or env_context.get("env_index")
+            if isinstance(raw_index, dict):
+                index_intraday = raw_index
+
         env_weekly_asof_trade_date = None
         env_weekly_risk_level = None
         env_weekly_gating_enabled = False
@@ -2376,6 +2731,33 @@ class MA5MA20OpenMonitorRunner:
             )
             env_weekly_bias = env_context.get("weekly_bias")
             env_weekly_status = env_context.get("weekly_status")
+        env_index_code = index_intraday.get("env_index_code")
+        env_index_asof_trade_date = index_intraday.get("env_index_asof_trade_date")
+        env_index_asof_close = _to_float(index_intraday.get("env_index_asof_close"))
+        env_index_asof_ma20 = _to_float(index_intraday.get("env_index_asof_ma20"))
+        env_index_asof_ma60 = _to_float(index_intraday.get("env_index_asof_ma60"))
+        env_index_asof_macd_hist = _to_float(
+            index_intraday.get("env_index_asof_macd_hist")
+        )
+        env_index_asof_atr14 = _to_float(index_intraday.get("env_index_asof_atr14"))
+        env_index_live_trade_date = index_intraday.get("env_index_live_trade_date")
+        env_index_live_open = _to_float(index_intraday.get("env_index_live_open"))
+        env_index_live_high = _to_float(index_intraday.get("env_index_live_high"))
+        env_index_live_low = _to_float(index_intraday.get("env_index_live_low"))
+        env_index_live_latest = _to_float(index_intraday.get("env_index_live_latest"))
+        env_index_live_pct_change = _to_float(
+            index_intraday.get("env_index_live_pct_change")
+        )
+        env_index_live_volume = _to_float(index_intraday.get("env_index_live_volume"))
+        env_index_live_amount = _to_float(index_intraday.get("env_index_live_amount"))
+        env_index_dev_ma20_atr = _to_float(index_intraday.get("env_index_dev_ma20_atr"))
+        env_index_gate_action = (
+            str(index_intraday.get("env_index_gate_action")).strip().upper()
+            if index_intraday.get("env_index_gate_action") is not None
+            else None
+        )
+        env_index_gate_reason = index_intraday.get("env_index_gate_reason")
+        env_index_position_cap = _to_float(index_intraday.get("env_index_position_cap"))
 
         if env_position_hint is None:
             env_position_hint = env_position_hint_raw
@@ -2587,6 +2969,26 @@ class MA5MA20OpenMonitorRunner:
         env_weekly_risk_levels: List[str | None] = []
         env_weekly_scene_list: List[str | None] = []
         env_weekly_gate_action_list: List[str | None] = []
+        env_index_codes: List[str | None] = []
+        env_index_asof_trade_dates: List[str | None] = []
+        env_index_asof_closes: List[float | None] = []
+        env_index_asof_ma20_list: List[float | None] = []
+        env_index_asof_ma60_list: List[float | None] = []
+        env_index_asof_macd_hist_list: List[float | None] = []
+        env_index_asof_atr14_list: List[float | None] = []
+        env_index_live_trade_dates: List[str | None] = []
+        env_index_live_opens: List[float | None] = []
+        env_index_live_highs: List[float | None] = []
+        env_index_live_lows: List[float | None] = []
+        env_index_live_latests: List[float | None] = []
+        env_index_live_pct_changes: List[float | None] = []
+        env_index_live_volumes: List[float | None] = []
+        env_index_live_amounts: List[float | None] = []
+        env_index_dev_ma20_atr_list: List[float | None] = []
+        env_index_gate_action_list: List[str | None] = []
+        env_index_gate_reason_list: List[str | None] = []
+        env_index_position_cap_list: List[float | None] = []
+        env_final_gate_action_list: List[str | None] = []
         board_statuses: List[str | None] = []
         board_ranks: List[float | None] = []
         board_chg_pcts: List[float | None] = []
@@ -3154,6 +3556,8 @@ class MA5MA20OpenMonitorRunner:
                 cap_candidates.append(("env_position_hint", env_position_hint))
             if env_weekly_plan_a_exposure_cap is not None:
                 cap_candidates.append(("weekly_plan_a_cap", env_weekly_plan_a_exposure_cap))
+            if env_index_position_cap is not None:
+                cap_candidates.append(("env_index_position_cap", env_index_position_cap))
             entry_exposure_cap = None
             if cap_candidates:
                 entry_exposure_cap = min(val for _, val in cap_candidates)
@@ -3300,6 +3704,38 @@ class MA5MA20OpenMonitorRunner:
                     if weekly_gate_action is None:
                         weekly_gate_action = "ALLOW"
 
+            final_gate_action = self._merge_gate_actions(
+                weekly_gate_action, env_index_gate_action
+            )
+            gate_notes: list[str] = []
+            if env_index_gate_action:
+                gate_notes.append(f"指数门控={env_index_gate_action}")
+            if env_index_gate_reason:
+                gate_notes.append(str(env_index_gate_reason))
+            gate_note_text = "；".join([t for t in gate_notes if t])
+
+            if final_gate_action == "STOP":
+                gate_reason_text = gate_note_text or "指数门控=STOP"
+                if action in {"EXECUTE", "EXECUTE_SMALL"}:
+                    action = "WAIT"
+                if candidate_status == "ACTIVE":
+                    status_reason = (
+                        f"{status_reason}；{gate_reason_text}"
+                        if status_reason
+                        else gate_reason_text
+                    )
+                if reason and reason != "OK":
+                    reason = f"{reason}；{gate_reason_text}"
+                else:
+                    reason = gate_reason_text
+            elif final_gate_action == "WAIT" and action == "EXECUTE":
+                wait_text = gate_note_text or "指数门控=WAIT"
+                action = "WAIT"
+                status_reason = (
+                    f"{status_reason}；{wait_text}" if status_reason else wait_text
+                )
+                reason = f"{reason}；{wait_text}" if reason and reason != "OK" else wait_text
+
             if candidate_status == "ACTIVE" and action in {"SKIP", "WAIT"}:
                 status_reason = reason
 
@@ -3358,6 +3794,26 @@ class MA5MA20OpenMonitorRunner:
             status_tags_json_list.append(status_tags_json_value)
             candidate_stages.append(candidate_stage)
             candidate_states.append(candidate_state)
+            env_index_codes.append(env_index_code)
+            env_index_asof_trade_dates.append(env_index_asof_trade_date)
+            env_index_asof_closes.append(env_index_asof_close)
+            env_index_asof_ma20_list.append(env_index_asof_ma20)
+            env_index_asof_ma60_list.append(env_index_asof_ma60)
+            env_index_asof_macd_hist_list.append(env_index_asof_macd_hist)
+            env_index_asof_atr14_list.append(env_index_asof_atr14)
+            env_index_live_trade_dates.append(env_index_live_trade_date)
+            env_index_live_opens.append(env_index_live_open)
+            env_index_live_highs.append(env_index_live_high)
+            env_index_live_lows.append(env_index_live_low)
+            env_index_live_latests.append(env_index_live_latest)
+            env_index_live_pct_changes.append(env_index_live_pct_change)
+            env_index_live_volumes.append(env_index_live_volume)
+            env_index_live_amounts.append(env_index_live_amount)
+            env_index_dev_ma20_atr_list.append(env_index_dev_ma20_atr)
+            env_index_gate_action_list.append(env_index_gate_action)
+            env_index_gate_reason_list.append(env_index_gate_reason)
+            env_index_position_cap_list.append(env_index_position_cap)
+            env_final_gate_action_list.append(final_gate_action)
 
             vol_ratio_val = _to_float(live_intraday_vol_ratio)
             dev_ma20_atr_val = _to_float(dev_ma20_atr)
@@ -3366,7 +3822,18 @@ class MA5MA20OpenMonitorRunner:
             dev_ma20_atr_txt = f"{dev_ma20_atr_val:.2f}" if dev_ma20_atr_val is not None else "-"
             runup_atr_txt = f"{runup_atr_val:.2f}" if runup_atr_val is not None else "-"
             board_txt = board_status or "-"
-            gate_txt = weekly_gate_action or "NOT_APPLIED"
+            gate_txt = final_gate_action or weekly_gate_action or "NOT_APPLIED"
+            index_pct_txt = (
+                f"{env_index_live_pct_change:.2f}%"
+                if env_index_live_pct_change is not None
+                else "-"
+            )
+            index_gate_txt = env_index_gate_action or "-"
+            index_dev_txt = (
+                f"{env_index_dev_ma20_atr:.2f}"
+                if env_index_dev_ma20_atr is not None
+                else "-"
+            )
             summary_line = (
                 f"{candidate_stage}/{candidate_state} {action}"
                 f" | 量比={vol_ratio_txt}"
@@ -3374,6 +3841,7 @@ class MA5MA20OpenMonitorRunner:
                 f" | runupATR={runup_atr_txt}"
                 f" | 板块={board_txt}"
                 f" | 门控={gate_txt}"
+                f" | 指数={index_pct_txt}/{index_gate_txt}/{index_dev_txt}"
             )
             summary_lines.append(summary_line[:512])
 
@@ -3416,6 +3884,26 @@ class MA5MA20OpenMonitorRunner:
         merged["env_weekly_risk_level"] = env_weekly_risk_levels
         merged["env_weekly_scene"] = env_weekly_scene_list
         merged["env_weekly_gate_action"] = env_weekly_gate_action_list
+        merged["env_index_code"] = env_index_codes
+        merged["env_index_asof_trade_date"] = env_index_asof_trade_dates
+        merged["env_index_asof_close"] = env_index_asof_closes
+        merged["env_index_asof_ma20"] = env_index_asof_ma20_list
+        merged["env_index_asof_ma60"] = env_index_asof_ma60_list
+        merged["env_index_asof_macd_hist"] = env_index_asof_macd_hist_list
+        merged["env_index_asof_atr14"] = env_index_asof_atr14_list
+        merged["env_index_live_trade_date"] = env_index_live_trade_dates
+        merged["env_index_live_open"] = env_index_live_opens
+        merged["env_index_live_high"] = env_index_live_highs
+        merged["env_index_live_low"] = env_index_live_lows
+        merged["env_index_live_latest"] = env_index_live_latests
+        merged["env_index_live_pct_change"] = env_index_live_pct_changes
+        merged["env_index_live_volume"] = env_index_live_volumes
+        merged["env_index_live_amount"] = env_index_live_amounts
+        merged["env_index_dev_ma20_atr"] = env_index_dev_ma20_atr_list
+        merged["env_index_gate_action"] = env_index_gate_action_list
+        merged["env_index_gate_reason"] = env_index_gate_reason_list
+        merged["env_index_position_cap"] = env_index_position_cap_list
+        merged["env_final_gate_action"] = env_final_gate_action_list
         merged["board_status"] = board_statuses
         merged["board_rank"] = board_ranks
         merged["board_chg_pct"] = board_chg_pcts
@@ -3529,6 +4017,26 @@ class MA5MA20OpenMonitorRunner:
             "env_index_score",
             "env_regime",
             "env_position_hint",
+            "env_index_code",
+            "env_index_asof_trade_date",
+            "env_index_asof_close",
+            "env_index_asof_ma20",
+            "env_index_asof_ma60",
+            "env_index_asof_macd_hist",
+            "env_index_asof_atr14",
+            "env_index_live_trade_date",
+            "env_index_live_open",
+            "env_index_live_high",
+            "env_index_live_low",
+            "env_index_live_latest",
+            "env_index_live_pct_change",
+            "env_index_live_volume",
+            "env_index_live_amount",
+            "env_index_dev_ma20_atr",
+            "env_index_gate_action",
+            "env_index_gate_reason",
+            "env_index_position_cap",
+            "env_final_gate_action",
             "env_weekly_asof_trade_date",
             "env_weekly_risk_level",
             "env_weekly_scene",
@@ -3597,6 +4105,26 @@ class MA5MA20OpenMonitorRunner:
             "env_regime",
             "env_position_hint",
             "env_index_score",
+            "env_index_code",
+            "env_index_asof_trade_date",
+            "env_index_asof_close",
+            "env_index_asof_ma20",
+            "env_index_asof_ma60",
+            "env_index_asof_macd_hist",
+            "env_index_asof_atr14",
+            "env_index_live_trade_date",
+            "env_index_live_open",
+            "env_index_live_high",
+            "env_index_live_low",
+            "env_index_live_latest",
+            "env_index_live_pct_change",
+            "env_index_live_volume",
+            "env_index_live_amount",
+            "env_index_dev_ma20_atr",
+            "env_index_gate_action",
+            "env_index_gate_reason",
+            "env_index_position_cap",
+            "env_final_gate_action",
             "env_weekly_asof_trade_date",
             "env_weekly_risk_level",
             "env_weekly_scene",
@@ -3926,6 +4454,26 @@ class MA5MA20OpenMonitorRunner:
                     str(plan_b_if or "")[:120],
                     str(plan_b_recover or "")[:120],
                 )
+        index_history = self._load_index_history(latest_trade_date)
+        index_live_quote = self._fetch_index_live_quote()
+        index_env_snapshot = self._build_index_env_snapshot(index_history, index_live_quote)
+        if isinstance(env_context, dict):
+            env_context["index_intraday"] = index_env_snapshot
+        if index_env_snapshot:
+            gate_action = index_env_snapshot.get("env_index_gate_action")
+            gate_reason = index_env_snapshot.get("env_index_gate_reason") or "-"
+            live_pct = _to_float(index_env_snapshot.get("env_index_live_pct_change"))
+            dev_ma20_atr = _to_float(index_env_snapshot.get("env_index_dev_ma20_atr"))
+            self.logger.info(
+                "指数快照：code=%s asof=%s live=%s pct=%.2f%% dev_ma20_atr=%s 门控=%s（%s）",
+                index_env_snapshot.get("env_index_code"),
+                index_env_snapshot.get("env_index_asof_trade_date"),
+                index_env_snapshot.get("env_index_live_trade_date"),
+                0.0 if live_pct is None else live_pct,
+                f"{dev_ma20_atr:.2f}" if dev_ma20_atr is not None else "-",
+                gate_action or "-",
+                gate_reason,
+            )
         result = self._evaluate(
             signals,
             quotes,
