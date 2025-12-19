@@ -22,6 +22,7 @@ import time
 
 from ashare.config import get_section
 from ashare.open_monitor import MA5MA20OpenMonitorRunner
+from ashare.schema_manager import ensure_schema
 
 
 def _next_run_at(now: dt.datetime, interval_min: int) -> dt.datetime:
@@ -127,6 +128,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    ensure_schema()
     runner = MA5MA20OpenMonitorRunner()
     logger = runner.logger
     interval_min = int(args.interval)

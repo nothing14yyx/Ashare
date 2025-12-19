@@ -39,6 +39,12 @@ from .config import get_section
 from .db import DatabaseConfig, MySQLWriter
 from .env_snapshot_utils import resolve_weekly_asof_date
 from .ma5_ma20_trend_strategy import _atr, _macd
+from .schema_manager import (
+    TABLE_ENV_INDEX_SNAPSHOT,
+    TABLE_STRATEGY_MA5_MA20_OPEN_MONITOR,
+    TABLE_STRATEGY_MA5_MA20_OPEN_MONITOR_ENV,
+    TABLE_STRATEGY_MA5_MA20_SIGNALS,
+)
 from .utils.convert import to_float as _to_float
 from .utils.logger import setup_logger
 from .weekly_env_builder import WeeklyEnvironmentBuilder
@@ -209,10 +215,10 @@ class OpenMonitorParams:
     enabled: bool = True
 
     # 信号来源表：默认沿用 MA5-MA20 策略 signals_table
-    signals_table: str = "strategy_ma5_ma20_signals"
+    signals_table: str = TABLE_STRATEGY_MA5_MA20_SIGNALS
 
     # 输出表：开盘检查结果
-    output_table: str = "strategy_ma5_ma20_open_monitor"
+    output_table: str = TABLE_STRATEGY_MA5_MA20_OPEN_MONITOR
 
     # 回看近 N 个交易日的 BUY 信号
     signal_lookback_days: int = 3
@@ -271,10 +277,10 @@ class OpenMonitorParams:
     dedupe_bucket_minutes: int = 5
 
     # 环境快照表：存储周线计划等“批次级别”信息，避免在每条标的记录里重复。
-    env_snapshot_table: str = "strategy_ma5_ma20_open_monitor_env"
+    env_snapshot_table: str = TABLE_STRATEGY_MA5_MA20_OPEN_MONITOR_ENV
 
     # 指数环境快照表：按哈希去重存储单份指数环境，避免在事实表重复写入。
-    env_index_snapshot_table: str = "strategy_env_index_snapshot"
+    env_index_snapshot_table: str = TABLE_ENV_INDEX_SNAPSHOT
 
     # 同一批次内同一 code 只保留“最新 date（信号日）”那条 BUY 信号。
     # 目的：避免同一批次出现重复 code（例如同一只股票在 12-09 与 12-11 都触发 BUY）。
@@ -596,151 +602,6 @@ class MA5MA20OpenMonitorRunner:
                 avg_map[code] = float(volumes.mean())
         return avg_map
 
-    def _ensure_column(self, table: str, column: str, definition: str) -> None:
-        if not self._table_exists(table) or self._column_exists(table, column):
-            return
-
-        try:
-            with self.db_writer.engine.begin() as conn:
-                conn.execute(text(f"ALTER TABLE `{table}` ADD COLUMN `{column}` {definition}"))
-            self.logger.info("表 %s 已新增列 %s。", table, column)
-        except Exception as exc:  # noqa: BLE001
-            self.logger.warning("为表 %s 添加列 %s 失败：%s", table, column, exc)
-
-    def _ensure_datetime_column(self, table: str, column: str) -> None:
-        if not self._table_exists(table):
-            return
-
-        if not self._column_exists(table, column):
-            try:
-                with self.db_writer.engine.begin() as conn:
-                    conn.execute(
-                        text(
-                            f"ALTER TABLE `{table}` ADD COLUMN `{column}` DATETIME(6) NULL"
-                        )
-                    )
-                self.logger.info("表 %s 已新增 DATETIME(6) 列 %s。", table, column)
-            except Exception as exc:  # noqa: BLE001
-                self.logger.warning("为表 %s 添加 DATETIME(6) 列 %s 失败：%s", table, column, exc)
-            return
-
-        data_type = ""
-        column_type = ""
-        try:
-            stmt = text(
-                """
-                SELECT DATA_TYPE, COLUMN_TYPE
-                FROM information_schema.columns
-                WHERE table_schema = :schema AND table_name = :table AND column_name = :column
-                """
-            )
-            with self.db_writer.engine.begin() as conn:
-                df = pd.read_sql_query(
-                    stmt,
-                    conn,
-                    params={
-                        "schema": self.db_writer.config.db_name,
-                        "table": table,
-                        "column": column,
-                    },
-                )
-        except Exception as exc:  # noqa: BLE001
-            self.logger.debug("读取列 %s.%s 类型失败：%s", table, column, exc)
-            return
-
-        if not df.empty:
-            data_type = str(df.iloc[0].get("DATA_TYPE") or "").lower()
-            column_type = str(df.iloc[0].get("COLUMN_TYPE") or "").lower()
-
-        if data_type == "datetime" and "datetime(6)" in column_type:
-            return
-
-        try:
-            with self.db_writer.engine.begin() as conn:
-                conn.execute(
-                    text(
-                        f"ALTER TABLE `{table}` MODIFY COLUMN `{column}` DATETIME(6) NULL"
-                    )
-                )
-            self.logger.info(
-                "表 %s.%s 列已转换为 DATETIME(6)，保证时间排序正确。", table, column
-            )
-        except Exception as exc:  # noqa: BLE001
-            self.logger.warning(
-                "将列 %s.%s 转为 DATETIME(6) 失败（当前类型：%s），保留原类型：%s",
-                table,
-                column,
-                column_type or "unknown",
-                exc,
-            )
-
-    def _ensure_numeric_column(self, table: str, column: str, definition: str) -> None:
-        if not self._table_exists(table):
-            return
-
-        if not self._column_exists(table, column):
-            self._ensure_column(table, column, definition)
-            return
-
-        data_type = ""
-        column_type = ""
-        try:
-            stmt = text(
-                """
-                SELECT DATA_TYPE, COLUMN_TYPE
-                FROM information_schema.columns
-                WHERE table_schema = :schema AND table_name = :table AND column_name = :column
-                """
-            )
-            with self.db_writer.engine.begin() as conn:
-                df = pd.read_sql_query(
-                    stmt,
-                    conn,
-                    params={
-                        "schema": self.db_writer.config.db_name,
-                        "table": table,
-                        "column": column,
-                    },
-                )
-        except Exception as exc:  # noqa: BLE001
-            self.logger.debug("读取列 %s.%s 类型失败：%s", table, column, exc)
-            return
-
-        if not df.empty:
-            data_type = str(df.iloc[0].get("DATA_TYPE") or "").lower()
-            column_type = str(df.iloc[0].get("COLUMN_TYPE") or "").lower()
-
-        numeric_types = {
-            "double",
-            "float",
-            "decimal",
-            "int",
-            "bigint",
-            "smallint",
-            "tinyint",
-        }
-
-        if data_type in numeric_types:
-            return
-
-        try:
-            with self.db_writer.engine.begin() as conn:
-                conn.execute(text(f"ALTER TABLE `{table}` MODIFY COLUMN `{column}` {definition}"))
-            self.logger.info(
-                "表 %s.%s 列已调整为数值列 %s，避免类型漂移。",
-                table,
-                column,
-                definition,
-            )
-        except Exception as exc:  # noqa: BLE001
-            self.logger.warning(
-                "调整列 %s.%s 为数值列失败（当前类型：%s），保留原类型：%s",
-                table,
-                column,
-                column_type or "unknown",
-                exc,
-            )
-
     # -------------------------
     # DB helpers
     # -------------------------
@@ -775,415 +636,6 @@ class MA5MA20OpenMonitorRunner:
         except Exception as exc:  # noqa: BLE001
             self.logger.debug("检查列 %s.%s 是否存在失败：%s", table, column, exc)
             return False
-
-    def _index_exists(self, table: str, index: str) -> bool:
-        try:
-            stmt = text(
-                """
-                SELECT COUNT(*) AS cnt
-                FROM information_schema.statistics
-                WHERE table_schema = :schema AND table_name = :table AND index_name = :index
-                """
-            )
-            with self.db_writer.engine.begin() as conn:
-                df = pd.read_sql_query(
-                    stmt,
-                    conn,
-                    params={
-                        "schema": self.db_writer.config.db_name,
-                        "table": table,
-                        "index": index,
-                    },
-                )
-            return not df.empty and bool(df.iloc[0].get("cnt", 0))
-        except Exception as exc:  # noqa: BLE001
-            self.logger.debug("检查索引 %s.%s 是否存在失败：%s", table, index, exc)
-            return False
-
-    def _ensure_varchar_column(self, table: str, column: str, length: int) -> None:
-        if not self._column_exists(table, column):
-            return
-
-        # utf8mb4 下单列 VARCHAR 最大约 16383 字符（受 65535 bytes 行大小限制影响）
-        MYSQL_SAFE_VARCHAR_MAX = 16383
-
-        try:
-            stmt = text(
-                """
-                SELECT DATA_TYPE, CHARACTER_MAXIMUM_LENGTH, COLUMN_TYPE
-                FROM information_schema.columns
-                WHERE table_schema = :schema AND table_name = :table AND column_name = :column
-                """
-            )
-            with self.db_writer.engine.begin() as conn:
-                df = pd.read_sql_query(
-                    stmt,
-                    conn,
-                    params={
-                        "schema": self.db_writer.config.db_name,
-                        "table": table,
-                        "column": column,
-                    },
-                )
-        except Exception as exc:  # noqa: BLE001
-            self.logger.warning("读取列 %s.%s 元数据失败：%s", table, column, exc)
-            return
-
-        if df.empty:
-            return
-
-        row = df.iloc[0]
-        data_type = str(row.get("DATA_TYPE") or "").lower()
-        char_len = row.get("CHARACTER_MAXIMUM_LENGTH")
-        column_type = str(row.get("COLUMN_TYPE") or "").lower()
-
-        # information_schema 对 TEXT/LONGTEXT 会给出 65535 等“理论最大长度”，
-        # 但这不代表能安全改成 VARCHAR(65535)（utf8mb4 下会触发 1074）。
-        is_text_like = (
-            ("text" in data_type)
-            or ("blob" in data_type)
-            or ("text" in column_type)
-            or ("blob" in column_type)
-        )
-        is_varchar_like = data_type in {"varchar", "char"}
-
-        # DATE/INT 等非字符串列没必要强行转 VARCHAR，且可能破坏语义。
-        if not (is_text_like or is_varchar_like):
-            return
-
-        current_len = int(char_len or 0)
-        safe_len = min(int(length), MYSQL_SAFE_VARCHAR_MAX)
-
-        if safe_len <= 0:
-            return
-
-        if is_text_like:
-            target_len = safe_len
-        else:
-            if current_len >= safe_len:
-                return
-            target_len = min(max(safe_len, current_len), MYSQL_SAFE_VARCHAR_MAX)
-
-        try:
-            with self.db_writer.engine.begin() as conn:
-                conn.execute(
-                    text(
-                        f"ALTER TABLE `{table}` MODIFY COLUMN `{column}` VARCHAR({target_len})"
-                    )
-                )
-            self.logger.info(
-                "表 %s.%s 列已调整为 VARCHAR(%s) 以支持索引。",
-                table,
-                column,
-                target_len,
-            )
-        except Exception as exc:  # noqa: BLE001
-            self.logger.warning(
-                "调整列 %s.%s 类型为 VARCHAR 失败：%s", table, column, exc
-            )
-
-    def _cleanup_duplicate_snapshots(self, table: str) -> None:
-        """清理历史重复快照，确保唯一索引可创建（仅保留最新 checked_at）。"""
-
-        required_cols = {
-            "monitor_date",
-            "sig_date",
-            "code",
-            "dedupe_bucket",
-            "checked_at",
-        }
-        for col in required_cols:
-            if not self._column_exists(table, col):
-                return
-
-        try:
-            with self.db_writer.engine.begin() as conn:
-                res = conn.execute(
-                    text(
-                        f"""
-                        DELETE t1
-                        FROM `{table}` t1
-                        JOIN `{table}` t2
-                          ON t1.`monitor_date` = t2.`monitor_date`
-                         AND t1.`sig_date` = t2.`sig_date`
-                         AND t1.`code` = t2.`code`
-                         AND t1.`dedupe_bucket` = t2.`dedupe_bucket`
-                         AND (
-                              (t1.`checked_at` < t2.`checked_at`)
-                              OR (t1.`checked_at` IS NULL AND t2.`checked_at` IS NOT NULL)
-                         )
-                        """
-                    )
-                )
-            # pymysql 对 DELETE 可能返回 -1，这里只做“有变化”提示
-            if getattr(res, "rowcount", 0) and res.rowcount > 0:
-                self.logger.info(
-                    "表 %s 已清理 %s 条重复快照（保留最新 checked_at）。",
-                    table,
-                    res.rowcount,
-                )
-        except Exception as exc:  # noqa: BLE001
-            self.logger.warning("清理表 %s 重复快照失败：%s", table, exc)
-
-    def _ensure_indexable_columns(self, table: str) -> None:
-        dedupe_columns = {
-            "monitor_date": 32,
-            "sig_date": 32,
-            "code": 32,
-            "snapshot_hash": 64,
-            "dedupe_bucket": 32,
-        }
-
-        for column, length in dedupe_columns.items():
-            self._ensure_varchar_column(table, column, length)
-
-    def _ensure_snapshot_schema(self, table: str) -> None:
-        if not table or not self._table_exists(table):
-            return
-
-        self._ensure_datetime_column(table, "checked_at")
-
-        if not self._column_exists(table, "snapshot_hash"):
-            try:
-                with self.db_writer.engine.begin() as conn:
-                    conn.execute(
-                        text(
-                            f"ALTER TABLE `{table}` ADD COLUMN `snapshot_hash` VARCHAR(64)"
-                        )
-                    )
-                self.logger.info("表 %s 已新增 snapshot_hash 列用于去重。", table)
-            except Exception as exc:  # noqa: BLE001
-                self.logger.warning("为表 %s 添加 snapshot_hash 列失败：%s", table, exc)
-
-        if not self._column_exists(table, "dedupe_bucket"):
-            try:
-                with self.db_writer.engine.begin() as conn:
-                    conn.execute(
-                        text(
-                            f"ALTER TABLE `{table}` ADD COLUMN `dedupe_bucket` VARCHAR(32)"
-                        )
-                    )
-                self.logger.info("表 %s 已新增 dedupe_bucket 列用于时间桶去重。", table)
-            except Exception as exc:  # noqa: BLE001
-                self.logger.warning("为表 %s 添加 dedupe_bucket 列失败：%s", table, exc)
-
-        self._ensure_indexable_columns(table)
-
-        # live_intraday_vol_ratio 在首次写入时可能因 dtype/object 被建成 TEXT，
-        # 会导致 SQL 侧的筛选/排序出现隐式转换或字符串比较问题。
-        # 这里强制修正为数值列，保持与代码中的 float 计算一致。
-        self._ensure_numeric_column(table, "live_intraday_vol_ratio", "DOUBLE NULL")
-
-        index_name = "ux_open_monitor_dedupe"
-        if not self._index_exists(table, index_name):
-            self._cleanup_duplicate_snapshots(table)
-
-            try:
-                with self.db_writer.engine.begin() as conn:
-                    conn.execute(
-                        text(
-                            f"""
-                            CREATE UNIQUE INDEX `{index_name}`
-                            ON `{table}` (`monitor_date`, `sig_date`, `code`, `dedupe_bucket`)
-                            """
-                        )
-                    )
-                self.logger.info("表 %s 已创建唯一索引 %s 用于幂等写入。", table, index_name)
-            except Exception as exc:  # noqa: BLE001
-                self.logger.warning("创建唯一索引 %s 失败：%s", index_name, exc)
-
-    def _ensure_strength_schema(self, table: str) -> None:
-        if not table or not self._table_exists(table):
-            return
-
-        self._ensure_datetime_column(table, "checked_at")
-
-        self._ensure_numeric_column(table, "signal_strength", "DOUBLE NULL")
-        self._ensure_numeric_column(table, "strength_delta", "DOUBLE NULL")
-        self._ensure_column(table, "strength_trend", "VARCHAR(16) NULL")
-        self._ensure_column(table, "strength_note", "VARCHAR(512) NULL")
-
-    def _ensure_env_snapshot_schema(self, table: str) -> None:
-        if not table:
-            return
-
-        if not self._table_exists(table):
-            ddl = text(
-                f"""
-                CREATE TABLE `{table}` (
-                    `monitor_date` VARCHAR(10) NOT NULL,
-                    `dedupe_bucket` VARCHAR(32) NOT NULL,
-                    `checked_at` DATETIME NULL,
-                    `env_weekly_asof_trade_date` VARCHAR(10) NULL,
-                    `env_weekly_risk_level` VARCHAR(16) NULL,
-                    `env_weekly_scene` VARCHAR(32) NULL,
-                    `env_weekly_gate_policy` VARCHAR(16) NULL,
-                    `env_weekly_plan_json` TEXT NULL,
-                    `env_weekly_plan_a` VARCHAR(255) NULL,
-                    `env_weekly_plan_b` VARCHAR(255) NULL,
-                    `env_weekly_plan_a_exposure_cap` DOUBLE NULL,
-                    `env_weekly_bias` VARCHAR(16) NULL,
-                    `env_weekly_status` VARCHAR(32) NULL,
-                    `env_weekly_gating_enabled` TINYINT(1) NULL,
-                    `env_weekly_tags` VARCHAR(255) NULL,
-                    `env_weekly_money_proxy` VARCHAR(255) NULL,
-                    `env_weekly_note` VARCHAR(255) NULL,
-                    `env_regime` VARCHAR(32) NULL,
-                    `env_position_hint` DOUBLE NULL,
-                    `env_position_hint_raw` DOUBLE NULL,
-                    `env_index_code` VARCHAR(16) NULL,
-                    `env_index_asof_trade_date` VARCHAR(10) NULL,
-                    `env_index_asof_close` DOUBLE NULL,
-                    `env_index_asof_ma20` DOUBLE NULL,
-                    `env_index_asof_ma60` DOUBLE NULL,
-                    `env_index_asof_macd_hist` DOUBLE NULL,
-                    `env_index_asof_atr14` DOUBLE NULL,
-                    `env_index_live_trade_date` VARCHAR(10) NULL,
-                    `env_index_live_open` DOUBLE NULL,
-                    `env_index_live_high` DOUBLE NULL,
-                    `env_index_live_low` DOUBLE NULL,
-                    `env_index_live_latest` DOUBLE NULL,
-                    `env_index_live_pct_change` DOUBLE NULL,
-                    `env_index_live_volume` DOUBLE NULL,
-                    `env_index_live_amount` DOUBLE NULL,
-                    `env_index_dev_ma20_atr` DOUBLE NULL,
-                    `env_index_gate_action` VARCHAR(16) NULL,
-                    `env_index_gate_reason` VARCHAR(255) NULL,
-                    `env_index_position_cap` DOUBLE NULL,
-                    `env_final_gate_action` VARCHAR(16) NULL,
-                    PRIMARY KEY (`monitor_date`, `dedupe_bucket`)
-                )
-                """
-            )
-            try:
-                with self.db_writer.engine.begin() as conn:
-                    conn.execute(ddl)
-                self.logger.info("已创建环境快照表 %s。", table)
-            except Exception as exc:  # noqa: BLE001
-                self.logger.warning("创建环境快照表 %s 失败：%s", table, exc)
-                return
-
-        self._ensure_datetime_column(table, "checked_at")
-        for col, ddl in {
-            "env_weekly_plan_a": "VARCHAR(255)",
-            "env_weekly_plan_b": "VARCHAR(255)",
-            "env_weekly_plan_a_exposure_cap": "DOUBLE",
-            "env_weekly_tags": "VARCHAR(255)",
-            "env_weekly_money_proxy": "VARCHAR(255)",
-            "env_weekly_note": "VARCHAR(255)",
-            "env_regime": "VARCHAR(32)",
-            "env_position_hint": "DOUBLE",
-            "env_position_hint_raw": "DOUBLE",
-            "env_weekly_gating_enabled": "TINYINT(1)",
-            "env_weekly_gate_policy": "VARCHAR(16)",
-            "env_index_code": "VARCHAR(16)",
-            "env_index_asof_trade_date": "VARCHAR(10)",
-            "env_index_asof_close": "DOUBLE",
-            "env_index_asof_ma20": "DOUBLE",
-            "env_index_asof_ma60": "DOUBLE",
-            "env_index_asof_macd_hist": "DOUBLE",
-            "env_index_asof_atr14": "DOUBLE",
-            "env_index_live_trade_date": "VARCHAR(10)",
-            "env_index_live_open": "DOUBLE",
-            "env_index_live_high": "DOUBLE",
-            "env_index_live_low": "DOUBLE",
-            "env_index_live_latest": "DOUBLE",
-            "env_index_live_pct_change": "DOUBLE",
-            "env_index_live_volume": "DOUBLE",
-            "env_index_live_amount": "DOUBLE",
-            "env_index_dev_ma20_atr": "DOUBLE",
-            "env_index_gate_action": "VARCHAR(16)",
-            "env_index_gate_reason": "VARCHAR(255)",
-            "env_index_position_cap": "DOUBLE",
-            "env_final_gate_action": "VARCHAR(16)",
-        }.items():
-            self._ensure_column(table, col, f"{ddl} NULL")
-
-    def _ensure_env_index_snapshot_schema(self, table: str) -> None:
-        if not table:
-            return
-
-        if not self._table_exists(table):
-            ddl = text(
-                f"""
-                CREATE TABLE `{table}` (
-                    `snapshot_hash` VARCHAR(32) NOT NULL,
-                    `monitor_date` VARCHAR(10) NULL,
-                    `dedupe_bucket` VARCHAR(16) NULL,
-                    `checked_at` DATETIME(6) NULL,
-                    `index_code` VARCHAR(16) NULL,
-                    `asof_trade_date` DATE NULL,
-                    `live_trade_date` DATE NULL,
-                    `asof_close` DOUBLE NULL,
-                    `asof_ma20` DOUBLE NULL,
-                    `asof_ma60` DOUBLE NULL,
-                    `asof_macd_hist` DOUBLE NULL,
-                    `asof_atr14` DOUBLE NULL,
-                    `live_open` DOUBLE NULL,
-                    `live_high` DOUBLE NULL,
-                    `live_low` DOUBLE NULL,
-                    `live_latest` DOUBLE NULL,
-                    `live_pct_change` DOUBLE NULL,
-                    `live_volume` DOUBLE NULL,
-                    `live_amount` DOUBLE NULL,
-                    `dev_ma20_atr` DOUBLE NULL,
-                    `gate_action` VARCHAR(16) NULL,
-                    `gate_reason` VARCHAR(255) NULL,
-                    `position_cap` DOUBLE NULL,
-                    PRIMARY KEY (`snapshot_hash`)
-                )
-                """
-            )
-            try:
-                with self.db_writer.engine.begin() as conn:
-                    conn.execute(ddl)
-                self.logger.info("已创建指数环境快照表 %s。", table)
-            except Exception as exc:  # noqa: BLE001
-                self.logger.warning("创建指数环境快照表 %s 失败：%s", table, exc)
-                return
-
-        for col, ddl in {
-            "monitor_date": "VARCHAR(10)",
-            "dedupe_bucket": "VARCHAR(16)",
-            "checked_at": "DATETIME(6)",
-            "index_code": "VARCHAR(16)",
-            "asof_trade_date": "DATE",
-            "live_trade_date": "DATE",
-            "asof_close": "DOUBLE",
-            "asof_ma20": "DOUBLE",
-            "asof_ma60": "DOUBLE",
-            "asof_macd_hist": "DOUBLE",
-            "asof_atr14": "DOUBLE",
-            "live_open": "DOUBLE",
-            "live_high": "DOUBLE",
-            "live_low": "DOUBLE",
-            "live_latest": "DOUBLE",
-            "live_pct_change": "DOUBLE",
-            "live_volume": "DOUBLE",
-            "live_amount": "DOUBLE",
-            "dev_ma20_atr": "DOUBLE",
-            "gate_action": "VARCHAR(16)",
-            "gate_reason": "VARCHAR(255)",
-            "position_cap": "DOUBLE",
-        }.items():
-            self._ensure_column(table, col, f"{ddl} NULL")
-        self._ensure_datetime_column(table, "checked_at")
-
-        unique_name = "uk_env_index_snapshot"
-        if not self._index_exists(table, unique_name):
-            try:
-                with self.db_writer.engine.begin() as conn:
-                    conn.execute(
-                        text(
-                            f"""
-                            CREATE UNIQUE INDEX `{unique_name}`
-                            ON `{table}` (`monitor_date`, `dedupe_bucket`, `index_code`, `checked_at`)
-                            """
-                        )
-                    )
-                self.logger.info("指数环境快照表 %s 已添加唯一索引 %s。", table, unique_name)
-            except Exception as exc:  # noqa: BLE001
-                self.logger.warning("为表 %s 创建唯一索引 %s 失败：%s", table, unique_name, exc)
 
     def _persist_env_snapshot(
         self,
@@ -1288,7 +740,9 @@ class MA5MA20OpenMonitorRunner:
             env_weekly_gate_policy, index_snapshot.get("env_index_gate_action")
         )
 
-        self._ensure_env_snapshot_schema(table)
+        if not self._table_exists(table):
+            self.logger.error("环境快照表 %s 不存在，已跳过写入。", table)
+            return
         columns = list(payload.keys())
         update_cols = [c for c in columns if c not in {"monitor_date", "dedupe_bucket"}]
         col_clause = ", ".join(f"`{c}`" for c in columns)
@@ -1323,8 +777,8 @@ class MA5MA20OpenMonitorRunner:
         if not snapshot or not table:
             return None
 
-        self._ensure_env_index_snapshot_schema(table)
         if not self._table_exists(table):
+            self.logger.error("指数环境快照表 %s 不存在，已跳过写入。", table)
             return None
 
         columns = list(snapshot.keys())
@@ -1361,8 +815,6 @@ class MA5MA20OpenMonitorRunner:
         table = self.params.env_snapshot_table
         if not (table and monitor_date and self._table_exists(table)):
             return None
-
-        self._ensure_env_snapshot_schema(table)
 
         def _load_latest(match_bucket: bool) -> pd.DataFrame:
             bucket_clause = "`dedupe_bucket` = :b AND" if match_bucket else ""
@@ -1583,104 +1035,6 @@ class MA5MA20OpenMonitorRunner:
         self, env_context: dict[str, Any] | None
     ) -> str | None:
         return self.env_builder.resolve_env_weekly_gate_policy(env_context)
-
-    def _ensure_monitor_columns(self, table: str) -> None:
-        if not table or not self._table_exists(table):
-            return
-
-        extra_columns = {
-            "env_regime": "VARCHAR(32)",
-            "env_position_hint": "DOUBLE",
-            "env_index_score": "DOUBLE",
-            "env_index_snapshot_hash": "VARCHAR(32)",
-            "env_final_gate_action": "VARCHAR(16)",
-            "env_weekly_asof_trade_date": "VARCHAR(10)",
-            "env_weekly_risk_level": "VARCHAR(16)",
-            "env_weekly_scene": "VARCHAR(32)",
-            "env_weekly_gate_action": "VARCHAR(16)",
-            "risk_tag": "VARCHAR(255)",
-            "risk_note": "VARCHAR(255)",
-            "entry_exposure_cap": "DOUBLE",
-            "sig_date": "VARCHAR(10)",
-            "asof_trade_date": "VARCHAR(10)",
-            "live_trade_date": "VARCHAR(10)",
-            "candidate_stage": "VARCHAR(16)",
-            "candidate_state": "VARCHAR(32)",
-            "signal_kind": "VARCHAR(16)",
-            "sig_close": "DOUBLE",
-            "asof_close": "DOUBLE",
-            "sig_ma5": "DOUBLE",
-            "sig_ma20": "DOUBLE",
-            "sig_ma60": "DOUBLE",
-            "sig_ma250": "DOUBLE",
-            "sig_vol_ratio": "DOUBLE",
-            "sig_macd_hist": "DOUBLE",
-            "sig_atr14": "DOUBLE",
-            "sig_stop_ref": "DOUBLE",
-            "sig_signal": "VARCHAR(16)",
-            "sig_reason": "VARCHAR(255)",
-            "asof_ma5": "DOUBLE",
-            "asof_ma20": "DOUBLE",
-            "asof_ma60": "DOUBLE",
-            "asof_ma250": "DOUBLE",
-            "asof_vol_ratio": "DOUBLE",
-            "asof_macd_hist": "DOUBLE",
-            "asof_atr14": "DOUBLE",
-            "asof_stop_ref": "DOUBLE",
-            "trade_stop_ref": "DOUBLE",
-            "effective_stop_ref": "DOUBLE",
-            "sig_kdj_k": "DOUBLE",
-            "sig_kdj_d": "DOUBLE",
-            "dev_ma5": "DOUBLE",
-            "dev_ma20": "DOUBLE",
-            "dev_ma5_atr": "DOUBLE",
-            "dev_ma20_atr": "DOUBLE",
-            "runup_from_sigclose": "DOUBLE",
-            "runup_from_sigclose_atr": "DOUBLE",
-            "runup_ref_price": "DOUBLE",
-            "runup_ref_source": "VARCHAR(32)",
-            "status_tags": "VARCHAR(255)",
-            "status_tags_json": "TEXT",
-            "summary_line": "VARCHAR(512)",
-        }
-
-        with self.db_writer.engine.begin() as conn:
-            for col, ddl in extra_columns.items():
-                if self._column_exists(table, col):
-                    continue
-                try:
-                    conn.execute(text(f"ALTER TABLE `{table}` ADD COLUMN `{col}` {ddl}"))
-                    self.logger.info("表 %s 已新增列 %s", table, col)
-                except Exception as exc:  # noqa: BLE001
-                    self.logger.warning("为表 %s 添加列 %s 失败：%s", table, col, exc)
-
-        self._ensure_indexable_columns(table)
-
-        index_name = "idx_open_monitor_strength_time"
-        if not self._index_exists(table, index_name):
-            try:
-                with self.db_writer.engine.begin() as conn:
-                    conn.execute(
-                        text(
-                            f"CREATE INDEX `{index_name}` ON `{table}` (`monitor_date`, `code`, `checked_at`)"
-                        )
-                    )
-                self.logger.info("表 %s 已新增索引 %s 加速强度历史查询。", table, index_name)
-            except Exception as exc:  # noqa: BLE001
-                self.logger.warning("创建索引 %s 失败：%s", index_name, exc)
-
-        code_time_index = "idx_open_monitor_code_time"
-        if not self._index_exists(table, code_time_index):
-            try:
-                with self.db_writer.engine.begin() as conn:
-                    conn.execute(
-                        text(
-                            f"CREATE INDEX `{code_time_index}` ON `{table}` (`code`, `checked_at`)"
-                        )
-                    )
-                self.logger.info("表 %s 已新增索引 %s 以优化跨日强度查询。", table, code_time_index)
-            except Exception as exc:  # noqa: BLE001
-                self.logger.warning("创建索引 %s 失败：%s", code_time_index, exc)
 
     def _load_existing_snapshot_keys(
         self, table: str, monitor_date: str, codes: List[str], dedupe_bucket: str
@@ -4214,11 +3568,6 @@ class MA5MA20OpenMonitorRunner:
                 df["status_tags_json"].fillna("").astype(str).str.slice(0, 4000)
             )
 
-        if table_exists:
-            self._ensure_snapshot_schema(table)
-            self._ensure_strength_schema(table)
-            self._ensure_monitor_columns(table)
-
         df["snapshot_hash"] = df.apply(lambda row: make_snapshot_hash(row.to_dict()), axis=1)
         df = df.drop_duplicates(
             subset=["monitor_date", "sig_date", "code", "dedupe_bucket"]
@@ -4260,8 +3609,6 @@ class MA5MA20OpenMonitorRunner:
         try:
             self.db_writer.write_dataframe(df, table, if_exists="append")
             self.logger.info("开盘监测结果已写入表 %s：%s 条", table, len(df))
-            self._ensure_snapshot_schema(table)
-            self._ensure_strength_schema(table)
         except Exception as exc:  # noqa: BLE001
             self.logger.error("写入开盘监测表失败：%s", exc)
 

@@ -19,6 +19,7 @@ from pathlib import Path
 
 from ashare.env_snapshot_utils import resolve_weekly_asof_date
 from ashare.open_monitor import MA5MA20OpenMonitorRunner
+from ashare.schema_manager import ensure_schema
 
 
 def main() -> None:
@@ -37,6 +38,7 @@ def main() -> None:
         print(str(exc))
         return
 
+    ensure_schema()
     runner = MA5MA20OpenMonitorRunner()
     checked_at = dt.datetime.now()
 

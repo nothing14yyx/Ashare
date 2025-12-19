@@ -10,10 +10,12 @@
 """
 
 from ashare.open_monitor import MA5MA20OpenMonitorRunner
+from ashare.schema_manager import ensure_schema
 
 
 def main() -> None:
     # 独立执行脚本：不受 config.yaml 的 enabled 总开关限制
+    ensure_schema()
     MA5MA20OpenMonitorRunner().run(force=True)
 
 
