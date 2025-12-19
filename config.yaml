@@ -147,7 +147,7 @@ open_monitor:
   output_table: strategy_ma5_ma20_open_monitor
 
   # 回看近 N 个交易日的 BUY 信号作为候选
-  signal_lookback_days: 3
+  signal_lookback_days: 7
 
   # 行情来源：akshare / eastmoney（路线A：建议固定 eastmoney，避免 AkShare/代理导致噪音）
   quote_source: eastmoney

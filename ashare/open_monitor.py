@@ -1663,31 +1663,14 @@ class MA5MA20OpenMonitorRunner:
     def _load_recent_buy_signals(self) -> Tuple[str | None, List[str], pd.DataFrame]:
         table = self.params.signals_table
         monitor_date = dt.date.today().isoformat()
-        lookback = max(
-            int(self.params.signal_lookback_days or 0),
-            int(self.params.cross_valid_days or 0),
-            int(self.params.pullback_valid_days or 0),
-            1,
-        )
+        # 严格最近 N 个交易日窗口：只由 signal_lookback_days 决定
+        lookback = max(int(self.params.signal_lookback_days or 0), 1)
 
         try:
             with self.db_writer.engine.begin() as conn:
                 max_df = pd.read_sql_query(
                     text(f"SELECT MAX(`date`) AS max_date FROM `{table}`"),
                     conn,
-                )
-                dates_df = pd.read_sql_query(
-                    text(
-                        f"""
-                        SELECT DISTINCT `date`
-                        FROM `{table}`
-                        WHERE `signal` = 'BUY'
-                        ORDER BY `date` DESC
-                        LIMIT :n
-                        """
-                    ),
-                    conn,
-                    params={"n": lookback},
                 )
         except Exception as exc:  # noqa: BLE001
             self.logger.error("读取 signals_table=%s 失败：%s", table, exc)
@@ -1701,13 +1684,84 @@ class MA5MA20OpenMonitorRunner:
             return None, [], pd.DataFrame()
 
         latest_trade_date = str(max_date)[:10]
-        if dates_df.empty:
-            self.logger.info("%s 没有任何 BUY 信号，跳过开盘监测。", latest_trade_date)
+
+        # 1) 先取严格“最近 N 个交易日窗口”（优先日线表；无日线表则回退 signals_table 的日期序列）
+        base_table = self._daily_table()
+        if not self._table_exists(base_table):
+            base_table = table
+
+        try:
+            with self.db_writer.engine.begin() as conn:
+                trade_dates_df = pd.read_sql_query(
+                    text(
+                        f"""
+                        SELECT DISTINCT CAST(`date` AS CHAR) AS d
+                        FROM `{base_table}`
+                        WHERE `date` <= :base_date
+                        ORDER BY `date` DESC
+                        LIMIT :n
+                        """
+                    ),
+                    conn,
+                    params={"base_date": latest_trade_date, "n": lookback},
+                )
+        except Exception as exc:  # noqa: BLE001
+            self.logger.error("读取最近交易日窗口失败：%s", exc)
             return latest_trade_date, [], pd.DataFrame()
 
-        signal_dates = [str(v)[:10] for v in dates_df["date"].tolist() if str(v).strip()]
+        trade_dates = (
+            trade_dates_df["d"].dropna().astype(str).str[:10].tolist()
+            if trade_dates_df is not None and not trade_dates_df.empty
+            else []
+        )
+        if not trade_dates:
+            self.logger.info(
+                "%s 无法获得最近 %s 个交易日窗口，跳过开盘监测。", latest_trade_date, lookback
+            )
+            return latest_trade_date, [], pd.DataFrame()
+
+        window_latest = trade_dates[0]
+        window_earliest = trade_dates[-1]
+
+        # 2) 只在该交易日窗口内筛 BUY 信号日（避免 BUY 稀疏导致日期漂移到更早）
+        try:
+            with self.db_writer.engine.begin() as conn:
+                buy_dates_df = pd.read_sql_query(
+                    text(
+                        f"""
+                        SELECT DISTINCT `date`
+                        FROM `{table}`
+                        WHERE `signal` = 'BUY'
+                          AND `date` <= :latest
+                          AND `date` >= :earliest
+                        ORDER BY `date` DESC
+                        """
+                    ),
+                    conn,
+                    params={"latest": window_latest, "earliest": window_earliest},
+                )
+        except Exception as exc:  # noqa: BLE001
+            self.logger.error("读取窗口内 BUY 信号日期失败：%s", exc)
+            return latest_trade_date, [], pd.DataFrame()
+
+        if buy_dates_df.empty:
+            self.logger.info(
+                "最近 %s 个交易日窗口（%s~%s，最新=%s）内无 BUY 信号，跳过开盘监测。",
+                lookback,
+                window_earliest,
+                window_latest,
+                latest_trade_date,
+            )
+            return latest_trade_date, [], pd.DataFrame()
+
+        signal_dates = [str(v)[:10] for v in buy_dates_df["date"].tolist() if str(v).strip()]
         self.logger.info(
-            "回看最近 %s 个交易日（最新=%s）BUY 信号：%s", lookback, latest_trade_date, signal_dates
+            "回看最近 %s 个交易日窗口（%s~%s，最新=%s）BUY 信号：%s",
+            lookback,
+            window_earliest,
+            window_latest,
+            latest_trade_date,
+            signal_dates,
         )
 
         available_cols = set(self._get_table_columns(table))
