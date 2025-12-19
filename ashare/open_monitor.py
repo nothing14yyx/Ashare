@@ -273,6 +273,9 @@ class OpenMonitorParams:
     # 环境快照表：存储周线计划等“批次级别”信息，避免在每条标的记录里重复。
     env_snapshot_table: str = "strategy_ma5_ma20_open_monitor_env"
 
+    # 指数环境快照表：按哈希去重存储单份指数环境，避免在事实表重复写入。
+    env_index_snapshot_table: str = "strategy_env_index_snapshot"
+
     # 同一批次内同一 code 只保留“最新 date（信号日）”那条 BUY 信号。
     # 目的：避免同一批次出现重复 code（例如同一只股票在 12-09 与 12-11 都触发 BUY）。
     unique_code_latest_date_only: bool = True
@@ -426,6 +429,10 @@ class OpenMonitorParams:
                 sec.get("env_snapshot_table", cls.env_snapshot_table)
             ).strip()
             or cls.env_snapshot_table,
+            env_index_snapshot_table=str(
+                sec.get("env_index_snapshot_table", cls.env_index_snapshot_table)
+            ).strip()
+            or cls.env_index_snapshot_table,
             output_mode=str(sec.get("output_mode", cls.output_mode)).strip().upper()
             or cls.output_mode,
             persist_env_snapshot=_get_bool(
@@ -1092,6 +1099,92 @@ class MA5MA20OpenMonitorRunner:
         }.items():
             self._ensure_column(table, col, f"{ddl} NULL")
 
+    def _ensure_env_index_snapshot_schema(self, table: str) -> None:
+        if not table:
+            return
+
+        if not self._table_exists(table):
+            ddl = text(
+                f"""
+                CREATE TABLE `{table}` (
+                    `snapshot_hash` VARCHAR(32) NOT NULL,
+                    `monitor_date` VARCHAR(10) NULL,
+                    `dedupe_bucket` VARCHAR(16) NULL,
+                    `checked_at` DATETIME(6) NULL,
+                    `index_code` VARCHAR(16) NULL,
+                    `asof_trade_date` DATE NULL,
+                    `live_trade_date` DATE NULL,
+                    `asof_close` DOUBLE NULL,
+                    `asof_ma20` DOUBLE NULL,
+                    `asof_ma60` DOUBLE NULL,
+                    `asof_macd_hist` DOUBLE NULL,
+                    `asof_atr14` DOUBLE NULL,
+                    `live_open` DOUBLE NULL,
+                    `live_high` DOUBLE NULL,
+                    `live_low` DOUBLE NULL,
+                    `live_latest` DOUBLE NULL,
+                    `live_pct_change` DOUBLE NULL,
+                    `live_volume` DOUBLE NULL,
+                    `live_amount` DOUBLE NULL,
+                    `dev_ma20_atr` DOUBLE NULL,
+                    `gate_action` VARCHAR(16) NULL,
+                    `gate_reason` VARCHAR(255) NULL,
+                    `position_cap` DOUBLE NULL,
+                    PRIMARY KEY (`snapshot_hash`)
+                )
+                """
+            )
+            try:
+                with self.db_writer.engine.begin() as conn:
+                    conn.execute(ddl)
+                self.logger.info("已创建指数环境快照表 %s。", table)
+            except Exception as exc:  # noqa: BLE001
+                self.logger.warning("创建指数环境快照表 %s 失败：%s", table, exc)
+                return
+
+        for col, ddl in {
+            "monitor_date": "VARCHAR(10)",
+            "dedupe_bucket": "VARCHAR(16)",
+            "checked_at": "DATETIME(6)",
+            "index_code": "VARCHAR(16)",
+            "asof_trade_date": "DATE",
+            "live_trade_date": "DATE",
+            "asof_close": "DOUBLE",
+            "asof_ma20": "DOUBLE",
+            "asof_ma60": "DOUBLE",
+            "asof_macd_hist": "DOUBLE",
+            "asof_atr14": "DOUBLE",
+            "live_open": "DOUBLE",
+            "live_high": "DOUBLE",
+            "live_low": "DOUBLE",
+            "live_latest": "DOUBLE",
+            "live_pct_change": "DOUBLE",
+            "live_volume": "DOUBLE",
+            "live_amount": "DOUBLE",
+            "dev_ma20_atr": "DOUBLE",
+            "gate_action": "VARCHAR(16)",
+            "gate_reason": "VARCHAR(255)",
+            "position_cap": "DOUBLE",
+        }.items():
+            self._ensure_column(table, col, f"{ddl} NULL")
+        self._ensure_datetime_column(table, "checked_at")
+
+        unique_name = "uk_env_index_snapshot"
+        if not self._index_exists(table, unique_name):
+            try:
+                with self.db_writer.engine.begin() as conn:
+                    conn.execute(
+                        text(
+                            f"""
+                            CREATE UNIQUE INDEX `{unique_name}`
+                            ON `{table}` (`monitor_date`, `dedupe_bucket`, `index_code`, `checked_at`)
+                            """
+                        )
+                    )
+                self.logger.info("指数环境快照表 %s 已添加唯一索引 %s。", table, unique_name)
+            except Exception as exc:  # noqa: BLE001
+                self.logger.warning("为表 %s 创建唯一索引 %s 失败：%s", table, unique_name, exc)
+
     def _persist_env_snapshot(
         self,
         env_context: dict[str, Any] | None,
@@ -1220,6 +1313,47 @@ class MA5MA20OpenMonitorRunner:
             )
         except Exception as exc:  # noqa: BLE001
             self.logger.warning("写入环境快照失败：%s", exc)
+
+    def _persist_index_snapshot(
+        self,
+        snapshot: dict[str, Any],
+        *,
+        table: str,
+    ) -> str | None:
+        if not snapshot or not table:
+            return None
+
+        self._ensure_env_index_snapshot_schema(table)
+        if not self._table_exists(table):
+            return None
+
+        columns = list(snapshot.keys())
+        if "snapshot_hash" not in columns:
+            return None
+
+        col_clause = ", ".join(f"`{c}`" for c in columns)
+        value_clause = ", ".join(f":{c}" for c in columns)
+        stmt = text(
+            f"""
+            INSERT INTO `{table}` ({col_clause})
+            VALUES ({value_clause})
+            ON DUPLICATE KEY UPDATE `snapshot_hash` = `snapshot_hash`
+            """
+        )
+
+        try:
+            with self.db_writer.engine.begin() as conn:
+                conn.execute(stmt, snapshot)
+            self.logger.info(
+                "指数环境快照已写入表 %s（hash=%s）。",
+                table,
+                snapshot.get("snapshot_hash"),
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.logger.warning("写入指数环境快照失败：%s", exc)
+            return None
+
+        return str(snapshot.get("snapshot_hash") or "")
 
     def _load_env_snapshot_context(
         self, monitor_date: str, dedupe_bucket: str | None = None
@@ -1455,28 +1589,10 @@ class MA5MA20OpenMonitorRunner:
             return
 
         extra_columns = {
-            "env_index_score": "DOUBLE",
             "env_regime": "VARCHAR(32)",
             "env_position_hint": "DOUBLE",
-            "env_index_code": "VARCHAR(16)",
-            "env_index_asof_trade_date": "VARCHAR(10)",
-            "env_index_asof_close": "DOUBLE",
-            "env_index_asof_ma20": "DOUBLE",
-            "env_index_asof_ma60": "DOUBLE",
-            "env_index_asof_macd_hist": "DOUBLE",
-            "env_index_asof_atr14": "DOUBLE",
-            "env_index_live_trade_date": "VARCHAR(10)",
-            "env_index_live_open": "DOUBLE",
-            "env_index_live_high": "DOUBLE",
-            "env_index_live_low": "DOUBLE",
-            "env_index_live_latest": "DOUBLE",
-            "env_index_live_pct_change": "DOUBLE",
-            "env_index_live_volume": "DOUBLE",
-            "env_index_live_amount": "DOUBLE",
-            "env_index_dev_ma20_atr": "DOUBLE",
-            "env_index_gate_action": "VARCHAR(16)",
-            "env_index_gate_reason": "VARCHAR(255)",
-            "env_index_position_cap": "DOUBLE",
+            "env_index_score": "DOUBLE",
+            "env_index_snapshot_hash": "VARCHAR(32)",
             "env_final_gate_action": "VARCHAR(16)",
             "env_weekly_asof_trade_date": "VARCHAR(10)",
             "env_weekly_risk_level": "VARCHAR(16)",
@@ -2615,25 +2731,7 @@ class MA5MA20OpenMonitorRunner:
             out["runup_ref_source"] = None
             out["status_tags"] = None
             out["status_tags_json"] = None
-            out["env_index_code"] = None
-            out["env_index_asof_trade_date"] = None
-            out["env_index_asof_close"] = None
-            out["env_index_asof_ma20"] = None
-            out["env_index_asof_ma60"] = None
-            out["env_index_asof_macd_hist"] = None
-            out["env_index_asof_atr14"] = None
-            out["env_index_live_trade_date"] = None
-            out["env_index_live_open"] = None
-            out["env_index_live_high"] = None
-            out["env_index_live_low"] = None
-            out["env_index_live_latest"] = None
-            out["env_index_live_pct_change"] = None
-            out["env_index_live_volume"] = None
-            out["env_index_live_amount"] = None
-            out["env_index_dev_ma20_atr"] = None
-            out["env_index_gate_action"] = None
-            out["env_index_gate_reason"] = None
-            out["env_index_position_cap"] = None
+            out["env_index_snapshot_hash"] = None
             out["env_final_gate_action"] = None
             out["summary_line"] = "INACTIVE/UNKNOWN UNKNOWN | 行情数据不可用"
             out["action"] = "UNKNOWN"
@@ -2969,25 +3067,6 @@ class MA5MA20OpenMonitorRunner:
         env_weekly_risk_levels: List[str | None] = []
         env_weekly_scene_list: List[str | None] = []
         env_weekly_gate_action_list: List[str | None] = []
-        env_index_codes: List[str | None] = []
-        env_index_asof_trade_dates: List[str | None] = []
-        env_index_asof_closes: List[float | None] = []
-        env_index_asof_ma20_list: List[float | None] = []
-        env_index_asof_ma60_list: List[float | None] = []
-        env_index_asof_macd_hist_list: List[float | None] = []
-        env_index_asof_atr14_list: List[float | None] = []
-        env_index_live_trade_dates: List[str | None] = []
-        env_index_live_opens: List[float | None] = []
-        env_index_live_highs: List[float | None] = []
-        env_index_live_lows: List[float | None] = []
-        env_index_live_latests: List[float | None] = []
-        env_index_live_pct_changes: List[float | None] = []
-        env_index_live_volumes: List[float | None] = []
-        env_index_live_amounts: List[float | None] = []
-        env_index_dev_ma20_atr_list: List[float | None] = []
-        env_index_gate_action_list: List[str | None] = []
-        env_index_gate_reason_list: List[str | None] = []
-        env_index_position_cap_list: List[float | None] = []
         env_final_gate_action_list: List[str | None] = []
         board_statuses: List[str | None] = []
         board_ranks: List[float | None] = []
@@ -3017,6 +3096,7 @@ class MA5MA20OpenMonitorRunner:
         candidate_stages: List[str] = []
         candidate_states: List[str] = []
         summary_lines: List[str | None] = []
+        env_index_snapshot_hashes: List[str | None] = []
 
         def _coalesce(row: pd.Series, *cols: str) -> float | None:
             for col in cols:
@@ -3794,25 +3874,7 @@ class MA5MA20OpenMonitorRunner:
             status_tags_json_list.append(status_tags_json_value)
             candidate_stages.append(candidate_stage)
             candidate_states.append(candidate_state)
-            env_index_codes.append(env_index_code)
-            env_index_asof_trade_dates.append(env_index_asof_trade_date)
-            env_index_asof_closes.append(env_index_asof_close)
-            env_index_asof_ma20_list.append(env_index_asof_ma20)
-            env_index_asof_ma60_list.append(env_index_asof_ma60)
-            env_index_asof_macd_hist_list.append(env_index_asof_macd_hist)
-            env_index_asof_atr14_list.append(env_index_asof_atr14)
-            env_index_live_trade_dates.append(env_index_live_trade_date)
-            env_index_live_opens.append(env_index_live_open)
-            env_index_live_highs.append(env_index_live_high)
-            env_index_live_lows.append(env_index_live_low)
-            env_index_live_latests.append(env_index_live_latest)
-            env_index_live_pct_changes.append(env_index_live_pct_change)
-            env_index_live_volumes.append(env_index_live_volume)
-            env_index_live_amounts.append(env_index_live_amount)
-            env_index_dev_ma20_atr_list.append(env_index_dev_ma20_atr)
-            env_index_gate_action_list.append(env_index_gate_action)
-            env_index_gate_reason_list.append(env_index_gate_reason)
-            env_index_position_cap_list.append(env_index_position_cap)
+            env_index_snapshot_hashes.append(index_intraday.get("env_index_snapshot_hash"))
             env_final_gate_action_list.append(final_gate_action)
 
             vol_ratio_val = _to_float(live_intraday_vol_ratio)
@@ -3884,26 +3946,8 @@ class MA5MA20OpenMonitorRunner:
         merged["env_weekly_risk_level"] = env_weekly_risk_levels
         merged["env_weekly_scene"] = env_weekly_scene_list
         merged["env_weekly_gate_action"] = env_weekly_gate_action_list
-        merged["env_index_code"] = env_index_codes
-        merged["env_index_asof_trade_date"] = env_index_asof_trade_dates
-        merged["env_index_asof_close"] = env_index_asof_closes
-        merged["env_index_asof_ma20"] = env_index_asof_ma20_list
-        merged["env_index_asof_ma60"] = env_index_asof_ma60_list
-        merged["env_index_asof_macd_hist"] = env_index_asof_macd_hist_list
-        merged["env_index_asof_atr14"] = env_index_asof_atr14_list
-        merged["env_index_live_trade_date"] = env_index_live_trade_dates
-        merged["env_index_live_open"] = env_index_live_opens
-        merged["env_index_live_high"] = env_index_live_highs
-        merged["env_index_live_low"] = env_index_live_lows
-        merged["env_index_live_latest"] = env_index_live_latests
-        merged["env_index_live_pct_change"] = env_index_live_pct_changes
-        merged["env_index_live_volume"] = env_index_live_volumes
-        merged["env_index_live_amount"] = env_index_live_amounts
-        merged["env_index_dev_ma20_atr"] = env_index_dev_ma20_atr_list
-        merged["env_index_gate_action"] = env_index_gate_action_list
-        merged["env_index_gate_reason"] = env_index_gate_reason_list
-        merged["env_index_position_cap"] = env_index_position_cap_list
         merged["env_final_gate_action"] = env_final_gate_action_list
+        merged["env_index_snapshot_hash"] = env_index_snapshot_hashes
         merged["board_status"] = board_statuses
         merged["board_rank"] = board_ranks
         merged["board_chg_pct"] = board_chg_pcts
@@ -4017,25 +4061,7 @@ class MA5MA20OpenMonitorRunner:
             "env_index_score",
             "env_regime",
             "env_position_hint",
-            "env_index_code",
-            "env_index_asof_trade_date",
-            "env_index_asof_close",
-            "env_index_asof_ma20",
-            "env_index_asof_ma60",
-            "env_index_asof_macd_hist",
-            "env_index_asof_atr14",
-            "env_index_live_trade_date",
-            "env_index_live_open",
-            "env_index_live_high",
-            "env_index_live_low",
-            "env_index_live_latest",
-            "env_index_live_pct_change",
-            "env_index_live_volume",
-            "env_index_live_amount",
-            "env_index_dev_ma20_atr",
-            "env_index_gate_action",
-            "env_index_gate_reason",
-            "env_index_position_cap",
+            "env_index_snapshot_hash",
             "env_final_gate_action",
             "env_weekly_asof_trade_date",
             "env_weekly_risk_level",
@@ -4105,25 +4131,7 @@ class MA5MA20OpenMonitorRunner:
             "env_regime",
             "env_position_hint",
             "env_index_score",
-            "env_index_code",
-            "env_index_asof_trade_date",
-            "env_index_asof_close",
-            "env_index_asof_ma20",
-            "env_index_asof_ma60",
-            "env_index_asof_macd_hist",
-            "env_index_asof_atr14",
-            "env_index_live_trade_date",
-            "env_index_live_open",
-            "env_index_live_high",
-            "env_index_live_low",
-            "env_index_live_latest",
-            "env_index_live_pct_change",
-            "env_index_live_volume",
-            "env_index_live_amount",
-            "env_index_dev_ma20_atr",
-            "env_index_gate_action",
-            "env_index_gate_reason",
-            "env_index_position_cap",
+            "env_index_snapshot_hash",
             "env_final_gate_action",
             "env_weekly_asof_trade_date",
             "env_weekly_risk_level",
@@ -4457,6 +4465,50 @@ class MA5MA20OpenMonitorRunner:
         index_history = self._load_index_history(latest_trade_date)
         index_live_quote = self._fetch_index_live_quote()
         index_env_snapshot = self._build_index_env_snapshot(index_history, index_live_quote)
+        env_index_snapshot_hash = None
+        if index_env_snapshot:
+            index_snapshot_payload = {
+                "monitor_date": monitor_date,
+                "dedupe_bucket": dedupe_bucket,
+                "checked_at": checked_at,
+                "index_code": index_env_snapshot.get("env_index_code"),
+                "asof_trade_date": index_env_snapshot.get("env_index_asof_trade_date"),
+                "live_trade_date": index_env_snapshot.get("env_index_live_trade_date"),
+                "asof_close": _to_float(
+                    index_env_snapshot.get("env_index_asof_close")
+                ),
+                "asof_ma20": _to_float(index_env_snapshot.get("env_index_asof_ma20")),
+                "asof_ma60": _to_float(index_env_snapshot.get("env_index_asof_ma60")),
+                "asof_macd_hist": _to_float(
+                    index_env_snapshot.get("env_index_asof_macd_hist")
+                ),
+                "asof_atr14": _to_float(index_env_snapshot.get("env_index_asof_atr14")),
+                "live_open": _to_float(index_env_snapshot.get("env_index_live_open")),
+                "live_high": _to_float(index_env_snapshot.get("env_index_live_high")),
+                "live_low": _to_float(index_env_snapshot.get("env_index_live_low")),
+                "live_latest": _to_float(
+                    index_env_snapshot.get("env_index_live_latest")
+                ),
+                "live_pct_change": _to_float(
+                    index_env_snapshot.get("env_index_live_pct_change")
+                ),
+                "live_volume": _to_float(index_env_snapshot.get("env_index_live_volume")),
+                "live_amount": _to_float(index_env_snapshot.get("env_index_live_amount")),
+                "dev_ma20_atr": _to_float(
+                    index_env_snapshot.get("env_index_dev_ma20_atr")
+                ),
+                "gate_action": index_env_snapshot.get("env_index_gate_action"),
+                "gate_reason": index_env_snapshot.get("env_index_gate_reason"),
+                "position_cap": _to_float(
+                    index_env_snapshot.get("env_index_position_cap")
+                ),
+            }
+            index_snapshot_payload["snapshot_hash"] = make_snapshot_hash(index_snapshot_payload)
+            env_index_snapshot_hash = self._persist_index_snapshot(
+                index_snapshot_payload,
+                table=self.params.env_index_snapshot_table,
+            ) or index_snapshot_payload["snapshot_hash"]
+            index_env_snapshot["env_index_snapshot_hash"] = env_index_snapshot_hash
         if isinstance(env_context, dict):
             env_context["index_intraday"] = index_env_snapshot
         if index_env_snapshot:
