@@ -1365,6 +1365,9 @@ class MA5MA20OpenMonitorRunner:
             "entry_exposure_cap": "DOUBLE",
             "sig_date": "VARCHAR(10)",
             "asof_trade_date": "VARCHAR(10)",
+            "live_trade_date": "VARCHAR(10)",
+            "candidate_stage": "VARCHAR(16)",
+            "candidate_state": "VARCHAR(32)",
             "signal_kind": "VARCHAR(16)",
             "sig_close": "DOUBLE",
             "asof_close": "DOUBLE",
@@ -1399,6 +1402,8 @@ class MA5MA20OpenMonitorRunner:
             "runup_ref_price": "DOUBLE",
             "runup_ref_source": "VARCHAR(32)",
             "status_tags": "VARCHAR(255)",
+            "status_tags_json": "TEXT",
+            "summary_line": "VARCHAR(512)",
         }
 
         with self.db_writer.engine.begin() as conn:
@@ -2249,7 +2254,8 @@ class MA5MA20OpenMonitorRunner:
         total_minutes = 240
         if q.empty:
             out = signals.copy()
-            out["monitor_date"] = dt.date.today().isoformat()
+            out["monitor_date"] = checked_at_ts.date().isoformat()
+            out["live_trade_date"] = out["monitor_date"]
             out["live_open"] = None
             out["live_latest"] = None
             out["live_high"] = None
@@ -2279,6 +2285,8 @@ class MA5MA20OpenMonitorRunner:
             out["runup_ref_price"] = None
             out["runup_ref_source"] = None
             out["status_tags"] = None
+            out["status_tags_json"] = None
+            out["summary_line"] = "INACTIVE/UNKNOWN UNKNOWN | 行情数据不可用"
             out["action"] = "UNKNOWN"
             out["action_reason"] = "行情数据不可用"
             out["candidate_status"] = "UNKNOWN"
@@ -2603,6 +2611,10 @@ class MA5MA20OpenMonitorRunner:
         runup_ref_price_list: List[float | None] = []
         runup_ref_source_list: List[str | None] = []
         status_tags_list: List[str | None] = []
+        status_tags_json_list: List[str | None] = []
+        candidate_stages: List[str] = []
+        candidate_states: List[str] = []
+        summary_lines: List[str | None] = []
 
         def _coalesce(row: pd.Series, *cols: str) -> float | None:
             for col in cols:
@@ -2761,7 +2773,7 @@ class MA5MA20OpenMonitorRunner:
         prev_strength_map = self._load_previous_strength(codes_all, as_of=checked_at_ts)
         eps = 1e-6
 
-        status_priority = ["STALE", "INVALID", "RUNUP_TOO_LARGE", "OVEREXTENDED"]
+        status_priority = ["INVALID", "RUNUP_TOO_LARGE", "OVEREXTENDED", "STALE"]
 
         for idx, row in merged.iterrows():
             action = "EXECUTE"
@@ -2998,22 +3010,32 @@ class MA5MA20OpenMonitorRunner:
                 mania_reason = risk_note or "风险标签=MANIA：短期过热，默认不追"
                 status_hits.append(("INVALID", mania_reason))
 
-            primary_status = next(
+            primary_state = next(
                 (
-                    status
-                    for status in status_priority
-                    if any(hit[0] == status for hit in status_hits)
+                    state
+                    for state in status_priority
+                    if any(hit[0] == state for hit in status_hits)
                 ),
-                "ACTIVE",
+                "OK",
             )
             primary_reason = next(
-                (hit[1] for hit in status_hits if hit[0] == primary_status),
+                (hit[1] for hit in status_hits if hit[0] == primary_state),
                 "结构/时效通过",
             )
-            other_tags = [f"{s}:{r}" for s, r in status_hits if s != primary_status]
+            other_tags = [f"{s}:{r}" for s, r in status_hits if s != primary_state]
             status_tags_value = ",".join(other_tags) if other_tags else None
+            status_tags_json_value = json.dumps(
+                {
+                    "primary": {"state": primary_state, "reason": primary_reason},
+                    "hits": [{"state": s, "reason": r} for s, r in status_hits],
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
 
-            candidate_status = primary_status
+            candidate_stage = "ACTIVE" if primary_state == "OK" else "INACTIVE"
+            candidate_state = primary_state
+            candidate_status = "ACTIVE" if candidate_stage == "ACTIVE" else candidate_state
             status_reason = primary_reason or "结构/时效通过"
 
             if candidate_status != "ACTIVE":
@@ -3333,6 +3355,27 @@ class MA5MA20OpenMonitorRunner:
             runup_ref_price_list.append(_to_float(runup_ref_price_val))
             runup_ref_source_list.append(runup_ref_source_val)
             status_tags_list.append(status_tags_value)
+            status_tags_json_list.append(status_tags_json_value)
+            candidate_stages.append(candidate_stage)
+            candidate_states.append(candidate_state)
+
+            vol_ratio_val = _to_float(live_intraday_vol_ratio)
+            dev_ma20_atr_val = _to_float(dev_ma20_atr)
+            runup_atr_val = _to_float(runup_from_sigclose_atr)
+            vol_ratio_txt = f"{vol_ratio_val:.2f}" if vol_ratio_val is not None else "-"
+            dev_ma20_atr_txt = f"{dev_ma20_atr_val:.2f}" if dev_ma20_atr_val is not None else "-"
+            runup_atr_txt = f"{runup_atr_val:.2f}" if runup_atr_val is not None else "-"
+            board_txt = board_status or "-"
+            gate_txt = weekly_gate_action or "NOT_APPLIED"
+            summary_line = (
+                f"{candidate_stage}/{candidate_state} {action}"
+                f" | 量比={vol_ratio_txt}"
+                f" | 偏离20ATR={dev_ma20_atr_txt}"
+                f" | runupATR={runup_atr_txt}"
+                f" | 板块={board_txt}"
+                f" | 门控={gate_txt}"
+            )
+            summary_lines.append(summary_line[:512])
 
             env_weekly_asof_trade_dates.append(env_weekly_asof_trade_date)
             env_weekly_risk_levels.append(env_weekly_risk_level)
@@ -3351,10 +3394,13 @@ class MA5MA20OpenMonitorRunner:
             effective_stop_refs.append(_to_float(effective_stop_ref))
             valid_days_list.append(valid_days)
 
-        merged["monitor_date"] = dt.date.today().isoformat()
+        merged["monitor_date"] = checked_at_ts.date().isoformat()
+        merged["live_trade_date"] = merged["monitor_date"]
         merged["action"] = actions
         merged["action_reason"] = reasons
         merged["candidate_status"] = statuses
+        merged["candidate_stage"] = candidate_stages
+        merged["candidate_state"] = candidate_states
         merged["status_reason"] = status_reasons
         merged["trade_stop_ref"] = trade_stop_refs
         merged["sig_stop_ref"] = sig_stop_refs
@@ -3402,6 +3448,8 @@ class MA5MA20OpenMonitorRunner:
         merged["runup_ref_price"] = runup_ref_price_list
         merged["runup_ref_source"] = runup_ref_source_list
         merged["status_tags"] = status_tags_list
+        merged["status_tags_json"] = status_tags_json_list
+        merged["summary_line"] = summary_lines
         if "asof_close" not in merged.columns:
             merged["asof_close"] = merged.get("sig_close")
 
@@ -3436,6 +3484,7 @@ class MA5MA20OpenMonitorRunner:
             "code",
             "name",
             "asof_trade_date",
+            "live_trade_date",
             "avg_volume_20",
             "live_open",
             "live_high",
@@ -3497,6 +3546,8 @@ class MA5MA20OpenMonitorRunner:
             "risk_tag",
             "risk_note",
             "status_tags",
+            "status_tags_json",
+            "summary_line",
             "signal_kind",
             "sig_signal",
             "sig_reason",
@@ -3513,6 +3564,7 @@ class MA5MA20OpenMonitorRunner:
             "monitor_date",
             "sig_date",
             "asof_trade_date",
+            "live_trade_date",
             "signal_age",
             "valid_days",
             "code",
@@ -3549,6 +3601,8 @@ class MA5MA20OpenMonitorRunner:
             "env_weekly_risk_level",
             "env_weekly_scene",
             "env_weekly_gate_action",
+            "candidate_stage",
+            "candidate_state",
             "candidate_status",
             "status_reason",
             "action",
@@ -3558,6 +3612,8 @@ class MA5MA20OpenMonitorRunner:
             "risk_tag",
             "risk_note",
             "status_tags",
+            "status_tags_json",
+            "summary_line",
             "checked_at",
             "dedupe_bucket",
             "snapshot_hash",
@@ -3602,6 +3658,7 @@ class MA5MA20OpenMonitorRunner:
             "sig_reason",
             "action_reason",
             "status_reason",
+            "status_tags",
         ]:
             if col in df.columns:
                 df[col] = (
@@ -3610,6 +3667,16 @@ class MA5MA20OpenMonitorRunner:
                     .astype(str)
                     .str.slice(0, 250)
                 )
+
+        if "summary_line" in df.columns:
+            df["summary_line"] = (
+                df["summary_line"].fillna("").astype(str).str.slice(0, 512)
+            )
+
+        if "status_tags_json" in df.columns:
+            df["status_tags_json"] = (
+                df["status_tags_json"].fillna("").astype(str).str.slice(0, 4000)
+            )
 
         if table_exists:
             self._ensure_snapshot_schema(table)
@@ -3696,20 +3763,47 @@ class MA5MA20OpenMonitorRunner:
         export_df[gap_col] = export_df[gap_col].apply(_to_float)
         # CSV 里把“状态正常且可执行”放在最前面，方便你开盘快速扫一眼
         action_rank = {"EXECUTE": 0, "WAIT": 1, "SKIP": 2, "UNKNOWN": 3}
-        status_rank = {
-            "ACTIVE": 0,
-            "OVEREXTENDED": 1,
-            "RUNUP_TOO_LARGE": 2,
-            "INVALID": 3,
-            "STALE": 4,
-            "UNKNOWN": 5,
-        }
         export_df["_action_rank"] = export_df["action"].map(action_rank).fillna(99)
-        export_df["_status_rank"] = export_df["candidate_status"].map(status_rank).fillna(99)
-        export_df = export_df.sort_values(
-            by=["_status_rank", "_action_rank", gap_col], ascending=[True, True, True]
-        )
-        export_df = export_df.drop(columns=["_action_rank", "_status_rank"], errors="ignore")
+
+        if "candidate_stage" in export_df.columns and "candidate_state" in export_df.columns:
+            stage_rank = {"ACTIVE": 0, "INACTIVE": 1}
+            state_rank = {
+                "OK": 0,
+                "OVEREXTENDED": 1,
+                "RUNUP_TOO_LARGE": 2,
+                "INVALID": 3,
+                "STALE": 4,
+                "UNKNOWN": 9,
+            }
+            export_df["_stage_rank"] = export_df["candidate_stage"].map(stage_rank).fillna(99)
+            export_df["_state_rank"] = export_df["candidate_state"].map(state_rank).fillna(99)
+            export_df = export_df.sort_values(
+                by=["_stage_rank", "_action_rank", "_state_rank", gap_col],
+                ascending=[True, True, True, True],
+            )
+            export_df = export_df.drop(
+                columns=["_action_rank", "_stage_rank", "_state_rank"],
+                errors="ignore",
+            )
+        else:
+            status_rank = {
+                "ACTIVE": 0,
+                "OVEREXTENDED": 1,
+                "RUNUP_TOO_LARGE": 2,
+                "INVALID": 3,
+                "STALE": 4,
+                "UNKNOWN": 5,
+            }
+            export_df["_status_rank"] = (
+                export_df["candidate_status"].map(status_rank).fillna(99)
+            )
+            export_df = export_df.sort_values(
+                by=["_status_rank", "_action_rank", gap_col],
+                ascending=[True, True, True],
+            )
+            export_df = export_df.drop(
+                columns=["_action_rank", "_status_rank"], errors="ignore"
+            )
         if self.params.export_top_n > 0:
             export_df = export_df.head(self.params.export_top_n)
 
