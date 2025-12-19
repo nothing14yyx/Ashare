@@ -170,10 +170,10 @@ open_monitor:
 
   # 追高过滤：入场价相对 MA5 乖离过大（例如 0.08=超过 MA5 8% 就不追）
   max_entry_vs_ma5_pct: 0.08
-
-  # 过期判定：信号后过快拉升（相对 ATR 或涨幅），默认 1.2*ATR 或 7% 以上视为过期
-  expire_atr_mult: 1.2
-  expire_pct_threshold: 0.07
+  # 乖离/拉升阈值：用于可解释化派生字段
+  runup_atr_max: 1.2
+  dev_ma5_atr_max: 2.0
+  dev_ma20_atr_max: 2.5
 
   # 风控：开盘以“实际入场价”为基准计算止损（stop_ref=entry-stop_atr_mult*ATR）
   stop_atr_mult: 2.0
@@ -193,4 +193,3 @@ open_monitor:
   export_csv: false
   export_top_n: 100
   output_subdir: open_monitor
-

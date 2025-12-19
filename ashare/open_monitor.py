@@ -154,9 +154,10 @@ class OpenMonitorParams:
     # 追高过滤：入场价相对 MA5 乖离过大
     max_entry_vs_ma5_pct: float = 0.08  # 入场价 > MA5*(1+8%) → skip
 
-    # 过期判定：信号后快速拉升
-    expire_atr_mult: float = 1.2
-    expire_pct_threshold: float = 0.07
+    # 乖离/拉升阈值
+    runup_atr_max: float = 1.2  # 信号后最大拉升 / ATR > runup_atr_max → skip
+    dev_ma5_atr_max: float = 2.0
+    dev_ma20_atr_max: float = 2.5
 
     # 风控：开盘入场价为基准的 ATR 止损
     stop_atr_mult: float = 2.0         # trade_stop_ref = entry - stop_atr_mult*ATR
@@ -299,11 +300,9 @@ class OpenMonitorParams:
                 _get_float("max_entry_vs_ma5_pct", cls.max_entry_vs_ma5_pct),
                 "max_entry_vs_ma5_pct",
             ),
-            expire_atr_mult=_get_float("expire_atr_mult", cls.expire_atr_mult),
-            expire_pct_threshold=_normalize_ratio_pct(
-                _get_float("expire_pct_threshold", cls.expire_pct_threshold),
-                "expire_pct_threshold",
-            ),
+            runup_atr_max=_get_float("runup_atr_max", cls.runup_atr_max),
+            dev_ma5_atr_max=_get_float("dev_ma5_atr_max", cls.dev_ma5_atr_max),
+            dev_ma20_atr_max=_get_float("dev_ma20_atr_max", cls.dev_ma20_atr_max),
             stop_atr_mult=_get_float("stop_atr_mult", cls.stop_atr_mult),
             signal_day_limit_up_pct=_normalize_ratio_pct(
                 _get_float("signal_day_limit_up_pct", cls.signal_day_limit_up_pct),
@@ -1303,6 +1302,12 @@ class MA5MA20OpenMonitorRunner:
             "effective_stop_ref": "DOUBLE",
             "sig_kdj_k": "DOUBLE",
             "sig_kdj_d": "DOUBLE",
+            "dev_ma5": "DOUBLE",
+            "dev_ma20": "DOUBLE",
+            "dev_ma5_atr": "DOUBLE",
+            "dev_ma20_atr": "DOUBLE",
+            "runup_from_sigclose": "DOUBLE",
+            "runup_from_sigclose_atr": "DOUBLE",
         }
 
         with self.db_writer.engine.begin() as conn:
@@ -2120,6 +2125,12 @@ class MA5MA20OpenMonitorRunner:
             out["asof_stop_ref"] = out.get("sig_stop_ref")
             out["asof_trade_date"] = out.get("sig_date")
             out["avg_volume_20"] = None
+            out["dev_ma5"] = None
+            out["dev_ma20"] = None
+            out["dev_ma5_atr"] = None
+            out["dev_ma20_atr"] = None
+            out["runup_from_sigclose"] = None
+            out["runup_from_sigclose_atr"] = None
             out["action"] = "UNKNOWN"
             out["action_reason"] = "行情数据不可用"
             out["candidate_status"] = "UNKNOWN"
@@ -2385,9 +2396,9 @@ class MA5MA20OpenMonitorRunner:
         max_entry_vs_ma5 = self.params.max_entry_vs_ma5_pct
         stop_atr_mult = self.params.stop_atr_mult
         signal_day_limit_up = self.params.signal_day_limit_up_pct
-
-        expire_atr_mult = self.params.expire_atr_mult
-        expire_pct_threshold = self.params.expire_pct_threshold
+        runup_atr_max = self.params.runup_atr_max
+        dev_ma5_atr_max = self.params.dev_ma5_atr_max
+        dev_ma20_atr_max = self.params.dev_ma20_atr_max
         cross_valid_days = self.params.cross_valid_days
         pullback_valid_days = self.params.pullback_valid_days
         vol_threshold = self.volume_ratio_threshold
@@ -2425,6 +2436,12 @@ class MA5MA20OpenMonitorRunner:
         asof_macd_hist_list: List[float | None] = []
         asof_atr14_list: List[float | None] = []
         asof_stop_ref_list: List[float | None] = []
+        dev_ma5_list: List[float | None] = []
+        dev_ma20_list: List[float | None] = []
+        dev_ma5_atr_list: List[float | None] = []
+        dev_ma20_atr_list: List[float | None] = []
+        runup_from_sigclose_list: List[float | None] = []
+        runup_from_sigclose_atr_list: List[float | None] = []
 
         def _coalesce(row: pd.Series, *cols: str) -> float | None:
             for col in cols:
@@ -2581,12 +2598,13 @@ class MA5MA20OpenMonitorRunner:
                 "incremental_write=False 会覆盖当日历史，strength_delta/strength_trend 可能缺乏对比基础"
             )
         prev_strength_map = self._load_previous_strength(codes_all, as_of=checked_at_ts)
+        eps = 1e-6
 
         for idx, row in merged.iterrows():
             action = "EXECUTE"
             reason = "OK"
-            status = "ACTIVE"
-            status_reason = "健康满足"
+            candidate_status = "ACTIVE"
+            status_reason = "结构/时效通过"
 
             risk_tag_raw = str(row.get("risk_tag") or "").strip()
             risk_note = str(row.get("risk_note") or "").strip()
@@ -2693,6 +2711,7 @@ class MA5MA20OpenMonitorRunner:
             strength_trend = _classify_strength_trend(strength_score, prev_strength)
 
             valid_days = pullback_valid_days if is_pullback else cross_valid_days
+            sig_atr14_val = _to_float(row.get("sig_atr14"))
 
             trade_stop_ref_val = _to_float(trade_stop_ref)
             asof_stop_ref_val = _to_float(row.get("asof_stop_ref"))
@@ -2710,272 +2729,225 @@ class MA5MA20OpenMonitorRunner:
                 ),
                 None,
             )
-            structural_failure_reason = None
-            structural_downgrade_reason = None
-            if ma5 is not None and ma20 is not None and ma5 < ma20:
-                if is_pullback:
-                    structural_downgrade_reason = "盘中结构观察：MA5 下穿 MA20（回踩形态降级观察）"
-                else:
-                    structural_failure_reason = "盘中结构失效：MA5 下穿 MA20"
-            elif (
-                price_now is not None
-                and ma20 is not None
-                and atr14 is not None
-                and price_now < ma20 - 0.3 * atr14
-            ):
-                threshold = ma20 - 0.3 * atr14
-                structural_failure_reason = (
-                    f"盘中结构失效：最新价 {price_now:.2f} 低于 MA20-0.3ATR 阈值 {threshold:.2f}"
-                )
-            elif macd_hist is not None and macd_hist < 0:
-                if is_pullback:
-                    structural_downgrade_reason = "盘中结构观察：MACD 柱子转负（回踩形态降级观察）"
-                else:
-                    structural_failure_reason = "盘中结构失效：MACD 柱子转负"
-            elif (
-                price_now is not None
-                and effective_stop_ref is not None
-                and price_now <= effective_stop_ref
-            ):
-                stop_parts: list[str] = []
-                if trade_stop_ref_val is not None:
-                    stop_parts.append(f"entry 止损 {trade_stop_ref_val:.2f}")
-                if asof_stop_ref_val is not None:
-                    stop_parts.append(f"昨收止损 {asof_stop_ref_val:.2f}")
-                if signal_stop_ref_val is not None:
-                    stop_parts.append(f"信号日止损 {signal_stop_ref_val:.2f}")
-                stop_detail = "，".join(stop_parts)
-                detail_suffix = (
-                    "（参考顺序：入场ATR>昨收>信号日；候选："
-                    f"{stop_detail}）"
-                    if stop_detail
-                    else ""
-                )
-                structural_failure_reason = (
-                    f"盘中结构失效：最新价 {price_now:.2f} 跌破止损参考价 {effective_stop_ref:.2f}{detail_suffix}"
-                )
+            live_price_for_dev = _to_float(latest_px) if latest_px is not None else _to_float(price_now)
+            dev_ma5 = None
+            dev_ma20 = None
+            dev_ma5_atr = None
+            dev_ma20_atr = None
+            if live_price_for_dev is not None and ma5 is not None:
+                dev_ma5 = live_price_for_dev - ma5
+                if atr14 is not None:
+                    dev_ma5_atr = dev_ma5 / max(atr14, eps)
+            if live_price_for_dev is not None and ma20 is not None:
+                dev_ma20 = live_price_for_dev - ma20
+                if atr14 is not None:
+                    dev_ma20_atr = dev_ma20 / max(atr14, eps)
 
-            if structural_failure_reason:
-                status = "INVALID"
-                status_reason = structural_failure_reason
+            runup_from_sigclose = None
+            runup_from_sigclose_atr = None
+            sig_close_val = _to_float(signal_close)
+            post_sig_peak_values: list[float] = []
+            for cand in [row.get("live_high"), latest_px, row.get("asof_close")]:
+                cand_val = _to_float(cand)
+                if cand_val is not None:
+                    post_sig_peak_values.append(cand_val)
+            if sig_close_val is not None and post_sig_peak_values:
+                post_sig_peak = max(post_sig_peak_values)
+                runup_from_sigclose = post_sig_peak - sig_close_val
+                sig_atr_for_runup = sig_atr14_val if sig_atr14_val is not None else atr14
+                if sig_atr_for_runup is not None:
+                    runup_from_sigclose_atr = runup_from_sigclose / max(sig_atr_for_runup, eps)
+
+            if valid_days > 0 and signal_age is not None and signal_age > valid_days:
+                candidate_status = "STALE"
+                status_reason = f"signal_age={int(signal_age)} > valid_days={valid_days}"
                 action = "SKIP"
-                reason = structural_failure_reason
+                reason = status_reason
 
-            if not structural_failure_reason:
-                if structural_downgrade_reason and status == "ACTIVE":
-                    status = "WAIT"
-                    status_reason = structural_downgrade_reason
-                if (
-                    price_now is not None
-                    and ma20 is not None
-                    and vol_used is not None
-                    and vol_used >= vol_threshold
-                    and price_now < ma20
-                ):
-                    if is_pullback:
-                        status = "WAIT"
-                        status_reason = "价格跌破 MA20 且前一交易日放量（回踩形态观察）"
-                    else:
-                        status = "INVALID"
-                        status_reason = "价格跌破 MA20 且前一交易日放量"
-                post_sig_peak_candidates = [
-                    row.get("live_high"),
-                    row.get("live_latest"),
-                    row.get("asof_close"),
-                    signal_close,
-                ]
-                post_sig_peak_vals = [
-                    _to_float(v) for v in post_sig_peak_candidates if _to_float(v) is not None
-                ]
-                post_sig_peak = max(post_sig_peak_vals) if post_sig_peak_vals else None
-                overheat_reason = None
-                if (
-                    post_sig_peak is not None
-                    and ma5 is not None
-                    and max_entry_vs_ma5 > 0
-                    and post_sig_peak > ma5 * (1.0 + max_entry_vs_ma5)
-                ):
-                    overheat_reason = "相对MA5乖离过大"
-                elif (
-                    post_sig_peak is not None
-                    and signal_close is not None
-                    and post_sig_peak > signal_close
-                ):
-                    gain = (post_sig_peak - signal_close) / signal_close
-                    atr_base = atr14 if atr14 is not None else row.get("atr14")
-                    atr_gain = None
-                    if atr_base is not None and atr_base > 0:
-                        atr_gain = (post_sig_peak - signal_close) / atr_base
-                    if atr_gain is not None and atr_gain > expire_atr_mult:
-                        overheat_reason = f"信号后拉升超过 ATR×{expire_atr_mult:.2f}"
-                    elif gain > expire_pct_threshold:
-                        overheat_reason = f"信号后涨幅 {gain*100:.2f}% 超过阈值"
-
-                if overheat_reason:
-                    status = "EXPIRED"
-                    status_reason = overheat_reason
-                    action = "SKIP"
-                    reason = overheat_reason
-                elif valid_days > 0 and signal_age is not None and signal_age > valid_days:
-                    if strength_trend == "ENHANCING" or (
-                        strength_score is not None and strength_score >= 2
-                    ):
-                        status = "WAIT"
-                        status_reason = (
-                            f"超过有效期 {valid_days} 个交易日但强度走强，继续观察"
-                        )
-                    else:
-                        status = "EXPIRED"
-                        status_reason = f"超过有效期 {valid_days} 个交易日"
-                elif (
-                    price_now is not None
-                    and ma5 is not None
-                    and max_entry_vs_ma5 > 0
-                    and price_now > ma5 * (1.0 + max_entry_vs_ma5)
-                ):
-                    status = "EXPIRED"
-                    status_reason = "入场价/最新价相对 MA5 乖离过大"
-                elif price_now is not None and signal_close is not None and price_now > signal_close:
-                    gain = (price_now - signal_close) / signal_close
-                    atr_base = atr14 if atr14 is not None else row.get("atr14")
-                    atr_gain = None
-                    if atr_base is not None and atr_base > 0:
-                        atr_gain = (price_now - signal_close) / atr_base
-                    if atr_gain is not None and atr_gain > expire_atr_mult:
-                        status = "EXPIRED"
-                        status_reason = f"信号后拉升超过 ATR×{expire_atr_mult:.2f}"
-                    elif gain > expire_pct_threshold:
-                        status = "EXPIRED"
-                        status_reason = f"信号后涨幅 {gain*100:.2f}% 超过阈值"
-                else:
-                    trend_ok = (
-                        current_close is not None
-                        and ma60 is not None
-                        and ma250 is not None
-                        and ma20 is not None
-                        and current_close > ma60
-                        and current_close > ma250
-                        and ma20 > ma60 > ma250
+            invalid_reason = None
+            if candidate_status == "ACTIVE":
+                if macd_hist is not None and macd_hist <= 0:
+                    invalid_reason = f"MACD 柱子转负：asof_macd_hist={macd_hist:.4f} ≤ 0"
+                elif price_now is not None and ma20 is not None and price_now < ma20:
+                    invalid_reason = (
+                        f"跌破MA20：price_now={price_now:.2f} < asof_ma20={ma20:.2f}"
                     )
-                    macd_ok = macd_hist is not None and macd_hist > 0
-                    vol_ok = vol_used is not None and vol_used >= vol_threshold
+                elif ma5 is not None and ma20 is not None and ma5 < ma20:
+                    invalid_reason = f"盘中结构失效：MA5({ma5:.2f}) < MA20({ma20:.2f})"
+                elif (
+                    price_now is not None
+                    and effective_stop_ref is not None
+                    and price_now <= effective_stop_ref
+                ):
+                    stop_parts: list[str] = []
+                    if trade_stop_ref_val is not None:
+                        stop_parts.append(f"entry止损={trade_stop_ref_val:.2f}")
+                    if asof_stop_ref_val is not None:
+                        stop_parts.append(f"昨收止损={asof_stop_ref_val:.2f}")
+                    if signal_stop_ref_val is not None:
+                        stop_parts.append(f"信号日止损={signal_stop_ref_val:.2f}")
+                    stop_detail = "，".join(stop_parts)
+                    invalid_reason = (
+                        f"触发止损：price_now={price_now:.2f} <= effective_stop_ref={effective_stop_ref:.2f}"
+                    )
+                    if stop_detail:
+                        invalid_reason = f"{invalid_reason}（参考：{stop_detail}）"
+                elif (
+                    current_close is not None
+                    and ma60 is not None
+                    and ma250 is not None
+                    and ma20 is not None
+                    and (current_close <= ma60 or current_close <= ma250 or ma20 <= ma60)
+                ):
+                    invalid_reason = "多头排列/趋势破坏"
 
-                    if not trend_ok:
-                        status = "INVALID"
-                        status_reason = "多头排列/趋势破坏"
-                    elif (not macd_ok) or (not vol_ok):
-                        status = "WAIT"
-                        weak_reasons = []
-                        if not macd_ok:
-                            weak_reasons.append("MACD 动能转弱")
-                        if not vol_ok:
-                            weak_reasons.append("量能不足")
-                        status_reason = "；".join(weak_reasons) if weak_reasons else "继续观察"
-
-            if status == "ACTIVE" and strength_score is not None:
-                if strength_score < 0:
-                    status = "WAIT"
-                    status_reason = "信号强度偏弱，等待修复"
-                elif strength_trend == "WEAKENING":
-                    status = "WAIT"
-                    status_reason = "信号强度走弱，等待确认"
-
-            if status in {"INVALID", "EXPIRED"}:
+            if invalid_reason:
+                candidate_status = "INVALID"
+                status_reason = invalid_reason
                 action = "SKIP"
                 reason = status_reason
-            elif status == "WAIT":
-                action = "WAIT"
-                reason = status_reason
 
-            if action == "EXECUTE" and signal_day_pct is not None and signal_day_pct >= signal_day_limit_up:
-                action = "SKIP"
-                reason = f"信号日涨幅 {signal_day_pct*100:.2f}% 接近涨停，次日不追"
-
-            if action == "EXECUTE" and pct is not None and pct >= limit_up_trigger:
-                action = "SKIP"
-                reason = f"涨幅 {pct:.2f}% 接近/达到涨停"
-
-            if action == "EXECUTE" and gap is not None and gap > 0:
-                gap_up_threshold = max_up
-                atr_based = None
-                if ref_close is not None and ref_close > 0 and atr14 is not None and atr14 > 0 and max_up_atr_mult > 0:
-                    atr_based = max_up_atr_mult * atr14 / ref_close
-                    if atr_based > 0:
-                        gap_up_threshold = min(max_up, atr_based)
-
-                if gap > gap_up_threshold:
+            if candidate_status == "ACTIVE" and runup_from_sigclose_atr is not None:
+                if runup_from_sigclose_atr > runup_atr_max:
+                    candidate_status = "RUNUP_TOO_LARGE"
+                    status_reason = (
+                        f"runup_from_sigclose_atr={runup_from_sigclose_atr:.2f} > runup_atr_max={runup_atr_max:.2f}"
+                    )
                     action = "SKIP"
-                    if atr_based is None:
-                        reason = f"高开 {gap*100:.2f}% 超过阈值 {gap_up_threshold*100:.2f}%"
-                    else:
+                    reason = status_reason
+
+            if candidate_status == "ACTIVE":
+                overextend_reasons: list[str] = []
+                if dev_ma5_atr is not None and dev_ma5_atr > dev_ma5_atr_max:
+                    overextend_reasons.append(
+                        f"dev_ma5_atr={dev_ma5_atr:.2f} > {dev_ma5_atr_max:.2f}"
+                    )
+                if dev_ma20_atr is not None and dev_ma20_atr > dev_ma20_atr_max:
+                    overextend_reasons.append(
+                        f"dev_ma20_atr={dev_ma20_atr:.2f} > {dev_ma20_atr_max:.2f}"
+                    )
+                if overextend_reasons:
+                    candidate_status = "OVEREXTENDED"
+                    status_reason = "；".join(overextend_reasons)
+                    action = "SKIP"
+                    reason = status_reason
+
+            if candidate_status == "ACTIVE" and "MANIA" in risk_tags_split:
+                candidate_status = "INVALID"
+                status_reason = risk_note or "风险标签=MANIA：短期过热，默认不追"
+                action = "SKIP"
+                reason = status_reason
+
+            if candidate_status == "ACTIVE":
+                if action == "EXECUTE" and signal_day_pct is not None and signal_day_pct >= signal_day_limit_up:
+                    action = "SKIP"
+                    reason = f"信号日涨幅 {signal_day_pct*100:.2f}% 接近涨停，次日不追"
+
+                if action == "EXECUTE" and pct is not None and pct >= limit_up_trigger:
+                    action = "SKIP"
+                    reason = f"涨幅 {pct:.2f}% 接近/达到涨停"
+
+                if action == "EXECUTE" and gap is not None and gap > 0:
+                    gap_up_threshold = max_up
+                    atr_based = None
+                    if ref_close is not None and ref_close > 0 and atr14 is not None and atr14 > 0 and max_up_atr_mult > 0:
+                        atr_based = max_up_atr_mult * atr14 / ref_close
+                        if atr_based > 0:
+                            gap_up_threshold = min(max_up, atr_based)
+
+                    if gap > gap_up_threshold:
+                        action = "SKIP"
                         reason = (
                             f"高开 {gap*100:.2f}% 超过阈值 {gap_up_threshold*100:.2f}%"
-                            f"（min(固定{max_up*100:.2f}%, ATR×{max_up_atr_mult:.1f}={atr_based*100:.2f}% )）"
+                            if atr_based is None
+                            else (
+                                f"高开 {gap*100:.2f}% 超过阈值 {gap_up_threshold*100:.2f}%"
+                                f"（min(固定{max_up*100:.2f}%, ATR×{max_up_atr_mult:.1f}={atr_based*100:.2f}% )）"
+                            )
                         )
 
-            if action == "EXECUTE" and gap is not None and gap < max_down:
-                action = "SKIP"
-                reason = f"低开 {gap*100:.2f}% 低于阈值 {max_down*100:.2f}%"
-
-            if action == "EXECUTE" and (ma20 is not None) and (entry_px is not None):
-                threshold = ma20 * (
-                    1.0
-                    + (
-                        pullback_min_vs_ma20
-                        if is_pullback
-                        else min_vs_ma20
-                    )
-                )
-                if entry_px < threshold:
+                if action == "EXECUTE" and gap is not None and gap < max_down:
                     action = "SKIP"
-                    px_label = "入场价(最新)" if used_latest_as_entry else "入场价"
-                    reason = f"{px_label} {entry_px:.2f} 跌破 MA20 阈值 {threshold:.2f}"
+                    reason = f"低开 {gap*100:.2f}% 低于阈值 {max_down*100:.2f}%"
 
-            if action == "EXECUTE" and (ma5 is not None) and (entry_px is not None) and (max_entry_vs_ma5 > 0):
-                threshold_ma5 = ma5 * (1.0 + max_entry_vs_ma5)
-                if entry_px > threshold_ma5:
-                    action = "SKIP"
-                    px_label = "入场价(最新)" if used_latest_as_entry else "入场价"
-                    reason = (
-                        f"{px_label} {entry_px:.2f} 高于 MA5 阈值 {threshold_ma5:.2f}"
-                        f"（>{max_entry_vs_ma5*100:.2f}%）"
+                if action == "EXECUTE" and (ma20 is not None) and (entry_px is not None):
+                    threshold = ma20 * (
+                        1.0
+                        + (
+                            pullback_min_vs_ma20
+                            if is_pullback
+                            else min_vs_ma20
+                        )
                     )
+                    if entry_px < threshold:
+                        action = "SKIP"
+                        px_label = "入场价(最新)" if used_latest_as_entry else "入场价"
+                        reason = f"{px_label} {entry_px:.2f} 跌破 MA20 阈值 {threshold:.2f}"
 
-            if (
-                idx_score_float is not None
-                and action == "EXECUTE"
-                and idx_score_float < self.env_index_score_threshold
-            ):
-                action = "WAIT"
-                reason = (
-                    f"大盘趋势分数 {idx_score_float:.1f} 低于阈值"
-                    f" {self.env_index_score_threshold:.1f}，建议观望/减仓"
-                )
+                if action == "EXECUTE" and (ma5 is not None) and (entry_px is not None) and (max_entry_vs_ma5 > 0):
+                    threshold_ma5 = ma5 * (1.0 + max_entry_vs_ma5)
+                    if entry_px > threshold_ma5:
+                        action = "SKIP"
+                        px_label = "入场价(最新)" if used_latest_as_entry else "入场价"
+                        reason = (
+                            f"{px_label} {entry_px:.2f} 高于 MA5 阈值 {threshold_ma5:.2f}"
+                            f"（>{max_entry_vs_ma5*100:.2f}%）"
+                        )
 
-            if board_status == "weak" and action == "EXECUTE":
-                action = "WAIT"
-                reason = "所属板块走势偏弱，建议降低优先级"
-            elif board_status == "strong" and action == "WAIT" and action != "SKIP":
-                rank_display = f"{board_rank:.0f}" if board_rank is not None else "-"
-                reason = f"板块强势(rank={rank_display})，等待入场条件"
+                if action == "EXECUTE" and strength_score is not None:
+                    if strength_score < 0:
+                        action = "WAIT"
+                        status_reason = "信号强度<0，等待修复"
+                        reason = status_reason
+                    elif strength_trend == "WEAKENING":
+                        action = "WAIT"
+                        status_reason = "信号强度走弱，等待确认"
 
-            if "MANIA" in risk_tags_split:
-                action = "SKIP"
-                status = "INVALID"
-                status_reason = risk_note or "风险标签=MANIA：短期过热，默认不追"
-                reason = status_reason
-            elif risk_tags_split and action == "EXECUTE":
-                action = "WAIT"
-                status = "WAIT"
-                note_text = risk_note or "存在风险标签，建议谨慎"
-                reason = note_text
-                status_reason = note_text
+                if vol_used is not None and vol_used < vol_threshold and action == "EXECUTE":
+                    action = "WAIT"
+                    status_reason = (
+                        f"量能不足：{vol_used:.2f} < 量比阈值 {vol_threshold:.2f}"
+                    )
+                    reason = status_reason
+
+                if (
+                    idx_score_float is not None
+                    and action == "EXECUTE"
+                    and idx_score_float < self.env_index_score_threshold
+                ):
+                    action = "WAIT"
+                    status_reason = (
+                        f"大盘趋势分数 {idx_score_float:.1f} 低于阈值 {self.env_index_score_threshold:.1f}，观望"
+                    )
+                    reason = status_reason
+
+                if board_status == "weak" and action == "EXECUTE":
+                    action = "WAIT"
+                    status_reason = "所属板块走势偏弱，建议降低优先级"
+                    reason = status_reason
+                elif board_status == "strong" and action == "WAIT":
+                    rank_display = f"{board_rank:.0f}" if board_rank is not None else "-"
+                    status_reason = f"板块强势(rank={rank_display})，等待入场条件"
+                    reason = status_reason
+
+                if risk_tags_split and action == "EXECUTE":
+                    action = "WAIT"
+                    note_text = risk_note or "存在风险标签，建议谨慎"
+                    reason = note_text
+                    status_reason = note_text
 
             risk_tag_value = "|".join(risk_tags_split) if risk_tags_split else None
             merged.at[idx, "risk_tag"] = risk_tag_value
             merged.at[idx, "risk_note"] = risk_note or None
 
-            entry_exposure_cap = env_weekly_plan_a_exposure_cap
+            cap_candidates: list[tuple[str, float]] = []
+            if env_position_hint is not None:
+                cap_candidates.append(("env_position_hint", env_position_hint))
+            if env_weekly_plan_a_exposure_cap is not None:
+                cap_candidates.append(("weekly_plan_a_cap", env_weekly_plan_a_exposure_cap))
+            entry_exposure_cap = None
+            if cap_candidates:
+                entry_exposure_cap = min(val for _, val in cap_candidates)
 
             if env_regime:
                 pos_hint_text = (
@@ -2986,8 +2958,7 @@ class MA5MA20OpenMonitorRunner:
                 breakdown_reason = f"大盘结构破位，执行跳过{pos_hint_text}"
                 if env_regime == "BREAKDOWN":
                     action = "SKIP"
-                    if status != "INVALID":
-                        status = "WAIT"
+                    if candidate_status == "ACTIVE":
                         status_reason = "市场环境 BREAKDOWN，暂不执行"
                     if reason and reason != "OK":
                         reason = breakdown_reason + "；" + reason
@@ -2995,15 +2966,14 @@ class MA5MA20OpenMonitorRunner:
                         reason = breakdown_reason
                 elif env_regime == "RISK_OFF":
                     action = "WAIT"
-                    if status != "INVALID":
-                        status = "WAIT"
+                    if candidate_status == "ACTIVE":
                         status_reason = "市场环境 RISK_OFF，轻仓观望"
                     if reason == "OK":
                         reason = f"大盘偏弱{pos_hint_text}"
                 elif env_regime == "PULLBACK" and not risk_tags_split and reason == "OK":
                     reason = f"大盘处于回踩阶段{pos_hint_text}"
 
-            if action == "EXECUTE" and status not in {"INVALID", "EXPIRED"}:
+            if action == "EXECUTE" and candidate_status == "ACTIVE":
                 plan_tail = ""
                 if env_weekly_plan_a:
                     plan_tail = str(env_weekly_plan_a)
@@ -3025,7 +2995,6 @@ class MA5MA20OpenMonitorRunner:
                 else:
                     if env_weekly_risk_level == "HIGH":
                         action = "WAIT"
-                        status = "WAIT"
                         weekly_gate_action = "WAIT"
                         append_note = "周线风险高：观望/防守"
                         status_reason = f"{status_reason}；{append_note}" if status_reason else append_note
@@ -3043,6 +3012,9 @@ class MA5MA20OpenMonitorRunner:
                                 min(entry_exposure_cap, 0.2)
                                 if entry_exposure_cap is not None
                                 else 0.2
+                            )
+                            cap_candidates.append(
+                                ("weekly_soft_gate_cap", _to_float(entry_exposure_cap) or 0.0)
                             )
                             exposure_cap_effective = entry_exposure_cap
                             exposure_hint = (
@@ -3069,7 +3041,6 @@ class MA5MA20OpenMonitorRunner:
                                 reason = combined[:255]
                         else:
                             action = "WAIT"
-                            status = "WAIT"
                             weekly_gate_action = "WAIT"
                             status_reason = (
                                 f"{status_reason}；{soft_note}"
@@ -3088,7 +3059,6 @@ class MA5MA20OpenMonitorRunner:
                             "FORMING",
                         }:
                             action = "WAIT"
-                            status = "WAIT"
                             weekly_gate_action = "WAIT"
                             append_note = "周线偏空/未修复，等待"
                             status_reason = (
@@ -3121,6 +3091,30 @@ class MA5MA20OpenMonitorRunner:
                     if weekly_gate_action is None:
                         weekly_gate_action = "ALLOW"
 
+            if candidate_status == "ACTIVE" and action in {"SKIP", "WAIT"}:
+                status_reason = reason
+
+            exposure_chain = None
+            if candidate_status == "ACTIVE":
+                chain_parts = [f"{name}={val*100:.0f}%" for name, val in cap_candidates]
+                if entry_exposure_cap is not None:
+                    chain_tail = f"{entry_exposure_cap*100:.0f}%"
+                    exposure_chain = (
+                        f"entry_exposure_cap=min({', '.join(chain_parts)}) => {chain_tail}"
+                        if chain_parts
+                        else f"entry_exposure_cap={chain_tail}"
+                    )
+                elif chain_parts:
+                    exposure_chain = f"entry_exposure_cap=min({', '.join(chain_parts)})"
+                else:
+                    exposure_chain = "entry_exposure_cap=无显式上限（未提供环境上限）"
+
+            if exposure_chain:
+                if reason and reason != "OK":
+                    reason = f"{reason}；{exposure_chain}"
+                else:
+                    reason = exposure_chain
+
             env_regimes.append(env_regime)
             env_position_hints.append(env_position_hint)
             env_index_scores.append(idx_score_float)
@@ -3143,6 +3137,12 @@ class MA5MA20OpenMonitorRunner:
             asof_macd_hist_list.append(_to_float(macd_hist))
             asof_atr14_list.append(_to_float(atr14))
             asof_stop_ref_list.append(_to_float(_coalesce(row, "asof_stop_ref", "sig_stop_ref")))
+            dev_ma5_list.append(_to_float(dev_ma5))
+            dev_ma20_list.append(_to_float(dev_ma20))
+            dev_ma5_atr_list.append(_to_float(dev_ma5_atr))
+            dev_ma20_atr_list.append(_to_float(dev_ma20_atr))
+            runup_from_sigclose_list.append(_to_float(runup_from_sigclose))
+            runup_from_sigclose_atr_list.append(_to_float(runup_from_sigclose_atr))
 
             env_weekly_asof_trade_dates.append(env_weekly_asof_trade_date)
             env_weekly_risk_levels.append(env_weekly_risk_level)
@@ -3153,7 +3153,7 @@ class MA5MA20OpenMonitorRunner:
 
             actions.append(action)
             reasons.append(reason)
-            statuses.append(status)
+            statuses.append(candidate_status)
             status_reasons.append(status_reason)
             signal_kinds.append("PULLBACK" if is_pullback else "CROSS")
             trade_stop_refs.append(trade_stop_ref_val)
@@ -3203,6 +3203,12 @@ class MA5MA20OpenMonitorRunner:
         merged["asof_vol_ratio"] = asof_vol_ratio_list
         merged["asof_atr14"] = asof_atr14_list
         merged["asof_stop_ref"] = asof_stop_ref_list
+        merged["dev_ma5"] = dev_ma5_list
+        merged["dev_ma20"] = dev_ma20_list
+        merged["dev_ma5_atr"] = dev_ma5_atr_list
+        merged["dev_ma20_atr"] = dev_ma20_atr_list
+        merged["runup_from_sigclose"] = runup_from_sigclose_list
+        merged["runup_from_sigclose_atr"] = runup_from_sigclose_atr_list
         if "asof_close" not in merged.columns:
             merged["asof_close"] = merged.get("sig_close")
 
@@ -3269,6 +3275,12 @@ class MA5MA20OpenMonitorRunner:
             "sig_kdj_k",
             "sig_kdj_d",
             "trade_stop_ref",
+            "dev_ma5",
+            "dev_ma20",
+            "dev_ma5_atr",
+            "dev_ma20_atr",
+            "runup_from_sigclose",
+            "runup_from_sigclose_atr",
             "entry_exposure_cap",
             "env_index_score",
             "env_regime",
@@ -3325,6 +3337,12 @@ class MA5MA20OpenMonitorRunner:
             "sig_macd_hist",
             "sig_stop_ref",
             "trade_stop_ref",
+            "dev_ma5",
+            "dev_ma20",
+            "dev_ma5_atr",
+            "dev_ma20_atr",
+            "runup_from_sigclose",
+            "runup_from_sigclose_atr",
             "effective_stop_ref",
             "env_regime",
             "env_position_hint",
@@ -3479,7 +3497,14 @@ class MA5MA20OpenMonitorRunner:
         export_df[gap_col] = export_df[gap_col].apply(_to_float)
         # CSV 里把“状态正常且可执行”放在最前面，方便你开盘快速扫一眼
         action_rank = {"EXECUTE": 0, "WAIT": 1, "SKIP": 2, "UNKNOWN": 3}
-        status_rank = {"ACTIVE": 0, "WAIT": 1, "EXPIRED": 2, "INVALID": 3, "UNKNOWN": 4}
+        status_rank = {
+            "ACTIVE": 0,
+            "OVEREXTENDED": 1,
+            "RUNUP_TOO_LARGE": 2,
+            "INVALID": 3,
+            "STALE": 4,
+            "UNKNOWN": 5,
+        }
         export_df["_action_rank"] = export_df["action"].map(action_rank).fillna(99)
         export_df["_status_rank"] = export_df["candidate_status"].map(status_rank).fillna(99)
         export_df = export_df.sort_values(
