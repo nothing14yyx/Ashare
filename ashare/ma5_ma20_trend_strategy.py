@@ -31,6 +31,11 @@ from sqlalchemy.exc import OperationalError
 from .config import get_section
 from .db import DatabaseConfig, MySQLWriter
 from .indicator_utils import consecutive_true
+from .schema_manager import (
+    TABLE_STRATEGY_MA5_MA20_CANDIDATES,
+    TABLE_STRATEGY_MA5_MA20_SIGNALS,
+    VIEW_STRATEGY_MA5_MA20_CANDIDATES,
+)
 from .utils import setup_logger
 
 
@@ -61,12 +66,14 @@ class MA5MA20Params:
     kdj_low_threshold: float = 30.0
 
     # 输出表/视图
-    signals_table: str = "strategy_ma5_ma20_signals"
-    candidates_table: str = "strategy_ma5_ma20_candidates"  # 仅在 candidates_as_view=False 时写表
+    signals_table: str = TABLE_STRATEGY_MA5_MA20_SIGNALS
+    candidates_table: str = (
+        TABLE_STRATEGY_MA5_MA20_CANDIDATES
+    )  # 仅在 candidates_as_view=False 时写表
 
     # 可选：用视图替代 candidates 表（更简洁；候选清单实时从 signals 最新日筛选）
     candidates_as_view: bool = True
-    candidates_view: str = "v_strategy_ma5_ma20_candidates"
+    candidates_view: str = VIEW_STRATEGY_MA5_MA20_CANDIDATES
 
     # signals 写入范围：
     # - latest：仅写入最新交易日（默认，低开销）
@@ -857,156 +864,6 @@ class MA5MA20StrategyRunner:
         out["risk_note"] = risk_notes
         return out
 
-    def _ensure_signals_table(self, table: str) -> None:
-        """确保 signals 表存在（包含主键，避免重复）。"""
-        create_stmt = text(
-            f"""
-            CREATE TABLE IF NOT EXISTS `{table}` (
-              `date` DATE NOT NULL,
-              `code` VARCHAR(20) NOT NULL,
-              `close` DOUBLE NULL,
-              `volume` DOUBLE NULL,
-              `amount` DOUBLE NULL,
-              `ma5` DOUBLE NULL,
-              `ma10` DOUBLE NULL,
-              `ma20` DOUBLE NULL,
-              `ma60` DOUBLE NULL,
-              `ma250` DOUBLE NULL,
-              `vol_ratio` DOUBLE NULL,
-              `macd_dif` DOUBLE NULL,
-              `macd_dea` DOUBLE NULL,
-              `macd_hist` DOUBLE NULL,
-              `kdj_k` DOUBLE NULL,
-              `kdj_d` DOUBLE NULL,
-              `kdj_j` DOUBLE NULL,
-              `atr14` DOUBLE NULL,
-              `stop_ref` DOUBLE NULL,
-              `ret_10` DOUBLE NULL,
-              `ret_20` DOUBLE NULL,
-              `limit_up_cnt_20` DOUBLE NULL,
-              `ma20_bias` DOUBLE NULL,
-              `yearline_state` VARCHAR(50) NULL,
-              `risk_tag` VARCHAR(255) NULL,
-              `risk_note` VARCHAR(255) NULL,
-              `signal` VARCHAR(10) NULL,
-              `reason` VARCHAR(255) NULL,
-              PRIMARY KEY (`date`, `code`)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-            """
-        )
-        with self.db_writer.engine.begin() as conn:
-            conn.execute(create_stmt)
-
-    def _ensure_signals_columns(self, table: str) -> None:
-        extra_columns = {
-            "ret_10": "DOUBLE NULL",
-            "ret_20": "DOUBLE NULL",
-            "limit_up_cnt_20": "DOUBLE NULL",
-            "ma20_bias": "DOUBLE NULL",
-            "yearline_state": "VARCHAR(50) NULL",
-            "risk_tag": "VARCHAR(255) NULL",
-            "risk_note": "VARCHAR(255) NULL",
-        }
-
-        with self.db_writer.engine.begin() as conn:
-            existing_cols = pd.read_sql(
-                text(
-                    """
-                    SELECT COLUMN_NAME FROM information_schema.COLUMNS
-                    WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = :t
-                    """
-                ),
-                conn,
-                params={"t": table},
-            )["COLUMN_NAME"].tolist()
-
-            for col, ddl in extra_columns.items():
-                if col not in existing_cols:
-                    try:
-                        conn.execute(text(f"ALTER TABLE `{table}` ADD COLUMN `{col}` {ddl}"))
-                        self.logger.info("signals 表已新增列 %s", col)
-                    except Exception as exc:  # noqa: BLE001
-                        self.logger.warning("无法为 %s 添加列 %s：%s", table, col, exc)
-
-    def _ensure_candidates_table(self, table: str) -> None:
-        """确保 candidates 表存在（用于无 BUY 时清空表）。"""
-        create_stmt = text(
-            f"""
-            CREATE TABLE IF NOT EXISTS `{table}` (
-              `date` DATE NOT NULL,
-              `code` VARCHAR(20) NOT NULL,
-              `close` DOUBLE NULL,
-              `ma5` DOUBLE NULL,
-              `ma20` DOUBLE NULL,
-              `ma60` DOUBLE NULL,
-              `ma250` DOUBLE NULL,
-              `vol_ratio` DOUBLE NULL,
-              `macd_hist` DOUBLE NULL,
-              `kdj_k` DOUBLE NULL,
-              `kdj_d` DOUBLE NULL,
-              `atr14` DOUBLE NULL,
-              `stop_ref` DOUBLE NULL,
-              `yearline_state` VARCHAR(50) NULL,
-              `risk_tag` VARCHAR(255) NULL,
-              `risk_note` VARCHAR(255) NULL,
-              `reason` VARCHAR(255) NULL,
-              PRIMARY KEY (`date`, `code`)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-            """
-        )
-        with self.db_writer.engine.begin() as conn:
-            conn.execute(create_stmt)
-
-    def _ensure_candidates_columns(self, table: str) -> None:
-        extra_columns = {
-            "yearline_state": "VARCHAR(50) NULL",
-            "risk_tag": "VARCHAR(255) NULL",
-            "risk_note": "VARCHAR(255) NULL",
-        }
-
-        with self.db_writer.engine.begin() as conn:
-            existing_cols = pd.read_sql(
-                text(
-                    """
-                    SELECT COLUMN_NAME FROM information_schema.COLUMNS
-                    WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = :t
-                    """
-                ),
-                conn,
-                params={"t": table},
-            )["COLUMN_NAME"].tolist()
-
-            for col, ddl in extra_columns.items():
-                if col not in existing_cols:
-                    try:
-                        conn.execute(text(f"ALTER TABLE `{table}` ADD COLUMN `{col}` {ddl}"))
-                        self.logger.info("candidates 表已新增列 %s", col)
-                    except Exception as exc:  # noqa: BLE001
-                        self.logger.warning("无法为 %s 添加列 %s：%s", table, col, exc)
-
-    def _ensure_candidates_view(self, view_name: str) -> None:
-        """创建/更新 candidates 视图：从 signals 列出全部历史 BUY 信号。
-
-        若你只想看“最新交易日”的 BUY，请在查询时自行加：
-        WHERE `date` = (SELECT MAX(`date`) FROM signals_table)
-        """
-        base = self.params.signals_table
-        create_stmt = text(
-            f"""
-            CREATE OR REPLACE VIEW `{view_name}` AS
-            SELECT
-              `date`,`code`,`close`,
-              `ma5`,`ma20`,`ma60`,`ma250`,
-              `vol_ratio`,`macd_hist`,`kdj_k`,`kdj_d`,`atr14`,`stop_ref`,
-              `yearline_state`,`risk_tag`,`risk_note`,
-              `reason`
-            FROM `{base}`
-            WHERE `signal` = 'BUY'
-            """
-        )
-        with self.db_writer.engine.begin() as conn:
-            conn.execute(create_stmt)
-
     def _clear_table(self, table: str) -> None:
         try:
             with self.db_writer.engine.begin() as conn:
@@ -1029,7 +886,6 @@ class MA5MA20StrategyRunner:
         self, latest_date: dt.date, signals: pd.DataFrame, codes: List[str]
     ) -> None:
         tbl = self.params.signals_table
-        self._ensure_signals_table(tbl)
 
         scope = (getattr(self.params, "signals_write_scope", "latest") or "latest").strip().lower()
         if scope not in {"latest", "window"}:
@@ -1088,8 +944,6 @@ class MA5MA20StrategyRunner:
                     .str.slice(0, 250)
                 )
 
-        self._ensure_signals_columns(tbl)
-
         if scope == "latest":
             delete_stmt = (
                 text(f"DELETE FROM `{tbl}` WHERE `date` = :d AND `code` IN :codes")
@@ -1141,7 +995,6 @@ class MA5MA20StrategyRunner:
 
     def _write_candidates(self, latest_date: dt.date, signals: pd.DataFrame) -> None:
         tbl = self.params.candidates_table
-        self._ensure_candidates_table(tbl)
 
         latest = signals[signals["date"].dt.date == latest_date].copy()
         if latest.empty:
@@ -1179,7 +1032,6 @@ class MA5MA20StrategyRunner:
         cands["code"] = cands["code"].astype(str)
 
         self._clear_table(tbl)
-        self._ensure_candidates_columns(tbl)
         self.db_writer.write_dataframe(cands, tbl, if_exists="append")
 
     def run(self, *, force: bool = False) -> None:
@@ -1250,9 +1102,7 @@ class MA5MA20StrategyRunner:
             )
 
         self._write_signals(latest_date, sig_for_write, calc_codes)
-        if bool(getattr(self.params, "candidates_as_view", False)):
-            self._ensure_candidates_view(self.params.candidates_view)
-        else:
+        if not bool(getattr(self.params, "candidates_as_view", False)):
             self._write_candidates(latest_date, sig_for_candidates)
 
         latest_sig = sig[sig["date"].dt.date == latest_date]
