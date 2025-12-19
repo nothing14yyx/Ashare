@@ -2271,6 +2271,7 @@ class MA5MA20OpenMonitorRunner:
             "live_pct_change",
             "live_volume",
             "live_amount",
+            "prev_close",
             "avg_volume_20",
             "_signal_day_pct_change",
             "signal_strength",
@@ -2279,6 +2280,37 @@ class MA5MA20OpenMonitorRunner:
         for col in float_cols:
             if col in merged.columns:
                 merged[col] = merged.get(col).apply(_to_float)
+
+        def _resolve_live_pct_change(row: pd.Series) -> float | None:
+            latest_px = row.get("live_latest")
+            prev_close_val = row.get("prev_close")
+            asof_close_val = row.get("asof_close")
+
+            base_close = None
+            if prev_close_val is not None and prev_close_val > 0:
+                base_close = prev_close_val
+            elif asof_close_val is not None and asof_close_val > 0:
+                base_close = asof_close_val
+
+            reported_pct = row.get("live_pct_change")
+            if base_close is None or latest_px is None or latest_px <= 0:
+                return reported_pct
+
+            computed_pct = (latest_px / base_close - 1.0) * 100.0
+            if reported_pct is not None and abs(computed_pct - reported_pct) > 0.5:
+                base_label = "prev_close" if prev_close_val is not None else "asof_close"
+                self.logger.debug(
+                    "live_pct_change 偏差超过 0.5%%，按计算值覆盖：code=%s latest=%.4f %s=%.4f reported=%.4f computed=%.4f",
+                    row.get("code"),
+                    latest_px,
+                    base_label,
+                    base_close,
+                    reported_pct,
+                    computed_pct,
+                )
+            return computed_pct
+
+        merged["live_pct_change"] = merged.apply(_resolve_live_pct_change, axis=1)
 
         def _normalize_intraday_volume(vol: float | None, avg_vol: float | None) -> float | None:
             if vol is None or avg_vol is None or avg_vol <= 0:
@@ -2566,14 +2598,14 @@ class MA5MA20OpenMonitorRunner:
 
             if (
                 pct is not None
-                and pct <= -0.04
+                and pct <= -4.0
                 and live_intraday_vol_ratio is not None
                 and live_intraday_vol_ratio >= 1.2
             ):
                 if "BIG_DROP" not in risk_tags_split:
                     risk_tags_split.append("BIG_DROP")
                 detail = (
-                    f"暴跌放量风险：跌幅 {pct*100:.2f}%"
+                    f"暴跌放量风险：跌幅 {pct:.2f}%"
                     f"（阈值≤-4.00%），盘中量比 {live_intraday_vol_ratio:.2f}"
                     "（阈值≥1.20）"
                 )
@@ -2662,13 +2694,22 @@ class MA5MA20OpenMonitorRunner:
 
             valid_days = pullback_valid_days if is_pullback else cross_valid_days
 
-            # comment: feat: 止损参考价取 trade_stop_ref 与 signal_stop_ref 的更严格值 防止低开导致止损线被动放宽
-            effective_stop_ref = None
-            stop_candidates = [
-                v for v in (trade_stop_ref, signal_stop_ref) if v is not None
-            ]
-            if stop_candidates:
-                effective_stop_ref = max(stop_candidates)
+            trade_stop_ref_val = _to_float(trade_stop_ref)
+            asof_stop_ref_val = _to_float(row.get("asof_stop_ref"))
+            signal_stop_ref_val = _to_float(signal_stop_ref)
+
+            effective_stop_ref = next(
+                (
+                    val
+                    for val in [
+                        trade_stop_ref_val,
+                        asof_stop_ref_val,
+                        signal_stop_ref_val,
+                    ]
+                    if val is not None
+                ),
+                None,
+            )
             structural_failure_reason = None
             structural_downgrade_reason = None
             if ma5 is not None and ma20 is not None and ma5 < ma20:
@@ -2697,12 +2738,19 @@ class MA5MA20OpenMonitorRunner:
                 and price_now <= effective_stop_ref
             ):
                 stop_parts: list[str] = []
-                if trade_stop_ref is not None:
-                    stop_parts.append(f"entry 止损 {trade_stop_ref:.2f}")
-                if signal_stop_ref is not None:
-                    stop_parts.append(f"信号日止损 {signal_stop_ref:.2f}")
+                if trade_stop_ref_val is not None:
+                    stop_parts.append(f"entry 止损 {trade_stop_ref_val:.2f}")
+                if asof_stop_ref_val is not None:
+                    stop_parts.append(f"昨收止损 {asof_stop_ref_val:.2f}")
+                if signal_stop_ref_val is not None:
+                    stop_parts.append(f"信号日止损 {signal_stop_ref_val:.2f}")
                 stop_detail = "，".join(stop_parts)
-                detail_suffix = f"（取较高者：{stop_detail}）" if stop_detail else ""
+                detail_suffix = (
+                    "（参考顺序：入场ATR>昨收>信号日；候选："
+                    f"{stop_detail}）"
+                    if stop_detail
+                    else ""
+                )
                 structural_failure_reason = (
                     f"盘中结构失效：最新价 {price_now:.2f} 跌破止损参考价 {effective_stop_ref:.2f}{detail_suffix}"
                 )
@@ -3094,7 +3142,7 @@ class MA5MA20OpenMonitorRunner:
             )
             asof_macd_hist_list.append(_to_float(macd_hist))
             asof_atr14_list.append(_to_float(atr14))
-            asof_stop_ref_list.append(_to_float(signal_stop_ref))
+            asof_stop_ref_list.append(_to_float(_coalesce(row, "asof_stop_ref", "sig_stop_ref")))
 
             env_weekly_asof_trade_dates.append(env_weekly_asof_trade_date)
             env_weekly_risk_levels.append(env_weekly_risk_level)
@@ -3108,8 +3156,8 @@ class MA5MA20OpenMonitorRunner:
             statuses.append(status)
             status_reasons.append(status_reason)
             signal_kinds.append("PULLBACK" if is_pullback else "CROSS")
-            trade_stop_refs.append(_to_float(trade_stop_ref))
-            sig_stop_refs.append(_to_float(signal_stop_ref))
+            trade_stop_refs.append(trade_stop_ref_val)
+            sig_stop_refs.append(_to_float(signal_stop_ref_val))
             effective_stop_refs.append(_to_float(effective_stop_ref))
             valid_days_list.append(valid_days)
 
