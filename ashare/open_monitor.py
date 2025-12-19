@@ -122,6 +122,84 @@ def _to_eastmoney_secid(code: str) -> str:
 
 
 @dataclass(frozen=True)
+class RunupMetrics:
+    runup_ref_price: float | None
+    runup_ref_source: str | None
+    runup_from_sigclose: float | None
+    runup_from_sigclose_atr: float | None
+
+
+def compute_runup_metrics(
+    sig_close: float | None,
+    *,
+    asof_close: float | None,
+    live_high: float | None,
+    sig_atr14: float | None,
+    eps: float = 1e-6,
+) -> RunupMetrics:
+    live_high_val = _to_float(live_high)
+    asof_close_val = _to_float(asof_close)
+    sig_close_val = _to_float(sig_close)
+    sig_atr_val = _to_float(sig_atr14)
+
+    ref_price = None
+    ref_source = None
+    if live_high_val is not None and asof_close_val is not None:
+        ref_price = max(live_high_val, asof_close_val)
+        ref_source = "max(asof_close, live_high)"
+    elif live_high_val is not None:
+        ref_price = live_high_val
+        ref_source = "live_high"
+    elif asof_close_val is not None:
+        ref_price = asof_close_val
+        ref_source = "asof_close"
+
+    runup_from_sigclose = None
+    runup_from_sigclose_atr = None
+    if ref_price is not None and sig_close_val is not None:
+        runup_from_sigclose = ref_price - sig_close_val
+        if sig_atr_val is not None:
+            runup_from_sigclose_atr = runup_from_sigclose / max(sig_atr_val, eps)
+
+    return RunupMetrics(
+        runup_ref_price=ref_price,
+        runup_ref_source=ref_source,
+        runup_from_sigclose=runup_from_sigclose,
+        runup_from_sigclose_atr=runup_from_sigclose_atr,
+    )
+
+
+def evaluate_runup_breach(
+    metrics: RunupMetrics,
+    *,
+    runup_atr_max: float | None,
+    runup_atr_tol: float,
+    dev_ma20_atr: float | None = None,
+    dev_ma20_atr_min: float | None = None,
+) -> tuple[bool, str | None]:
+    if runup_atr_max is None or metrics.runup_from_sigclose_atr is None:
+        return False, None
+
+    if dev_ma20_atr_min is not None:
+        if dev_ma20_atr is None or dev_ma20_atr < dev_ma20_atr_min:
+            return False, None
+
+    threshold = runup_atr_max + runup_atr_tol
+    if metrics.runup_from_sigclose_atr > threshold:
+        ref_price_display = (
+            f"{metrics.runup_ref_price:.2f}" if metrics.runup_ref_price is not None else "N/A"
+        )
+        ref_source = metrics.runup_ref_source or "unknown"
+        reason = (
+            f"runup_ref_source={ref_source}, runup_ref_price={ref_price_display}, "
+            f"runup_from_sigclose_atr={metrics.runup_from_sigclose_atr:.3f} "
+            f"> runup_atr_max={runup_atr_max:.3f}+tol={runup_atr_tol:.3f}"
+        )
+        return True, reason
+    return False, None
+
+
+@dataclass(frozen=True)
 class OpenMonitorParams:
     """开盘监测参数（支持从 config.yaml 的 open_monitor 覆盖）。"""
 
@@ -156,6 +234,9 @@ class OpenMonitorParams:
 
     # 乖离/拉升阈值
     runup_atr_max: float = 1.2  # 信号后最大拉升 / ATR > runup_atr_max → skip
+    runup_atr_tol: float = 0.02  # 运行容差：runup_from_sigclose_atr > runup_atr_max + tol
+    pullback_runup_atr_max: float = 1.5  # 回踩形态使用更宽松的拉升阈值
+    pullback_runup_dev_ma20_atr_min: float = 1.0  # 回踩形态仅在 dev_ma20_atr 超过该阈值时判定追高
     dev_ma5_atr_max: float = 2.0
     dev_ma20_atr_max: float = 2.5
 
@@ -301,6 +382,13 @@ class OpenMonitorParams:
                 "max_entry_vs_ma5_pct",
             ),
             runup_atr_max=_get_float("runup_atr_max", cls.runup_atr_max),
+            runup_atr_tol=_get_float("runup_atr_tol", cls.runup_atr_tol),
+            pullback_runup_atr_max=_get_float(
+                "pullback_runup_atr_max", cls.pullback_runup_atr_max
+            ),
+            pullback_runup_dev_ma20_atr_min=_get_float(
+                "pullback_runup_dev_ma20_atr_min", cls.pullback_runup_dev_ma20_atr_min
+            ),
             dev_ma5_atr_max=_get_float("dev_ma5_atr_max", cls.dev_ma5_atr_max),
             dev_ma20_atr_max=_get_float("dev_ma20_atr_max", cls.dev_ma20_atr_max),
             stop_atr_mult=_get_float("stop_atr_mult", cls.stop_atr_mult),
@@ -1308,6 +1396,9 @@ class MA5MA20OpenMonitorRunner:
             "dev_ma20_atr": "DOUBLE",
             "runup_from_sigclose": "DOUBLE",
             "runup_from_sigclose_atr": "DOUBLE",
+            "runup_ref_price": "DOUBLE",
+            "runup_ref_source": "VARCHAR(32)",
+            "status_tags": "VARCHAR(255)",
         }
 
         with self.db_writer.engine.begin() as conn:
@@ -2131,6 +2222,9 @@ class MA5MA20OpenMonitorRunner:
             out["dev_ma20_atr"] = None
             out["runup_from_sigclose"] = None
             out["runup_from_sigclose_atr"] = None
+            out["runup_ref_price"] = None
+            out["runup_ref_source"] = None
+            out["status_tags"] = None
             out["action"] = "UNKNOWN"
             out["action_reason"] = "行情数据不可用"
             out["candidate_status"] = "UNKNOWN"
@@ -2442,6 +2536,9 @@ class MA5MA20OpenMonitorRunner:
         dev_ma20_atr_list: List[float | None] = []
         runup_from_sigclose_list: List[float | None] = []
         runup_from_sigclose_atr_list: List[float | None] = []
+        runup_ref_price_list: List[float | None] = []
+        runup_ref_source_list: List[str | None] = []
+        status_tags_list: List[str | None] = []
 
         def _coalesce(row: pd.Series, *cols: str) -> float | None:
             for col in cols:
@@ -2600,11 +2697,14 @@ class MA5MA20OpenMonitorRunner:
         prev_strength_map = self._load_previous_strength(codes_all, as_of=checked_at_ts)
         eps = 1e-6
 
+        status_priority = ["STALE", "INVALID", "RUNUP_TOO_LARGE", "OVEREXTENDED"]
+
         for idx, row in merged.iterrows():
             action = "EXECUTE"
             reason = "OK"
             candidate_status = "ACTIVE"
             status_reason = "结构/时效通过"
+            status_hits: list[tuple[str, str]] = []
 
             risk_tag_raw = str(row.get("risk_tag") or "").strip()
             risk_note = str(row.get("risk_note") or "").strip()
@@ -2743,102 +2843,127 @@ class MA5MA20OpenMonitorRunner:
                 if atr14 is not None:
                     dev_ma20_atr = dev_ma20 / max(atr14, eps)
 
-            runup_from_sigclose = None
-            runup_from_sigclose_atr = None
             sig_close_val = _to_float(signal_close)
-            post_sig_peak_values: list[float] = []
-            for cand in [row.get("live_high"), latest_px, row.get("asof_close")]:
-                cand_val = _to_float(cand)
-                if cand_val is not None:
-                    post_sig_peak_values.append(cand_val)
-            if sig_close_val is not None and post_sig_peak_values:
-                post_sig_peak = max(post_sig_peak_values)
-                runup_from_sigclose = post_sig_peak - sig_close_val
-                sig_atr_for_runup = sig_atr14_val if sig_atr14_val is not None else atr14
-                if sig_atr_for_runup is not None:
-                    runup_from_sigclose_atr = runup_from_sigclose / max(sig_atr_for_runup, eps)
+            runup_metrics = compute_runup_metrics(
+                sig_close_val,
+                asof_close=_coalesce(row, "asof_close", "sig_close"),
+                live_high=row.get("live_high"),
+                sig_atr14=sig_atr14_val if sig_atr14_val is not None else atr14,
+                eps=eps,
+            )
+            runup_from_sigclose = runup_metrics.runup_from_sigclose
+            runup_from_sigclose_atr = runup_metrics.runup_from_sigclose_atr
+            runup_ref_price_val = runup_metrics.runup_ref_price
+            runup_ref_source_val = runup_metrics.runup_ref_source
+
+            runup_atr_cap = runup_atr_max
+            dev_ma20_gate = None
+            if is_pullback:
+                runup_atr_cap = (
+                    self.params.pullback_runup_atr_max
+                    if self.params.pullback_runup_atr_max is not None
+                    else runup_atr_max
+                )
+                dev_ma20_gate = self.params.pullback_runup_dev_ma20_atr_min
+            runup_triggered, runup_detail = evaluate_runup_breach(
+                runup_metrics,
+                runup_atr_max=runup_atr_cap,
+                runup_atr_tol=self.params.runup_atr_tol,
+                dev_ma20_atr=dev_ma20_atr,
+                dev_ma20_atr_min=dev_ma20_gate,
+            )
 
             if valid_days > 0 and signal_age is not None and signal_age > valid_days:
-                candidate_status = "STALE"
-                status_reason = f"signal_age={int(signal_age)} > valid_days={valid_days}"
-                action = "SKIP"
-                reason = status_reason
+                status_hits.append(
+                    ("STALE", f"signal_age={int(signal_age)} > valid_days={valid_days}")
+                )
 
             invalid_reason = None
-            if candidate_status == "ACTIVE":
-                if macd_hist is not None and macd_hist <= 0:
-                    invalid_reason = f"MACD 柱子转负：asof_macd_hist={macd_hist:.4f} ≤ 0"
-                elif price_now is not None and ma20 is not None and price_now < ma20:
-                    invalid_reason = (
-                        f"跌破MA20：price_now={price_now:.2f} < asof_ma20={ma20:.2f}"
-                    )
-                elif ma5 is not None and ma20 is not None and ma5 < ma20:
-                    invalid_reason = f"盘中结构失效：MA5({ma5:.2f}) < MA20({ma20:.2f})"
-                elif (
-                    price_now is not None
-                    and effective_stop_ref is not None
-                    and price_now <= effective_stop_ref
-                ):
-                    stop_parts: list[str] = []
-                    if trade_stop_ref_val is not None:
-                        stop_parts.append(f"entry止损={trade_stop_ref_val:.2f}")
-                    if asof_stop_ref_val is not None:
-                        stop_parts.append(f"昨收止损={asof_stop_ref_val:.2f}")
-                    if signal_stop_ref_val is not None:
-                        stop_parts.append(f"信号日止损={signal_stop_ref_val:.2f}")
-                    stop_detail = "，".join(stop_parts)
-                    invalid_reason = (
-                        f"触发止损：price_now={price_now:.2f} <= effective_stop_ref={effective_stop_ref:.2f}"
-                    )
-                    if stop_detail:
-                        invalid_reason = f"{invalid_reason}（参考：{stop_detail}）"
-                elif (
-                    current_close is not None
-                    and ma60 is not None
-                    and ma250 is not None
-                    and ma20 is not None
-                    and (current_close <= ma60 or current_close <= ma250 or ma20 <= ma60)
-                ):
-                    invalid_reason = "多头排列/趋势破坏"
+            if macd_hist is not None and macd_hist <= 0:
+                invalid_reason = f"MACD 柱子转负：asof_macd_hist={macd_hist:.4f} ≤ 0"
+            elif price_now is not None and ma20 is not None and price_now < ma20:
+                invalid_reason = (
+                    f"跌破MA20：price_now={price_now:.2f} < asof_ma20={ma20:.2f}"
+                )
+            elif ma5 is not None and ma20 is not None and ma5 < ma20:
+                invalid_reason = f"盘中结构失效：MA5({ma5:.2f}) < MA20({ma20:.2f})"
+            elif (
+                price_now is not None
+                and effective_stop_ref is not None
+                and price_now <= effective_stop_ref
+            ):
+                stop_parts: list[str] = []
+                if trade_stop_ref_val is not None:
+                    stop_parts.append(f"entry止损={trade_stop_ref_val:.2f}")
+                if asof_stop_ref_val is not None:
+                    stop_parts.append(f"昨收止损={asof_stop_ref_val:.2f}")
+                if signal_stop_ref_val is not None:
+                    stop_parts.append(f"信号日止损={signal_stop_ref_val:.2f}")
+                stop_detail = "，".join(stop_parts)
+                invalid_reason = (
+                    f"触发止损：price_now={price_now:.2f} <= effective_stop_ref={effective_stop_ref:.2f}"
+                )
+                if stop_detail:
+                    invalid_reason = f"{invalid_reason}（参考：{stop_detail}）"
+            elif (
+                current_close is not None
+                and ma60 is not None
+                and ma250 is not None
+                and ma20 is not None
+                and (current_close <= ma60 or current_close <= ma250 or ma20 <= ma60)
+            ):
+                invalid_reason = "多头排列/趋势破坏"
 
             if invalid_reason:
-                candidate_status = "INVALID"
-                status_reason = invalid_reason
+                status_hits.append(("INVALID", invalid_reason))
+
+            if runup_triggered and runup_detail:
+                status_hits.append(("RUNUP_TOO_LARGE", runup_detail))
+
+            overextend_reasons: list[str] = []
+            if dev_ma5_atr is not None and dev_ma5_atr > dev_ma5_atr_max:
+                overextend_reasons.append(
+                    f"dev_ma5_atr={dev_ma5_atr:.2f} > {dev_ma5_atr_max:.2f}"
+                )
+            if dev_ma20_atr is not None and dev_ma20_atr > dev_ma20_atr_max:
+                overextend_reasons.append(
+                    f"dev_ma20_atr={dev_ma20_atr:.2f} > {dev_ma20_atr_max:.2f}"
+                )
+            if overextend_reasons:
+                status_hits.append(("OVEREXTENDED", "；".join(overextend_reasons)))
+
+            if "MANIA" in risk_tags_split:
+                mania_reason = risk_note or "风险标签=MANIA：短期过热，默认不追"
+                status_hits.append(("INVALID", mania_reason))
+
+            primary_status = next(
+                (
+                    status
+                    for status in status_priority
+                    if any(hit[0] == status for hit in status_hits)
+                ),
+                "ACTIVE",
+            )
+            primary_reason = next(
+                (hit[1] for hit in status_hits if hit[0] == primary_status),
+                "结构/时效通过",
+            )
+            other_tags = [f"{s}:{r}" for s, r in status_hits if s != primary_status]
+            status_tags_value = ",".join(other_tags) if other_tags else None
+
+            candidate_status = primary_status
+            status_reason = primary_reason or "结构/时效通过"
+
+            if candidate_status != "ACTIVE":
                 action = "SKIP"
+                if (
+                    runup_triggered
+                    and candidate_status != "RUNUP_TOO_LARGE"
+                    and runup_detail
+                ):
+                    status_reason = f"{status_reason}；{runup_detail}"
                 reason = status_reason
-
-            if candidate_status == "ACTIVE" and runup_from_sigclose_atr is not None:
-                if runup_from_sigclose_atr > runup_atr_max:
-                    candidate_status = "RUNUP_TOO_LARGE"
-                    status_reason = (
-                        f"runup_from_sigclose_atr={runup_from_sigclose_atr:.2f} > runup_atr_max={runup_atr_max:.2f}"
-                    )
-                    action = "SKIP"
-                    reason = status_reason
-
-            if candidate_status == "ACTIVE":
-                overextend_reasons: list[str] = []
-                if dev_ma5_atr is not None and dev_ma5_atr > dev_ma5_atr_max:
-                    overextend_reasons.append(
-                        f"dev_ma5_atr={dev_ma5_atr:.2f} > {dev_ma5_atr_max:.2f}"
-                    )
-                if dev_ma20_atr is not None and dev_ma20_atr > dev_ma20_atr_max:
-                    overextend_reasons.append(
-                        f"dev_ma20_atr={dev_ma20_atr:.2f} > {dev_ma20_atr_max:.2f}"
-                    )
-                if overextend_reasons:
-                    candidate_status = "OVEREXTENDED"
-                    status_reason = "；".join(overextend_reasons)
-                    action = "SKIP"
-                    reason = status_reason
-
-            if candidate_status == "ACTIVE" and "MANIA" in risk_tags_split:
-                candidate_status = "INVALID"
-                status_reason = risk_note or "风险标签=MANIA：短期过热，默认不追"
-                action = "SKIP"
-                reason = status_reason
-
-            if candidate_status == "ACTIVE":
+            else:
                 if action == "EXECUTE" and signal_day_pct is not None and signal_day_pct >= signal_day_limit_up:
                     action = "SKIP"
                     reason = f"信号日涨幅 {signal_day_pct*100:.2f}% 接近涨停，次日不追"
@@ -3143,6 +3268,9 @@ class MA5MA20OpenMonitorRunner:
             dev_ma20_atr_list.append(_to_float(dev_ma20_atr))
             runup_from_sigclose_list.append(_to_float(runup_from_sigclose))
             runup_from_sigclose_atr_list.append(_to_float(runup_from_sigclose_atr))
+            runup_ref_price_list.append(_to_float(runup_ref_price_val))
+            runup_ref_source_list.append(runup_ref_source_val)
+            status_tags_list.append(status_tags_value)
 
             env_weekly_asof_trade_dates.append(env_weekly_asof_trade_date)
             env_weekly_risk_levels.append(env_weekly_risk_level)
@@ -3209,6 +3337,9 @@ class MA5MA20OpenMonitorRunner:
         merged["dev_ma20_atr"] = dev_ma20_atr_list
         merged["runup_from_sigclose"] = runup_from_sigclose_list
         merged["runup_from_sigclose_atr"] = runup_from_sigclose_atr_list
+        merged["runup_ref_price"] = runup_ref_price_list
+        merged["runup_ref_source"] = runup_ref_source_list
+        merged["status_tags"] = status_tags_list
         if "asof_close" not in merged.columns:
             merged["asof_close"] = merged.get("sig_close")
 
@@ -3281,6 +3412,8 @@ class MA5MA20OpenMonitorRunner:
             "dev_ma20_atr",
             "runup_from_sigclose",
             "runup_from_sigclose_atr",
+            "runup_ref_price",
+            "runup_ref_source",
             "entry_exposure_cap",
             "env_index_score",
             "env_regime",
@@ -3301,6 +3434,7 @@ class MA5MA20OpenMonitorRunner:
             "strength_note",
             "risk_tag",
             "risk_note",
+            "status_tags",
             "signal_kind",
             "sig_signal",
             "sig_reason",
@@ -3343,6 +3477,8 @@ class MA5MA20OpenMonitorRunner:
             "dev_ma20_atr",
             "runup_from_sigclose",
             "runup_from_sigclose_atr",
+            "runup_ref_price",
+            "runup_ref_source",
             "effective_stop_ref",
             "env_regime",
             "env_position_hint",
@@ -3359,6 +3495,7 @@ class MA5MA20OpenMonitorRunner:
             "strength_note",
             "risk_tag",
             "risk_note",
+            "status_tags",
             "checked_at",
             "dedupe_bucket",
             "snapshot_hash",
