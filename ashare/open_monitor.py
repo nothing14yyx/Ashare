@@ -41,8 +41,8 @@ from .env_snapshot_utils import resolve_weekly_asof_date
 from .ma5_ma20_trend_strategy import _atr, _macd
 from .schema_manager import (
     TABLE_ENV_INDEX_SNAPSHOT,
-    TABLE_STRATEGY_MA5_MA20_OPEN_MONITOR,
-    TABLE_STRATEGY_MA5_MA20_OPEN_MONITOR_ENV,
+    TABLE_STRATEGY_OPEN_MONITOR,
+    TABLE_STRATEGY_OPEN_MONITOR_ENV,
     TABLE_STRATEGY_MA5_MA20_SIGNALS,
 )
 from .utils.convert import to_float as _to_float
@@ -218,7 +218,7 @@ class OpenMonitorParams:
     signals_table: str = TABLE_STRATEGY_MA5_MA20_SIGNALS
 
     # 输出表：开盘检查结果
-    output_table: str = TABLE_STRATEGY_MA5_MA20_OPEN_MONITOR
+    output_table: str = TABLE_STRATEGY_OPEN_MONITOR
 
     # 回看近 N 个交易日的 BUY 信号
     signal_lookback_days: int = 3
@@ -277,7 +277,7 @@ class OpenMonitorParams:
     dedupe_bucket_minutes: int = 5
 
     # 环境快照表：存储周线计划等“批次级别”信息，避免在每条标的记录里重复。
-    env_snapshot_table: str = TABLE_STRATEGY_MA5_MA20_OPEN_MONITOR_ENV
+    env_snapshot_table: str = TABLE_STRATEGY_OPEN_MONITOR_ENV
 
     # 指数环境快照表：按哈希去重存储单份指数环境，避免在事实表重复写入。
     env_index_snapshot_table: str = TABLE_ENV_INDEX_SNAPSHOT
