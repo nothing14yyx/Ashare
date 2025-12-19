@@ -145,6 +145,9 @@ open_monitor:
   # signals_table 默认沿用 strategy_ma5_ma20_trend.signals_table，可显式覆盖
   # signals_table: strategy_ma5_ma20_signals
   output_table: strategy_ma5_ma20_open_monitor
+  # 指数代码与回看窗口
+  index_code: sh.000001
+  index_hist_lookback_days: 250
 
   # 回看近 N 个交易日的 BUY 信号作为候选
   signal_lookback_days: 7
