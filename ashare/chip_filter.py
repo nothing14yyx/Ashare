@@ -126,7 +126,7 @@ class ChipFilter:
         sig_df["sig_date"] = pd.to_datetime(sig_df["date"], errors="coerce")
         sig_df = sig_df.dropna(subset=["sig_date", "code"])
         sig_df["code"] = sig_df["code"].astype(str)
-        sig_df = sig_df.sort_values(["code", "sig_date"]).reset_index(drop=True)
+        sig_df = sig_df.sort_values(["code", "sig_date"], ignore_index=True)
         if sig_df.empty:
             return pd.DataFrame()
 
@@ -136,17 +136,32 @@ class ChipFilter:
         if chip_df.empty:
             return pd.DataFrame()
 
-        chip_df = chip_df.sort_values(["code", "announce_date"]).reset_index(drop=True)
+        chip_df = chip_df.sort_values(["code", "announce_date"], ignore_index=True)
 
-        merged = pd.merge_asof(
-            sig_df,
-            chip_df,
-            by="code",
-            left_on="sig_date",
-            right_on="announce_date",
-            direction="backward",
-            allow_exact_matches=True,
-        )
+        merged_parts = []
+        for code, sig_slice in sig_df.groupby("code", sort=False):
+            chip_slice = chip_df[chip_df["code"] == code]
+            if chip_slice.empty:
+                merged_parts.append(
+                    sig_slice.assign(
+                        announce_date=pd.NaT,
+                        gdhs_delta_pct=pd.NA,
+                        gdhs_delta_raw=pd.NA,
+                    )
+                )
+                continue
+            merged_parts.append(
+                pd.merge_asof(
+                    sig_slice,
+                    chip_slice,
+                    left_on="sig_date",
+                    right_on="announce_date",
+                    direction="backward",
+                    allow_exact_matches=True,
+                )
+            )
+
+        merged = pd.concat(merged_parts, ignore_index=True)
         merged["gdhs_delta_pct"] = pd.to_numeric(merged.get("gdhs_delta_pct"), errors="coerce")
         merged["vol_ratio"] = pd.to_numeric(merged.get("vol_ratio"), errors="coerce")
         chip_reason = pd.Series("", index=merged.index, dtype="object")
