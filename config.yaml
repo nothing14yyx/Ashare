@@ -144,7 +144,7 @@ open_monitor:
   enabled: true
   # signals_table 默认沿用 strategy_ma5_ma20_trend.signals_table，可显式覆盖
   # signals_table: strategy_signals
-  output_table: strategy_open_monitor
+  output_table: strategy_open_monitor_eval
   # 指数代码与回看窗口
   index_code: sh.000001
   index_hist_lookback_days: 250

@@ -19,8 +19,9 @@ TABLE_STRATEGY_SIGNAL_CANDIDATES = "strategy_signal_candidates"
 VIEW_STRATEGY_SIGNAL_CANDIDATES = "v_strategy_signal_candidates"
 
 # 开盘监测输出
-TABLE_STRATEGY_OPEN_MONITOR = "strategy_open_monitor"
+TABLE_STRATEGY_OPEN_MONITOR_EVAL = "strategy_open_monitor_eval"
 TABLE_STRATEGY_OPEN_MONITOR_ENV = "strategy_open_monitor_env"
+VIEW_STRATEGY_OPEN_MONITOR_WIDE = "v_strategy_open_monitor_wide"
 
 # 大盘/指数环境快照
 TABLE_ENV_INDEX_SNAPSHOT = "strategy_env_index_snapshot"
@@ -32,9 +33,10 @@ class TableNames:
     candidates_table: str
     candidates_view: str
     candidates_as_view: bool
-    open_monitor_table: str
+    open_monitor_eval_table: str
     env_snapshot_table: str
     env_index_snapshot_table: str
+    open_monitor_view: str
 
 
 class SchemaManager:
@@ -52,9 +54,15 @@ class SchemaManager:
         else:
             self._ensure_candidates_table(tables.candidates_table)
 
-        self._ensure_open_monitor_table(tables.open_monitor_table)
+        self._ensure_open_monitor_eval_table(tables.open_monitor_eval_table)
         self._ensure_env_snapshot_table(tables.env_snapshot_table)
         self._ensure_env_index_snapshot_table(tables.env_index_snapshot_table)
+        self._ensure_open_monitor_view(
+            tables.open_monitor_view,
+            tables.open_monitor_eval_table,
+            tables.env_snapshot_table,
+            tables.env_index_snapshot_table,
+        )
 
     def _resolve_table_names(self) -> TableNames:
         strat_cfg = get_section("strategy_ma5_ma20_trend") or {}
@@ -75,9 +83,9 @@ class SchemaManager:
         )
         candidates_as_view = bool(strat_cfg.get("candidates_as_view", True))
 
-        open_monitor_table = (
-            str(open_monitor_cfg.get("output_table", TABLE_STRATEGY_OPEN_MONITOR)).strip()
-            or TABLE_STRATEGY_OPEN_MONITOR
+        open_monitor_eval_table = (
+            str(open_monitor_cfg.get("output_table", TABLE_STRATEGY_OPEN_MONITOR_EVAL)).strip()
+            or TABLE_STRATEGY_OPEN_MONITOR_EVAL
         )
         env_snapshot_table = (
             str(open_monitor_cfg.get("env_snapshot_table", TABLE_STRATEGY_OPEN_MONITOR_ENV)).strip()
@@ -92,15 +100,25 @@ class SchemaManager:
             ).strip()
             or TABLE_ENV_INDEX_SNAPSHOT
         )
+        open_monitor_view = (
+            str(
+                open_monitor_cfg.get(
+                    "open_monitor_view",
+                    VIEW_STRATEGY_OPEN_MONITOR_WIDE,
+                )
+            ).strip()
+            or VIEW_STRATEGY_OPEN_MONITOR_WIDE
+        )
 
         return TableNames(
             signals_table=signals_table,
             candidates_table=candidates_table,
             candidates_view=candidates_view,
             candidates_as_view=candidates_as_view,
-            open_monitor_table=open_monitor_table,
+            open_monitor_eval_table=open_monitor_eval_table,
             env_snapshot_table=env_snapshot_table,
             env_index_snapshot_table=env_index_snapshot_table,
+            open_monitor_view=open_monitor_view,
         )
 
     # ---------- generic helpers ----------
@@ -325,55 +343,19 @@ class SchemaManager:
         self.logger.info("已创建/更新候选视图 %s。", view)
 
     # ---------- Open monitor ----------
-    def _ensure_open_monitor_table(self, table: str) -> None:
+    def _ensure_open_monitor_eval_table(self, table: str) -> None:
         columns = {
-            "monitor_date": "VARCHAR(10) NULL",
-            "sig_date": "VARCHAR(10) NULL",
+            "monitor_date": "VARCHAR(10) NOT NULL",
+            "sig_date": "VARCHAR(10) NOT NULL",
+            "dedupe_bucket": "VARCHAR(32) NOT NULL",
             "asof_trade_date": "VARCHAR(10) NULL",
             "live_trade_date": "VARCHAR(10) NULL",
             "signal_age": "INT NULL",
             "valid_days": "INT NULL",
-            "code": "VARCHAR(20) NULL",
-            "name": "VARCHAR(64) NULL",
-            "industry": "VARCHAR(64) NULL",
-            "board_name": "VARCHAR(64) NULL",
-            "board_code": "VARCHAR(32) NULL",
-            "board_status": "VARCHAR(32) NULL",
-            "board_rank": "INT NULL",
-            "board_chg_pct": "DOUBLE NULL",
-            "avg_amount_20": "DOUBLE NULL",
-            "avg_volume_20": "DOUBLE NULL",
-            "live_open": "DOUBLE NULL",
-            "live_high": "DOUBLE NULL",
-            "live_low": "DOUBLE NULL",
-            "live_latest": "DOUBLE NULL",
-            "live_volume": "DOUBLE NULL",
-            "live_amount": "DOUBLE NULL",
+            "code": "VARCHAR(20) NOT NULL",
             "live_gap_pct": "DOUBLE NULL",
             "live_pct_change": "DOUBLE NULL",
             "live_intraday_vol_ratio": "DOUBLE NULL",
-            "sig_close": "DOUBLE NULL",
-            "sig_ma5": "DOUBLE NULL",
-            "sig_ma20": "DOUBLE NULL",
-            "sig_ma60": "DOUBLE NULL",
-            "sig_ma250": "DOUBLE NULL",
-            "sig_vol_ratio": "DOUBLE NULL",
-            "sig_macd_hist": "DOUBLE NULL",
-            "sig_atr14": "DOUBLE NULL",
-            "sig_stop_ref": "DOUBLE NULL",
-            "effective_stop_ref": "DOUBLE NULL",
-            "asof_close": "DOUBLE NULL",
-            "asof_ma5": "DOUBLE NULL",
-            "asof_ma20": "DOUBLE NULL",
-            "asof_ma60": "DOUBLE NULL",
-            "asof_ma250": "DOUBLE NULL",
-            "asof_vol_ratio": "DOUBLE NULL",
-            "asof_macd_hist": "DOUBLE NULL",
-            "asof_atr14": "DOUBLE NULL",
-            "asof_stop_ref": "DOUBLE NULL",
-            "sig_kdj_k": "DOUBLE NULL",
-            "sig_kdj_d": "DOUBLE NULL",
-            "trade_stop_ref": "DOUBLE NULL",
             "dev_ma5": "DOUBLE NULL",
             "dev_ma20": "DOUBLE NULL",
             "dev_ma5_atr": "DOUBLE NULL",
@@ -386,40 +368,39 @@ class SchemaManager:
             "env_index_score": "DOUBLE NULL",
             "env_regime": "VARCHAR(32) NULL",
             "env_position_hint": "DOUBLE NULL",
-            "env_index_snapshot_hash": "VARCHAR(32) NULL",
             "env_final_gate_action": "VARCHAR(16) NULL",
-            "env_weekly_asof_trade_date": "VARCHAR(10) NULL",
-            "env_weekly_risk_level": "VARCHAR(16) NULL",
-            "env_weekly_scene": "VARCHAR(32) NULL",
-            "env_weekly_gate_action": "VARCHAR(16) NULL",
+            "env_index_snapshot_hash": "VARCHAR(32) NULL",
             "signal_strength": "DOUBLE NULL",
             "strength_delta": "DOUBLE NULL",
             "strength_trend": "VARCHAR(16) NULL",
             "strength_note": "VARCHAR(512) NULL",
-            "risk_tag": "VARCHAR(255) NULL",
-            "risk_note": "VARCHAR(255) NULL",
-            "status_tags": "VARCHAR(255) NULL",
-            "status_tags_json": "TEXT NULL",
-            "summary_line": "VARCHAR(512) NULL",
             "signal_kind": "VARCHAR(16) NULL",
             "sig_signal": "VARCHAR(16) NULL",
             "sig_reason": "VARCHAR(255) NULL",
             "candidate_stage": "VARCHAR(16) NULL",
             "candidate_state": "VARCHAR(32) NULL",
             "candidate_status": "VARCHAR(32) NULL",
+            "primary_status": "VARCHAR(32) NULL",
             "status_reason": "VARCHAR(255) NULL",
             "action": "VARCHAR(16) NULL",
             "action_reason": "VARCHAR(255) NULL",
+            "status_tags_json": "TEXT NULL",
+            "summary_line": "VARCHAR(512) NULL",
+            "risk_tag": "VARCHAR(255) NULL",
+            "risk_note": "VARCHAR(255) NULL",
             "checked_at": "DATETIME(6) NULL",
-            "dedupe_bucket": "VARCHAR(32) NULL",
             "snapshot_hash": "VARCHAR(64) NULL",
         }
         if not self._table_exists(table):
-            self._create_table(table, columns)
+            self._create_table(
+                table,
+                columns,
+                primary_key=("monitor_date", "sig_date", "code", "dedupe_bucket"),
+            )
         else:
             self._add_missing_columns(table, columns)
 
-        for col in ["monitor_date", "sig_date", "code", "snapshot_hash", "dedupe_bucket"]:
+        for col in ["monitor_date", "sig_date", "code", "snapshot_hash", "dedupe_bucket", "env_index_snapshot_hash"]:
             self._ensure_varchar_length(table, col, 64 if col == "snapshot_hash" else 32)
 
         self._ensure_datetime_column(table, "checked_at")
@@ -498,40 +479,10 @@ class SchemaManager:
             "env_weekly_asof_trade_date": "VARCHAR(10) NULL",
             "env_weekly_risk_level": "VARCHAR(16) NULL",
             "env_weekly_scene": "VARCHAR(32) NULL",
+            "env_weekly_gate_action": "VARCHAR(16) NULL",
             "env_weekly_gate_policy": "VARCHAR(16) NULL",
-            "env_weekly_plan_json": "TEXT NULL",
-            "env_weekly_plan_a": "VARCHAR(255) NULL",
-            "env_weekly_plan_b": "VARCHAR(255) NULL",
-            "env_weekly_plan_a_exposure_cap": "DOUBLE NULL",
-            "env_weekly_bias": "VARCHAR(16) NULL",
-            "env_weekly_status": "VARCHAR(32) NULL",
-            "env_weekly_gating_enabled": "TINYINT(1) NULL",
-            "env_weekly_tags": "VARCHAR(255) NULL",
-            "env_weekly_money_proxy": "VARCHAR(255) NULL",
-            "env_weekly_note": "VARCHAR(255) NULL",
-            "env_regime": "VARCHAR(32) NULL",
-            "env_position_hint": "DOUBLE NULL",
-            "env_position_hint_raw": "DOUBLE NULL",
-            "env_index_code": "VARCHAR(16) NULL",
-            "env_index_asof_trade_date": "VARCHAR(10) NULL",
-            "env_index_asof_close": "DOUBLE NULL",
-            "env_index_asof_ma20": "DOUBLE NULL",
-            "env_index_asof_ma60": "DOUBLE NULL",
-            "env_index_asof_macd_hist": "DOUBLE NULL",
-            "env_index_asof_atr14": "DOUBLE NULL",
-            "env_index_live_trade_date": "VARCHAR(10) NULL",
-            "env_index_live_open": "DOUBLE NULL",
-            "env_index_live_high": "DOUBLE NULL",
-            "env_index_live_low": "DOUBLE NULL",
-            "env_index_live_latest": "DOUBLE NULL",
-            "env_index_live_pct_change": "DOUBLE NULL",
-            "env_index_live_volume": "DOUBLE NULL",
-            "env_index_live_amount": "DOUBLE NULL",
-            "env_index_dev_ma20_atr": "DOUBLE NULL",
-            "env_index_gate_action": "VARCHAR(16) NULL",
-            "env_index_gate_reason": "VARCHAR(255) NULL",
-            "env_index_position_cap": "DOUBLE NULL",
             "env_final_gate_action": "VARCHAR(16) NULL",
+            "env_index_snapshot_hash": "VARCHAR(32) NULL",
         }
         if not self._table_exists(table):
             self._create_table(table, columns, primary_key=("monitor_date", "dedupe_bucket"))
@@ -583,6 +534,122 @@ class SchemaManager:
                     )
                 )
             self.logger.info("指数环境快照表 %s 已添加唯一索引 %s。", table, unique_name)
+
+    def _ensure_open_monitor_view(
+        self,
+        view: str,
+        eval_table: str,
+        env_table: str,
+        env_index_table: str,
+    ) -> None:
+        if not (view and eval_table and env_table and env_index_table):
+            return
+
+        dim_stock_exists = self._table_exists("dim_stock_industry")
+        board_dim_exists = self._table_exists("dim_stock_board_industry")
+        stock_join = (
+            "LEFT JOIN `dim_stock_industry` dsi ON e.`code` = dsi.`code`"
+            if dim_stock_exists
+            else ""
+        )
+        board_join = (
+            "LEFT JOIN `dim_stock_board_industry` dsb ON e.`code` = dsb.`code`"
+            if board_dim_exists
+            else ""
+        )
+        name_expr = "dsi.`code_name`" if dim_stock_exists else "NULL"
+        industry_expr = "dsi.`industry`" if dim_stock_exists else "NULL"
+        board_name_expr = "dsb.`board_name`" if board_dim_exists else "NULL"
+        board_code_expr = "dsb.`board_code`" if board_dim_exists else "NULL"
+
+        stmt = text(
+            f"""
+            CREATE OR REPLACE VIEW `{view}` AS
+            SELECT
+              e.`monitor_date`,
+              e.`sig_date`,
+              e.`dedupe_bucket`,
+              e.`code`,
+              {name_expr} AS `name`,
+              {industry_expr} AS `industry`,
+              {board_name_expr} AS `board_name`,
+              {board_code_expr} AS `board_code`,
+              e.`asof_trade_date`,
+              e.`live_trade_date`,
+              e.`signal_age`,
+              e.`valid_days`,
+              e.`live_gap_pct`,
+              e.`live_pct_change`,
+              e.`live_intraday_vol_ratio`,
+              e.`dev_ma5`,
+              e.`dev_ma20`,
+              e.`dev_ma5_atr`,
+              e.`dev_ma20_atr`,
+              e.`runup_from_sigclose`,
+              e.`runup_from_sigclose_atr`,
+              e.`runup_ref_price`,
+              e.`runup_ref_source`,
+              e.`entry_exposure_cap`,
+              e.`env_index_score`,
+              e.`env_regime`,
+              e.`env_position_hint`,
+              COALESCE(e.`env_final_gate_action`, env.`env_final_gate_action`) AS `env_final_gate_action`,
+              e.`env_index_snapshot_hash`,
+              e.`signal_strength`,
+              e.`strength_delta`,
+              e.`strength_trend`,
+              e.`strength_note`,
+              e.`signal_kind`,
+              e.`sig_signal`,
+              e.`sig_reason`,
+              e.`candidate_stage`,
+              e.`candidate_state`,
+              e.`candidate_status`,
+              e.`primary_status`,
+              e.`status_reason`,
+              e.`action`,
+              e.`action_reason`,
+              e.`status_tags_json`,
+              e.`summary_line`,
+              e.`risk_tag`,
+              e.`risk_note`,
+              e.`checked_at`,
+              e.`snapshot_hash`,
+              env.`env_weekly_asof_trade_date`,
+              env.`env_weekly_risk_level`,
+              env.`env_weekly_scene`,
+              env.`env_weekly_gate_action`,
+              env.`env_weekly_gate_policy`,
+              idx.`asof_trade_date` AS `env_index_asof_trade_date`,
+              idx.`live_trade_date` AS `env_index_live_trade_date`,
+              idx.`asof_close` AS `env_index_asof_close`,
+              idx.`asof_ma20` AS `env_index_asof_ma20`,
+              idx.`asof_ma60` AS `env_index_asof_ma60`,
+              idx.`asof_macd_hist` AS `env_index_asof_macd_hist`,
+              idx.`asof_atr14` AS `env_index_asof_atr14`,
+              idx.`live_open` AS `env_index_live_open`,
+              idx.`live_high` AS `env_index_live_high`,
+              idx.`live_low` AS `env_index_live_low`,
+              idx.`live_latest` AS `env_index_live_latest`,
+              idx.`live_pct_change` AS `env_index_live_pct_change`,
+              idx.`live_volume` AS `env_index_live_volume`,
+              idx.`live_amount` AS `env_index_live_amount`,
+              idx.`dev_ma20_atr` AS `env_index_dev_ma20_atr`,
+              idx.`gate_action` AS `env_index_gate_action`,
+              idx.`gate_reason` AS `env_index_gate_reason`,
+              idx.`position_cap` AS `env_index_position_cap`
+            FROM `{eval_table}` e
+            LEFT JOIN `{env_table}` env
+              ON e.`monitor_date` = env.`monitor_date` AND e.`dedupe_bucket` = env.`dedupe_bucket`
+            LEFT JOIN `{env_index_table}` idx
+              ON e.`env_index_snapshot_hash` = idx.`snapshot_hash`
+            {stock_join}
+            {board_join}
+            """
+        )
+        with self.engine.begin() as conn:
+            conn.execute(stmt)
+        self.logger.info("已创建/更新开盘监测宽视图 %s。", view)
 
 
 def ensure_schema() -> None:

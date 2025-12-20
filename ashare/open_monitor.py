@@ -41,8 +41,8 @@ from .env_snapshot_utils import resolve_weekly_asof_date
 from .ma5_ma20_trend_strategy import _atr, _macd
 from .schema_manager import (
     TABLE_ENV_INDEX_SNAPSHOT,
-    TABLE_STRATEGY_OPEN_MONITOR,
     TABLE_STRATEGY_OPEN_MONITOR_ENV,
+    TABLE_STRATEGY_OPEN_MONITOR_EVAL,
     TABLE_STRATEGY_SIGNALS,
 )
 from .utils.convert import to_float as _to_float
@@ -218,7 +218,7 @@ class OpenMonitorParams:
     signals_table: str = TABLE_STRATEGY_SIGNALS
 
     # 输出表：开盘检查结果
-    output_table: str = TABLE_STRATEGY_OPEN_MONITOR
+    output_table: str = TABLE_STRATEGY_OPEN_MONITOR_EVAL
 
     # 回看近 N 个交易日的 BUY 信号
     signal_lookback_days: int = 3
@@ -652,37 +652,14 @@ class MA5MA20OpenMonitorRunner:
         if not table:
             return
 
-        payload = {}
-        weekly_scenario = (
-            env_context.get("weekly_scenario") if isinstance(env_context, dict) else {}
-        )
+        payload: dict[str, Any] = {}
+        weekly_scenario = env_context.get("weekly_scenario") if isinstance(env_context, dict) else {}
         if not isinstance(weekly_scenario, dict):
             weekly_scenario = {}
 
-        def _is_empty_env_value(value: Any) -> bool:
-            if value is None:
-                return True
-            if isinstance(value, str):
-                return value == ""
-            if isinstance(value, dict):
-                return len(value) == 0
-            if isinstance(value, (list, tuple, set)):
-                return len(value) == 0
-
-            size = getattr(value, "size", None)
-            if isinstance(size, int):
-                return size == 0
-
-            try:
-                return len(value) == 0  # type: ignore[arg-type]
-            except Exception:
-                return False
-
         def _get_env(key: str) -> Any:  # noqa: ANN401
-            if isinstance(env_context, dict):
-                value = env_context.get(key, None)
-                if not _is_empty_env_value(value):
-                    return value
+            if isinstance(env_context, dict) and env_context.get(key) not in (None, ""):
+                return env_context.get(key)
             return weekly_scenario.get(key)
 
         payload["monitor_date"] = monitor_date
@@ -692,50 +669,14 @@ class MA5MA20OpenMonitorRunner:
         payload["env_weekly_risk_level"] = _get_env("weekly_risk_level")
         payload["env_weekly_scene"] = _get_env("weekly_scene_code")
         payload["env_weekly_gate_policy"] = env_weekly_gate_policy
-        payload["env_weekly_plan_json"] = _get_env("weekly_plan_json")
-        payload["env_weekly_plan_a"] = _get_env("weekly_plan_a")
-        payload["env_weekly_plan_b"] = _get_env("weekly_plan_b")
-        payload["env_weekly_plan_a_exposure_cap"] = _to_float(
-            _get_env("weekly_plan_a_exposure_cap")
-        )
-        payload["env_weekly_bias"] = _get_env("weekly_bias")
-        payload["env_weekly_status"] = _get_env("weekly_status")
-        payload["env_weekly_gating_enabled"] = bool(
-            _get_env("weekly_gating_enabled")
-        )
-        payload["env_weekly_tags"] = _get_env("weekly_tags")
-        payload["env_weekly_money_proxy"] = _get_env("weekly_money_proxy")
-        payload["env_weekly_note"] = _get_env("weekly_note")
-        payload["env_regime"] = _get_env("regime")
-        env_position_hint = _to_float(_get_env("effective_position_hint"))
-        if env_position_hint is None:
-            env_position_hint = _to_float(_get_env("position_hint"))
-        payload["env_position_hint"] = env_position_hint
-        payload["env_position_hint_raw"] = _to_float(_get_env("position_hint_raw"))
+        payload["env_weekly_gate_action"] = _get_env("weekly_gate_policy") or env_weekly_gate_policy
         index_snapshot = {}
         if isinstance(env_context, dict):
             raw_index_snapshot = env_context.get("index_intraday")
             if isinstance(raw_index_snapshot, dict):
                 index_snapshot = raw_index_snapshot
-        payload["env_index_code"] = index_snapshot.get("env_index_code")
-        payload["env_index_asof_trade_date"] = index_snapshot.get("env_index_asof_trade_date")
-        payload["env_index_asof_close"] = _to_float(index_snapshot.get("env_index_asof_close"))
-        payload["env_index_asof_ma20"] = _to_float(index_snapshot.get("env_index_asof_ma20"))
-        payload["env_index_asof_ma60"] = _to_float(index_snapshot.get("env_index_asof_ma60"))
-        payload["env_index_asof_macd_hist"] = _to_float(index_snapshot.get("env_index_asof_macd_hist"))
-        payload["env_index_asof_atr14"] = _to_float(index_snapshot.get("env_index_asof_atr14"))
-        payload["env_index_live_trade_date"] = index_snapshot.get("env_index_live_trade_date")
-        payload["env_index_live_open"] = _to_float(index_snapshot.get("env_index_live_open"))
-        payload["env_index_live_high"] = _to_float(index_snapshot.get("env_index_live_high"))
-        payload["env_index_live_low"] = _to_float(index_snapshot.get("env_index_live_low"))
-        payload["env_index_live_latest"] = _to_float(index_snapshot.get("env_index_live_latest"))
-        payload["env_index_live_pct_change"] = _to_float(index_snapshot.get("env_index_live_pct_change"))
-        payload["env_index_live_volume"] = _to_float(index_snapshot.get("env_index_live_volume"))
-        payload["env_index_live_amount"] = _to_float(index_snapshot.get("env_index_live_amount"))
-        payload["env_index_dev_ma20_atr"] = _to_float(index_snapshot.get("env_index_dev_ma20_atr"))
-        payload["env_index_gate_action"] = index_snapshot.get("env_index_gate_action")
-        payload["env_index_gate_reason"] = index_snapshot.get("env_index_gate_reason")
-        payload["env_index_position_cap"] = _to_float(index_snapshot.get("env_index_position_cap"))
+        env_index_hash = index_snapshot.get("env_index_snapshot_hash")
+        payload["env_index_snapshot_hash"] = env_index_hash
         payload["env_final_gate_action"] = self._merge_gate_actions(
             env_weekly_gate_policy, index_snapshot.get("env_index_gate_action")
         )
@@ -808,6 +749,55 @@ class MA5MA20OpenMonitorRunner:
             return None
 
         return str(snapshot.get("snapshot_hash") or "")
+
+    def _load_index_snapshot_by_hash(self, snapshot_hash: str | None) -> dict[str, Any]:
+        if not snapshot_hash:
+            return {}
+        table = self.params.env_index_snapshot_table
+        if not (table and self._table_exists(table)):
+            return {}
+        stmt = text(
+            f"""
+            SELECT *
+            FROM `{table}`
+            WHERE `snapshot_hash` = :h
+            ORDER BY `checked_at` DESC
+            LIMIT 1
+            """
+        )
+        try:
+            with self.db_writer.engine.begin() as conn:
+                df = pd.read_sql_query(stmt, conn, params={"h": snapshot_hash})
+        except Exception as exc:  # noqa: BLE001
+            self.logger.debug("读取指数环境快照失败：%s", exc)
+            return {}
+        if df.empty:
+            return {}
+        raw = df.iloc[0].to_dict()
+        normalized = {
+            "env_index_snapshot_hash": raw.get("snapshot_hash"),
+            "env_index_code": raw.get("index_code"),
+            "env_index_asof_trade_date": raw.get("asof_trade_date"),
+            "env_index_live_trade_date": raw.get("live_trade_date"),
+            "env_index_asof_close": raw.get("asof_close"),
+            "env_index_asof_ma20": raw.get("asof_ma20"),
+            "env_index_asof_ma60": raw.get("asof_ma60"),
+            "env_index_asof_macd_hist": raw.get("asof_macd_hist"),
+            "env_index_asof_atr14": raw.get("asof_atr14"),
+            "env_index_live_open": raw.get("live_open"),
+            "env_index_live_high": raw.get("live_high"),
+            "env_index_live_low": raw.get("live_low"),
+            "env_index_live_latest": raw.get("live_latest"),
+            "env_index_live_pct_change": raw.get("live_pct_change"),
+            "env_index_live_volume": raw.get("live_volume"),
+            "env_index_live_amount": raw.get("live_amount"),
+            "env_index_dev_ma20_atr": raw.get("dev_ma20_atr"),
+            "env_index_gate_action": raw.get("gate_action"),
+            "env_index_gate_reason": raw.get("gate_reason"),
+            "env_index_position_cap": raw.get("position_cap"),
+            "checked_at": raw.get("checked_at"),
+        }
+        return normalized
 
     def _load_env_snapshot_context(
         self, monitor_date: str, dedupe_bucket: str | None = None
@@ -924,6 +914,9 @@ class MA5MA20OpenMonitorRunner:
         _backfill("weekly_direction_confirmed")
         _backfill("weekly_key_levels")
 
+        index_snapshot_hash = row.get("env_index_snapshot_hash")
+        loaded_index_snapshot = self._load_index_snapshot_by_hash(index_snapshot_hash)
+
         env_context: dict[str, Any] = {
             "weekly_scenario": weekly_scenario,
             "weekly_asof_trade_date": weekly_scenario.get("weekly_asof_trade_date"),
@@ -956,8 +949,9 @@ class MA5MA20OpenMonitorRunner:
                 or row.get("env_weekly_gate_action")
             ),
             "dedupe_bucket": row.get("dedupe_bucket"),
+            "env_index_snapshot_hash": index_snapshot_hash,
         }
-        index_snapshot = {
+        index_snapshot = loaded_index_snapshot or {
             "env_index_code": row.get("env_index_code"),
             "env_index_asof_trade_date": row.get("env_index_asof_trade_date"),
             "env_index_asof_close": row.get("env_index_asof_close"),
@@ -978,8 +972,12 @@ class MA5MA20OpenMonitorRunner:
             "env_index_gate_reason": row.get("env_index_gate_reason"),
             "env_index_position_cap": row.get("env_index_position_cap"),
             "env_final_gate_action": row.get("env_final_gate_action"),
+            "env_index_snapshot_hash": index_snapshot_hash,
         }
         env_context["index_intraday"] = index_snapshot
+        if env_context.get("position_hint") is None:
+            env_context["position_hint"] = index_snapshot.get("env_index_position_cap")
+            env_context["effective_position_hint"] = env_context["position_hint"]
 
         return env_context
 
@@ -2083,8 +2081,8 @@ class MA5MA20OpenMonitorRunner:
             out["runup_from_sigclose_atr"] = None
             out["runup_ref_price"] = None
             out["runup_ref_source"] = None
-            out["status_tags"] = None
             out["status_tags_json"] = None
+            out["primary_status"] = None
             out["env_index_snapshot_hash"] = None
             out["env_final_gate_action"] = None
             out["summary_line"] = "INACTIVE/UNKNOWN UNKNOWN | 行情数据不可用"
@@ -2445,7 +2443,7 @@ class MA5MA20OpenMonitorRunner:
         runup_from_sigclose_atr_list: List[float | None] = []
         runup_ref_price_list: List[float | None] = []
         runup_ref_source_list: List[str | None] = []
-        status_tags_list: List[str | None] = []
+        primary_statuses: List[str | None] = []
         status_tags_json_list: List[str | None] = []
         candidate_stages: List[str] = []
         candidate_states: List[str] = []
@@ -2858,8 +2856,6 @@ class MA5MA20OpenMonitorRunner:
                 (hit[1] for hit in status_hits if hit[0] == primary_state),
                 "结构/时效通过",
             )
-            other_tags = [f"{s}:{r}" for s, r in status_hits if s != primary_state]
-            status_tags_value = ",".join(other_tags) if other_tags else None
             status_tags_json_value = json.dumps(
                 {
                     "primary": {"state": primary_state, "reason": primary_reason},
@@ -3224,7 +3220,7 @@ class MA5MA20OpenMonitorRunner:
             runup_from_sigclose_atr_list.append(_to_float(runup_from_sigclose_atr))
             runup_ref_price_list.append(_to_float(runup_ref_price_val))
             runup_ref_source_list.append(runup_ref_source_val)
-            status_tags_list.append(status_tags_value)
+            primary_statuses.append(primary_state)
             status_tags_json_list.append(status_tags_json_value)
             candidate_stages.append(candidate_stage)
             candidate_states.append(candidate_state)
@@ -3333,8 +3329,8 @@ class MA5MA20OpenMonitorRunner:
         merged["runup_from_sigclose_atr"] = runup_from_sigclose_atr_list
         merged["runup_ref_price"] = runup_ref_price_list
         merged["runup_ref_source"] = runup_ref_source_list
-        merged["status_tags"] = status_tags_list
         merged["status_tags_json"] = status_tags_json_list
+        merged["primary_status"] = primary_statuses
         merged["summary_line"] = summary_lines
         if "asof_close" not in merged.columns:
             merged["asof_close"] = merged.get("sig_close")
@@ -3433,8 +3429,8 @@ class MA5MA20OpenMonitorRunner:
             "strength_note",
             "risk_tag",
             "risk_note",
-            "status_tags",
             "status_tags_json",
+            "primary_status",
             "summary_line",
             "signal_kind",
             "sig_signal",
@@ -3501,8 +3497,8 @@ class MA5MA20OpenMonitorRunner:
             "strength_note",
             "risk_tag",
             "risk_note",
-            "status_tags",
             "status_tags_json",
+            "primary_status",
             "summary_line",
             "checked_at",
             "dedupe_bucket",
@@ -3524,6 +3520,7 @@ class MA5MA20OpenMonitorRunner:
     def _persist_results(self, df: pd.DataFrame) -> None:
         if df.empty:
             return
+        df = df.copy()
         table = self.params.output_table
         if not self.params.write_to_db:
             return
@@ -3531,6 +3528,7 @@ class MA5MA20OpenMonitorRunner:
         monitor_date = str(df.iloc[0].get("monitor_date") or "").strip()
         codes = df["code"].dropna().astype(str).unique().tolist()
         table_exists = self._table_exists(table)
+        table_columns = set(self._get_table_columns(table))
 
         for col in ["signal_strength", "strength_delta"]:
             if col in df.columns:
@@ -3548,7 +3546,6 @@ class MA5MA20OpenMonitorRunner:
             "sig_reason",
             "action_reason",
             "status_reason",
-            "status_tags",
         ]:
             if col in df.columns:
                 df[col] = (
@@ -3567,11 +3564,28 @@ class MA5MA20OpenMonitorRunner:
             df["status_tags_json"] = (
                 df["status_tags_json"].fillna("").astype(str).str.slice(0, 4000)
             )
+        if "primary_status" in df.columns:
+            df["primary_status"] = (
+                df["primary_status"].fillna("").astype(str).str.slice(0, 64)
+            )
+        else:
+            if "status_tags_json" in df.columns:
+                try:
+                    df["primary_status"] = df["status_tags_json"].apply(
+                        lambda x: (json.loads(x).get("primary", {}) or {}).get("state")
+                        if isinstance(x, str) and x.strip()
+                        else None
+                    )
+                except Exception:
+                    df["primary_status"] = None
 
         df["snapshot_hash"] = df.apply(lambda row: make_snapshot_hash(row.to_dict()), axis=1)
         df = df.drop_duplicates(
             subset=["monitor_date", "sig_date", "code", "dedupe_bucket"]
         )
+        if table_columns:
+            keep_cols = [c for c in df.columns if c in table_columns]
+            df = df[keep_cols]
 
         # 增量模式：不删除旧记录，保留每次运行的历史快照（checked_at 会区分）
         if (not self.params.incremental_write) and monitor_date and codes and table_exists:
@@ -3858,6 +3872,7 @@ class MA5MA20OpenMonitorRunner:
             index_env_snapshot["env_index_snapshot_hash"] = env_index_snapshot_hash
         if isinstance(env_context, dict):
             env_context["index_intraday"] = index_env_snapshot
+            env_context["env_index_snapshot_hash"] = env_index_snapshot_hash
         if index_env_snapshot:
             gate_action = index_env_snapshot.get("env_index_gate_action")
             gate_reason = index_env_snapshot.get("env_index_gate_reason") or "-"
