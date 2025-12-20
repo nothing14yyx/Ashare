@@ -22,7 +22,7 @@ from .config import ProxyConfig, get_section
 from .db import DatabaseConfig, MySQLWriter
 from .external_signal_manager import ExternalSignalManager
 from .fundamental_manager import FundamentalDataManager
-from .schema_manager import VIEW_A_SHARE_UNIVERSE, SchemaManager
+from .schema_manager import TABLE_A_SHARE_UNIVERSE, SchemaManager
 from .universe import AshareUniverseBuilder
 from .utils import setup_logger
 
@@ -2056,10 +2056,10 @@ class AshareApp:
             except Exception as exc:  # noqa: BLE001
                 self.logger.warning("基本面过滤阶段出现异常，保留未过滤结果: %s", exc)
 
-            universe_table = VIEW_A_SHARE_UNIVERSE
+            universe_snapshot_table = TABLE_A_SHARE_UNIVERSE
             self.logger.info(
-                "已生成候选池（视图 %s，依赖基础表实时计算）：内存行数=%s",
-                universe_table,
+                "已生成候选池（表快照目标 %s，基于基础表计算得到）：内存行数=%s",
+                universe_snapshot_table,
                 len(universe_df),
             )
 

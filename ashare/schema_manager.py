@@ -16,7 +16,7 @@ STRATEGY_CODE_MA5_MA20_TREND = "MA5_MA20_TREND"
 VIEW_DIM_STOCK_BASIC = "dim_stock_basic"
 VIEW_FACT_STOCK_DAILY = "fact_stock_daily"
 VIEW_DIM_INDEX_MEMBERSHIP_SNAPSHOT = "dim_index_membership_snapshot"
-VIEW_A_SHARE_UNIVERSE = "a_share_universe"
+TABLE_A_SHARE_UNIVERSE = "a_share_universe"
 
 # 统一策略信号体系表命名：按单一职责拆分
 TABLE_STRATEGY_INDICATOR_DAILY = "strategy_indicator_daily"
@@ -67,12 +67,12 @@ class SchemaManager:
 
         self._ensure_indicator_table(tables.indicator_table)
         self._ensure_signal_events_table(tables.signal_events_table)
+        # candidates 事实表始终存在：稳定事实表（可选额外创建视图做实时派生/兼容查询）
+        self._ensure_candidates_table(tables.candidates_table)
         if tables.candidates_as_view:
             self._ensure_candidates_view(
                 tables.candidates_view, tables.signal_events_table, tables.indicator_table
             )
-        else:
-            self._ensure_candidates_table(tables.candidates_table)
 
         self._ensure_open_monitor_eval_table(tables.open_monitor_eval_table)
         self._ensure_open_monitor_quote_table(tables.open_monitor_quote_table)
@@ -113,7 +113,17 @@ class SchemaManager:
             str(strat_cfg.get("candidates_view", VIEW_STRATEGY_SIGNAL_CANDIDATES)).strip()
             or VIEW_STRATEGY_SIGNAL_CANDIDATES
         )
-        candidates_as_view = bool(strat_cfg.get("candidates_as_view", True))
+        raw_candidates_as_view = strat_cfg.get("candidates_as_view", False)
+        if isinstance(raw_candidates_as_view, str):
+            lowered = raw_candidates_as_view.strip().lower()
+            if lowered in {"1", "true", "yes", "y", "on"}:
+                candidates_as_view = True
+            elif lowered in {"0", "false", "no", "n", "off"}:
+                candidates_as_view = False
+            else:
+                candidates_as_view = False
+        else:
+            candidates_as_view = bool(raw_candidates_as_view)
 
         open_monitor_eval_table = (
             str(open_monitor_cfg.get("output_table", TABLE_STRATEGY_OPEN_MONITOR_EVAL)).strip()
@@ -179,6 +189,22 @@ class SchemaManager:
         with self.engine.connect() as conn:
             inspector = inspect(conn)
             return inspector.has_table(table)
+
+    def _view_exists(self, view: str) -> bool:
+        condition = "TABLE_SCHEMA = :schema" if self.db_name else "TABLE_SCHEMA = DATABASE()"
+        stmt = text(
+            f"""
+            SELECT COUNT(*) AS cnt
+            FROM information_schema.TABLES
+            WHERE {condition} AND TABLE_NAME = :view AND TABLE_TYPE = 'VIEW'
+            """
+        )
+        params: Dict[str, str] = {"view": view}
+        if self.db_name:
+            params["schema"] = str(self.db_name)
+        with self.engine.connect() as conn:
+            row = conn.execute(stmt, params).mappings().first()
+        return bool(row and row.get("cnt"))
 
     def _index_exists(self, table: str, index: str) -> bool:
         condition = "table_schema = :schema" if self.db_name else "table_schema = DATABASE()"
@@ -332,6 +358,15 @@ class SchemaManager:
             return
         with self.engine.begin() as conn:
             conn.execute(text(f"DROP VIEW IF EXISTS `{name}`"))
+
+    def _drop_relation_any(self, name: str) -> None:
+        """删除同名关系对象（先视图后表），用于视图/表互转兼容。"""
+
+        if not name:
+            return
+        with self.engine.begin() as conn:
+            conn.execute(text(f"DROP VIEW IF EXISTS `{name}`"))
+            conn.execute(text(f"DROP TABLE IF EXISTS `{name}`"))
 
     # ---------- Base dims/facts ----------
     def _ensure_dim_stock_basic_view(self) -> None:
@@ -570,127 +605,57 @@ class SchemaManager:
             conn.execute(stmt)
         self.logger.info("已创建/更新指数成分维度视图 %s。", VIEW_DIM_INDEX_MEMBERSHIP_SNAPSHOT)
 
-    def _ensure_universe_view(self) -> None:
-        if not (self._table_exists(VIEW_DIM_STOCK_BASIC) and self._table_exists(VIEW_FACT_STOCK_DAILY)):
-            self.logger.debug(
-                "依赖视图缺失（%s/%s），创建空视图 a_share_universe 以便占位。",
-                VIEW_DIM_STOCK_BASIC,
-                VIEW_FACT_STOCK_DAILY,
-            )
-            self._drop_relation(VIEW_A_SHARE_UNIVERSE)
-            empty_stmt = text(
-                f"""
-                CREATE OR REPLACE VIEW `{VIEW_A_SHARE_UNIVERSE}` AS
-                SELECT
-                  CAST(NULL AS DATE) AS `date`,
-                  CAST(NULL AS CHAR(20)) AS `code`,
-                  CAST(NULL AS CHAR(64)) AS `code_name`,
-                  CAST(NULL AS CHAR(8)) AS `tradeStatus`,
-                  CAST(NULL AS DOUBLE) AS `amount`,
-                  CAST(NULL AS DOUBLE) AS `volume`,
-                  CAST(NULL AS DOUBLE) AS `open`,
-                  CAST(NULL AS DOUBLE) AS `high`,
-                  CAST(NULL AS DOUBLE) AS `low`,
-                  CAST(NULL AS DOUBLE) AS `close`,
-                  CAST(NULL AS DATE) AS `ipoDate`,
-                  CAST(NULL AS CHAR(8)) AS `type`,
-                  CAST(NULL AS CHAR(8)) AS `status`,
-                  CAST(NULL AS SIGNED) AS `in_hs300`,
-                  CAST(NULL AS SIGNED) AS `in_zz500`,
-                  CAST(NULL AS SIGNED) AS `in_sz50`
-                WHERE 1 = 0
-                """
-            )
+    def _ensure_universe_table(self) -> None:
+        """确保 a_share_universe 作为表存在（不再使用视图）。
+
+        说明：
+        - 该表用于承载你运行时生成的 universe 快照数据；
+        - 如历史版本曾创建同名 VIEW，这里会先安全地 drop 掉 view。
+        """
+
+        table = TABLE_A_SHARE_UNIVERSE
+
+        # 兼容旧版本：如果同名对象是 VIEW，则先删除，避免 CREATE TABLE 冲突
+        if self._view_exists(table):
+            self._drop_relation_any(table)
+
+        columns = {
+            "date": "DATE NOT NULL",
+            "code": "VARCHAR(20) NOT NULL",
+            "code_name": "VARCHAR(64) NULL",
+            "tradeStatus": "VARCHAR(8) NULL",
+            "amount": "DOUBLE NULL",
+            "volume": "DOUBLE NULL",
+            "open": "DOUBLE NULL",
+            "high": "DOUBLE NULL",
+            "low": "DOUBLE NULL",
+            "close": "DOUBLE NULL",
+            "ipoDate": "DATE NULL",
+            "type": "VARCHAR(8) NULL",
+            "status": "VARCHAR(8) NULL",
+            "in_hs300": "TINYINT NULL",
+            "in_zz500": "TINYINT NULL",
+            "in_sz50": "TINYINT NULL",
+        }
+
+        if not self._table_exists(table):
+            self._create_table(table, columns, primary_key=("date", "code"))
+        else:
+            self._add_missing_columns(table, columns)
+
+        idx_name = "idx_a_share_universe_code_date"
+        if not self._index_exists(table, idx_name):
             with self.engine.begin() as conn:
-                conn.execute(empty_stmt)
-            return
+                conn.execute(
+                    text(
+                        f"""
+                        CREATE INDEX `{idx_name}`
+                        ON `{table}` (`code`, `date`)
+                        """
+                    )
+                )
 
-        dim_meta = set(self._column_meta(VIEW_DIM_STOCK_BASIC).keys())
-        fact_meta = set(self._column_meta(VIEW_FACT_STOCK_DAILY).keys())
-        if not {"code", "date"}.intersection(fact_meta) or "code" not in dim_meta:
-            self.logger.warning("维度/事实视图缺少 code/date 列，跳过 a_share_universe 视图创建。")
-            return
-
-        date_ref = "trade_date" if "trade_date" in fact_meta else "date"
-        date_expr = f"f.`{date_ref}`"
-        trade_status_expr = "b.`tradeStatus`" if "tradeStatus" in dim_meta else "NULL"
-        amount_expr = "f.`amount`" if "amount" in fact_meta else "NULL"
-        volume_expr = "f.`volume`" if "volume" in fact_meta else "NULL"
-        close_expr = "f.`close`" if "close" in fact_meta else "NULL"
-        open_expr = "f.`open`" if "open" in fact_meta else "NULL"
-        high_expr = "f.`high`" if "high" in fact_meta else "NULL"
-        low_expr = "f.`low`" if "low" in fact_meta else "NULL"
-        ipo_expr = "b.`ipoDate`" if "ipoDate" in dim_meta else "NULL"
-        type_expr = "b.`type`" if "type" in dim_meta else "NULL"
-        status_expr = "b.`status`" if "status" in dim_meta else "NULL"
-
-        membership_exists = self._table_exists(VIEW_DIM_INDEX_MEMBERSHIP_SNAPSHOT)
-        membership_select = ""
-        membership_join = ""
-        if membership_exists:
-            membership_select = """
-              ,im.`in_hs300`
-              ,im.`in_zz500`
-              ,im.`in_sz50`
-            """
-            membership_join = (
-                f"""
-                LEFT JOIN (
-                  SELECT
-                    im.`code`,
-                    MAX(CASE WHEN im.`index_name` = 'hs300' THEN 1 ELSE 0 END) AS `in_hs300`,
-                    MAX(CASE WHEN im.`index_name` = 'zz500' THEN 1 ELSE 0 END) AS `in_zz500`,
-                    MAX(CASE WHEN im.`index_name` = 'sz50' THEN 1 ELSE 0 END) AS `in_sz50`
-                  FROM `{VIEW_DIM_INDEX_MEMBERSHIP_SNAPSHOT}` im
-                  JOIN (
-                    SELECT `index_name`, MAX(`snapshot_date`) AS `snapshot_date`
-                    FROM `{VIEW_DIM_INDEX_MEMBERSHIP_SNAPSHOT}`
-                    GROUP BY `index_name`
-                  ) latest_snapshot
-                    ON im.`index_name` = latest_snapshot.`index_name`
-                   AND im.`snapshot_date` = latest_snapshot.`snapshot_date`
-                  GROUP BY im.`code`
-                ) im ON f.`code` = im.`code`
-                """
-            )
-
-        status_filter = "COALESCE(b.`tradeStatus`, '1') = '1'" if "tradeStatus" in dim_meta else "1 = 1"
-
-        self._drop_relation(VIEW_A_SHARE_UNIVERSE)
-        stmt = text(
-            f"""
-            CREATE OR REPLACE VIEW `{VIEW_A_SHARE_UNIVERSE}` AS
-            SELECT
-              {date_expr} AS `date`,
-              f.`code`,
-              b.`code_name`,
-              {trade_status_expr} AS `tradeStatus`,
-              {amount_expr} AS `amount`,
-              {volume_expr} AS `volume`,
-              {open_expr} AS `open`,
-              {high_expr} AS `high`,
-              {low_expr} AS `low`,
-              {close_expr} AS `close`,
-              {ipo_expr} AS `ipoDate`,
-              {type_expr} AS `type`,
-              {status_expr} AS `status`
-              {membership_select}
-            FROM `{VIEW_FACT_STOCK_DAILY}` f
-            JOIN (
-              SELECT `code`, MAX(`{date_ref}`) AS `latest_date`
-              FROM `{VIEW_FACT_STOCK_DAILY}`
-              GROUP BY `code`
-            ) latest
-              ON f.`code` = latest.`code` AND f.`{date_ref}` = latest.`latest_date`
-            JOIN `{VIEW_DIM_STOCK_BASIC}` b ON f.`code` = b.`code`
-            {membership_join}
-            WHERE {status_filter}
-              AND UPPER(COALESCE(b.`code_name`, '')) NOT LIKE '%ST%'
-            """
-        )
-        with self.engine.begin() as conn:
-            conn.execute(stmt)
-        self.logger.info("已创建/更新视图 %s。", VIEW_A_SHARE_UNIVERSE)
+        self.logger.info("已创建/更新 Universe 表 %s。", table)
 
     # ---------- MA5-MA20 strategy ----------
     def _ensure_indicator_table(self, table: str) -> None:
@@ -1244,7 +1209,7 @@ class SchemaManager:
         self.logger.info("已创建/更新开盘监测宽视图 %s。", view)
 
         if compat_view and compat_view != view:
-            self._drop_relation(compat_view)
+            self._drop_relation_any(compat_view)
             compat_stmt = text(
                 f"""
                 CREATE OR REPLACE VIEW `{compat_view}` AS
