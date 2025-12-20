@@ -95,7 +95,7 @@ class ChipFilter:
         df["announce_date"] = pd.to_datetime(df["announce_date"], errors="coerce")
         df["gdhs_delta_pct"] = pd.to_numeric(df.get("gdhs_delta_pct"), errors="coerce")
         df["gdhs_delta_raw"] = pd.to_numeric(df.get("gdhs_delta_raw"), errors="coerce")
-        return df.dropna(subset=["announce_date"]).sort_values(["announce_date", "code"])
+        return df.dropna(subset=["announce_date"]).sort_values(["code", "announce_date"]).reset_index(drop=True)
 
     def _write_table(self, df: pd.DataFrame) -> None:
         if df.empty or not self._table_exists(self.table):
@@ -126,6 +126,7 @@ class ChipFilter:
         sig_df["sig_date"] = pd.to_datetime(sig_df["date"], errors="coerce")
         sig_df = sig_df.dropna(subset=["sig_date", "code"])
         sig_df["code"] = sig_df["code"].astype(str)
+        sig_df = sig_df.sort_values(["code", "sig_date"]).reset_index(drop=True)
         if sig_df.empty:
             return pd.DataFrame()
 
@@ -135,9 +136,11 @@ class ChipFilter:
         if chip_df.empty:
             return pd.DataFrame()
 
+        chip_df = chip_df.sort_values(["code", "announce_date"]).reset_index(drop=True)
+
         merged = pd.merge_asof(
-            sig_df.sort_values(["code", "sig_date"]),
-            chip_df.sort_values(["code", "announce_date"]),
+            sig_df,
+            chip_df,
             by="code",
             left_on="sig_date",
             right_on="announce_date",
