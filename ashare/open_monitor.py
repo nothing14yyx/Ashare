@@ -2878,7 +2878,7 @@ class MA5MA20OpenMonitorRunner:
         prev_strength_map = self._load_previous_strength(codes_all, as_of=checked_at_ts)
         eps = 1e-6
 
-        status_priority = ["INVALID", "RUNUP_TOO_LARGE", "OVEREXTENDED", "STALE"]
+        status_priority = ["STOP_LOSS", "INVALID", "RUNUP_TOO_LARGE", "OVEREXTENDED", "STALE"]
 
         for idx, row in merged.iterrows():
             action = "EXECUTE"
@@ -2886,6 +2886,7 @@ class MA5MA20OpenMonitorRunner:
             candidate_status = "ACTIVE"
             status_reason = "结构/时效通过"
             status_hits: list[tuple[str, str]] = []
+            entry_exposure_cap = None
 
             risk_tag_raw = str(row.get("risk_tag") or "").strip()
             risk_note = str(row.get("risk_note") or "").strip()
@@ -3051,6 +3052,9 @@ class MA5MA20OpenMonitorRunner:
                 dev_ma20_atr=dev_ma20_atr,
                 dev_ma20_atr_min=dev_ma20_gate,
             )
+            runup_take_profit = None
+            if runup_from_sigclose is not None and sig_close_val is not None and sig_close_val > 0:
+                runup_take_profit = runup_from_sigclose / sig_close_val
 
             if valid_days > 0 and signal_age is not None and signal_age > valid_days:
                 status_hits.append(
@@ -3058,6 +3062,13 @@ class MA5MA20OpenMonitorRunner:
                 )
 
             invalid_reason = None
+            latest_px_float = _to_float(latest_px)
+            hard_stop = (
+                latest_px_float is not None
+                and sig_close_val is not None
+                and sig_close_val > 0
+                and latest_px_float <= sig_close_val * 0.75
+            )
             if macd_hist is not None and macd_hist <= 0:
                 invalid_reason = f"MACD 柱子转负：asof_macd_hist={macd_hist:.4f} ≤ 0"
             elif price_now is not None and ma20 is not None and price_now < ma20:
@@ -3081,7 +3092,7 @@ class MA5MA20OpenMonitorRunner:
                 stop_detail = "，".join(stop_parts)
                 invalid_reason = (
                     f"触发止损：price_now={price_now:.2f} <= effective_stop_ref={effective_stop_ref:.2f}"
-                )
+                    )
                 if stop_detail:
                     invalid_reason = f"{invalid_reason}（参考：{stop_detail}）"
             elif (
@@ -3096,8 +3107,27 @@ class MA5MA20OpenMonitorRunner:
             if invalid_reason:
                 status_hits.append(("INVALID", invalid_reason))
 
+            if hard_stop:
+                status_hits.append(
+                    (
+                        "STOP_LOSS",
+                        f"最新价 {latest_px_float:.2f} 触发硬止损阈值 ≤ 信号收盘*0.75={sig_close_val*0.75:.2f}",
+                    )
+                )
+                action = "STOP"
+                reason = (
+                    f"硬止损：最新价≤信号收盘*0.75（{latest_px_float:.2f}/{sig_close_val*0.75:.2f}）"
+                )
+                entry_exposure_cap = 0.0
+
             if runup_triggered and runup_detail:
                 status_hits.append(("RUNUP_TOO_LARGE", runup_detail))
+
+            if runup_take_profit is not None and runup_take_profit >= 0.15:
+                status_hits.append(("TAKE_PROFIT", f"信号后涨幅 {runup_take_profit*100:.2f}% ≥ 15%"))
+                if action not in {"STOP", "SKIP"}:
+                    action = "REDUCE_50%"
+                    reason = f"分批止盈：{runup_take_profit*100:.2f}%"
 
             overextend_reasons: list[str] = []
             if dev_ma5_atr is not None and dev_ma5_atr > dev_ma5_atr_max:
@@ -3141,7 +3171,7 @@ class MA5MA20OpenMonitorRunner:
             candidate_status = "ACTIVE" if candidate_stage == "ACTIVE" else candidate_state
             status_reason = primary_reason or "结构/时效通过"
 
-            if candidate_status != "ACTIVE":
+            if candidate_status != "ACTIVE" and action not in {"STOP", "REDUCE_50%"}:
                 action = "SKIP"
                 if (
                     runup_triggered
@@ -3242,6 +3272,27 @@ class MA5MA20OpenMonitorRunner:
                     status_reason = f"板块强势(rank={rank_display})，等待入场条件"
                     reason = status_reason
 
+                fear_score_val = _to_float(row.get("sig_fear_score"))
+                if (
+                    fear_score_val is not None
+                    and fear_score_val < -0.5
+                    and gap is not None
+                    and gap >= 0.05
+                ):
+                    status_hits.append(
+                        (
+                            "FEAR_SKIP",
+                            f"fear_score={fear_score_val:.2f} gap={gap*100:.2f}%",
+                        )
+                    )
+                    if action in {"EXECUTE", "EXECUTE_SMALL"}:
+                        action = "WAIT"
+                    entry_exposure_cap = 0.0
+                    status_reason = (
+                        f"FEAR_SKIP fear={fear_score_val:.2f} gap={gap*100:.2f}%"
+                    )
+                    reason = status_reason
+
                 if risk_tags_split and action == "EXECUTE":
                     action = "WAIT"
                     note_text = risk_note or "存在风险标签，建议谨慎"
@@ -3253,15 +3304,19 @@ class MA5MA20OpenMonitorRunner:
             merged.at[idx, "risk_note"] = risk_note or None
 
             cap_candidates: list[tuple[str, float]] = []
+            sig_final_cap = _to_float(row.get("sig_final_cap"))
+            if sig_final_cap is not None:
+                cap_candidates.append(("signal_final_cap", sig_final_cap))
             if env_position_hint is not None:
                 cap_candidates.append(("env_position_hint", env_position_hint))
             if env_weekly_plan_a_exposure_cap is not None:
                 cap_candidates.append(("weekly_plan_a_cap", env_weekly_plan_a_exposure_cap))
             if env_index_position_cap is not None:
                 cap_candidates.append(("env_index_position_cap", env_index_position_cap))
-            entry_exposure_cap = None
+            existing_cap = entry_exposure_cap
             if cap_candidates:
-                entry_exposure_cap = min(val for _, val in cap_candidates)
+                candidate_cap = min(val for _, val in cap_candidates)
+                entry_exposure_cap = candidate_cap if existing_cap is None else min(existing_cap, candidate_cap)
 
             if env_regime:
                 pos_hint_text = (
@@ -3421,6 +3476,7 @@ class MA5MA20OpenMonitorRunner:
                 gate_reason_text = gate_note_text or "指数门控=STOP"
                 if action in {"EXECUTE", "EXECUTE_SMALL"}:
                     action = "WAIT"
+                entry_exposure_cap = 0.0
                 if candidate_status == "ACTIVE":
                     status_reason = (
                         f"{status_reason}；{gate_reason_text}"
@@ -3434,6 +3490,7 @@ class MA5MA20OpenMonitorRunner:
             elif final_gate_action == "WAIT" and action == "EXECUTE":
                 wait_text = gate_note_text or "指数门控=WAIT"
                 action = "WAIT"
+                entry_exposure_cap = 0.0
                 status_reason = (
                     f"{status_reason}；{wait_text}" if status_reason else wait_text
                 )
