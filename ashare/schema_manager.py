@@ -12,6 +12,12 @@ from .db import DatabaseConfig, MySQLWriter
 
 STRATEGY_CODE_MA5_MA20_TREND = "MA5_MA20_TREND"
 
+# 维度/事实视图：拆分 a_share_universe
+VIEW_DIM_STOCK_BASIC = "dim_stock_basic"
+VIEW_FACT_STOCK_DAILY = "fact_stock_daily"
+VIEW_DIM_INDEX_MEMBERSHIP_SNAPSHOT = "dim_index_membership_snapshot"
+VIEW_A_SHARE_UNIVERSE = "a_share_universe"
+
 # 统一策略信号体系表命名：按单一职责拆分
 TABLE_STRATEGY_INDICATOR_DAILY = "strategy_indicator_daily"
 TABLE_STRATEGY_SIGNAL_EVENTS = "strategy_signal_events"
@@ -23,6 +29,8 @@ TABLE_STRATEGY_OPEN_MONITOR_EVAL = "strategy_open_monitor_eval"
 TABLE_STRATEGY_OPEN_MONITOR_ENV = "strategy_open_monitor_env"
 TABLE_STRATEGY_OPEN_MONITOR_QUOTE = "strategy_open_monitor_quote"
 VIEW_STRATEGY_OPEN_MONITOR_WIDE = "v_strategy_open_monitor_wide"
+# 兼容旧宽表命名
+VIEW_STRATEGY_OPEN_MONITOR_COMPAT = "strategy_open_monitor"
 
 # 大盘/指数环境快照
 TABLE_ENV_INDEX_SNAPSHOT = "strategy_env_index_snapshot"
@@ -40,6 +48,7 @@ class TableNames:
     env_index_snapshot_table: str
     open_monitor_view: str
     open_monitor_quote_table: str
+    open_monitor_compat_view: str
 
 
 class SchemaManager:
@@ -50,6 +59,11 @@ class SchemaManager:
 
     def ensure_all(self) -> None:
         tables = self._resolve_table_names()
+
+        self._ensure_dim_stock_basic_view()
+        self._ensure_fact_stock_daily_view()
+        self._ensure_index_membership_view()
+        self._ensure_universe_view()
 
         self._ensure_indicator_table(tables.indicator_table)
         self._ensure_signal_events_table(tables.signal_events_table)
@@ -69,6 +83,8 @@ class SchemaManager:
             tables.open_monitor_eval_table,
             tables.env_snapshot_table,
             tables.env_index_snapshot_table,
+            tables.open_monitor_quote_table,
+            tables.open_monitor_compat_view,
         )
 
     def _resolve_table_names(self) -> TableNames:
@@ -134,6 +150,15 @@ class SchemaManager:
             ).strip()
             or TABLE_STRATEGY_OPEN_MONITOR_QUOTE
         )
+        open_monitor_compat_view = (
+            str(
+                open_monitor_cfg.get(
+                    "open_monitor_compat_view",
+                    VIEW_STRATEGY_OPEN_MONITOR_COMPAT,
+                )
+            ).strip()
+            or VIEW_STRATEGY_OPEN_MONITOR_COMPAT
+        )
 
         return TableNames(
             indicator_table=indicator_table,
@@ -146,6 +171,7 @@ class SchemaManager:
             env_index_snapshot_table=env_index_snapshot_table,
             open_monitor_view=open_monitor_view,
             open_monitor_quote_table=open_monitor_quote_table,
+            open_monitor_compat_view=open_monitor_compat_view,
         )
 
     # ---------- generic helpers ----------
@@ -300,6 +326,350 @@ class SchemaManager:
         with self.engine.begin() as conn:
             conn.execute(text(ddl))
         self.logger.info("已创建表 %s。", table)
+
+    def _drop_relation(self, name: str) -> None:
+        if not name:
+            return
+        with self.engine.begin() as conn:
+            conn.execute(text(f"DROP VIEW IF EXISTS `{name}`"))
+
+    # ---------- Base dims/facts ----------
+    def _ensure_dim_stock_basic_view(self) -> None:
+        source = "a_share_stock_list"
+        if not self._table_exists(source):
+            self.logger.debug(
+                "源表 %s 不存在，将创建空视图 %s。",
+                source,
+                VIEW_DIM_STOCK_BASIC,
+            )
+            self._drop_relation(VIEW_DIM_STOCK_BASIC)
+            empty_stmt = text(
+                f"""
+                CREATE OR REPLACE VIEW `{VIEW_DIM_STOCK_BASIC}` AS
+                SELECT
+                  CAST(NULL AS CHAR(20)) AS `code`,
+                  CAST(NULL AS CHAR(64)) AS `code_name`,
+                  CAST(NULL AS CHAR(8)) AS `tradeStatus`,
+                  CAST(NULL AS DATE) AS `ipoDate`,
+                  CAST(NULL AS DATE) AS `outDate`,
+                  CAST(NULL AS CHAR(8)) AS `type`,
+                  CAST(NULL AS CHAR(8)) AS `status`
+                WHERE 1 = 0
+                """
+            )
+            with self.engine.begin() as conn:
+                conn.execute(empty_stmt)
+            return
+
+        meta = self._column_meta(source)
+        mapping = {
+            "code": ["code"],
+            "code_name": ["code_name"],
+            "tradeStatus": ["tradeStatus", "tradestatus"],
+            "ipoDate": ["ipoDate"],
+            "outDate": ["outDate"],
+            "type": ["type"],
+            "status": ["status"],
+        }
+        select_cols: list[str] = []
+        for target, candidates in mapping.items():
+            for col in candidates:
+                if col in meta:
+                    expr = f"`{col}` AS `{target}`" if col != target else f"`{col}`"
+                    select_cols.append(expr)
+                    break
+        if "code" not in {c.split(" AS ")[-1].strip("`") for c in select_cols}:
+            self.logger.warning(
+                "源表 %s 缺少 code 列，将创建空视图 %s。",
+                source,
+                VIEW_DIM_STOCK_BASIC,
+            )
+            self._drop_relation(VIEW_DIM_STOCK_BASIC)
+            empty_stmt = text(
+                f"""
+                CREATE OR REPLACE VIEW `{VIEW_DIM_STOCK_BASIC}` AS
+                SELECT
+                  CAST(NULL AS CHAR(20)) AS `code`,
+                  CAST(NULL AS CHAR(64)) AS `code_name`,
+                  CAST(NULL AS CHAR(8)) AS `tradeStatus`,
+                  CAST(NULL AS DATE) AS `ipoDate`,
+                  CAST(NULL AS DATE) AS `outDate`,
+                  CAST(NULL AS CHAR(8)) AS `type`,
+                  CAST(NULL AS CHAR(8)) AS `status`
+                WHERE 1 = 0
+                """
+            )
+            with self.engine.begin() as conn:
+                conn.execute(empty_stmt)
+            return
+
+        columns_sql = ", ".join(select_cols)
+        self._drop_relation(VIEW_DIM_STOCK_BASIC)
+        stmt = text(
+            f"""
+            CREATE OR REPLACE VIEW `{VIEW_DIM_STOCK_BASIC}` AS
+            SELECT {columns_sql}
+            FROM `{source}`
+            """
+        )
+        with self.engine.begin() as conn:
+            conn.execute(stmt)
+        self.logger.info("已创建/更新维度视图 %s。", VIEW_DIM_STOCK_BASIC)
+
+    def _ensure_fact_stock_daily_view(self) -> None:
+        source = "history_daily_kline"
+        if not self._table_exists(source):
+            self.logger.debug(
+                "源表 %s 不存在，将创建空视图 %s。",
+                source,
+                VIEW_FACT_STOCK_DAILY,
+            )
+            self._drop_relation(VIEW_FACT_STOCK_DAILY)
+            empty_stmt = text(
+                f"""
+                CREATE OR REPLACE VIEW `{VIEW_FACT_STOCK_DAILY}` AS
+                SELECT
+                  CAST(NULL AS CHAR(20)) AS `code`,
+                  CAST(NULL AS DATE) AS `date`,
+                  CAST(NULL AS DATE) AS `trade_date`,
+                  CAST(NULL AS DOUBLE) AS `open`,
+                  CAST(NULL AS DOUBLE) AS `high`,
+                  CAST(NULL AS DOUBLE) AS `low`,
+                  CAST(NULL AS DOUBLE) AS `close`,
+                  CAST(NULL AS DOUBLE) AS `volume`,
+                  CAST(NULL AS DOUBLE) AS `amount`,
+                  CAST(NULL AS DOUBLE) AS `preclose`,
+                  CAST(NULL AS CHAR(8)) AS `tradestatus`
+                WHERE 1 = 0
+                """
+            )
+            with self.engine.begin() as conn:
+                conn.execute(empty_stmt)
+            return
+
+        meta = self._column_meta(source)
+        mapping = {
+            "code": ["code"],
+            "date": ["date"],
+            "open": ["open"],
+            "high": ["high"],
+            "low": ["low"],
+            "close": ["close"],
+            "volume": ["volume"],
+            "amount": ["amount"],
+            "tradestatus": ["tradestatus", "tradeStatus"],
+            "preclose": ["preclose"],
+        }
+        select_cols: list[str] = []
+        for target, candidates in mapping.items():
+            for col in candidates:
+                if col in meta:
+                    expr = f"`{col}` AS `{target}`" if col != target else f"`{col}`"
+                    select_cols.append(expr)
+                    break
+        if "date" in meta and "trade_date" not in {c.split(" AS ")[-1].strip("`") for c in select_cols}:
+            select_cols.append("CAST(`date` AS DATE) AS `trade_date`")
+
+        if not select_cols or "code" not in {c.split(" AS ")[-1].strip('`') for c in select_cols}:
+            self.logger.warning(
+                "源表 %s 缺少必需列，将创建空视图 %s。",
+                source,
+                VIEW_FACT_STOCK_DAILY,
+            )
+            self._drop_relation(VIEW_FACT_STOCK_DAILY)
+            empty_stmt = text(
+                f"""
+                CREATE OR REPLACE VIEW `{VIEW_FACT_STOCK_DAILY}` AS
+                SELECT
+                  CAST(NULL AS CHAR(20)) AS `code`,
+                  CAST(NULL AS DATE) AS `date`,
+                  CAST(NULL AS DATE) AS `trade_date`,
+                  CAST(NULL AS DOUBLE) AS `open`,
+                  CAST(NULL AS DOUBLE) AS `high`,
+                  CAST(NULL AS DOUBLE) AS `low`,
+                  CAST(NULL AS DOUBLE) AS `close`,
+                  CAST(NULL AS DOUBLE) AS `volume`,
+                  CAST(NULL AS DOUBLE) AS `amount`,
+                  CAST(NULL AS DOUBLE) AS `preclose`,
+                  CAST(NULL AS CHAR(8)) AS `tradestatus`
+                WHERE 1 = 0
+                """
+            )
+            with self.engine.begin() as conn:
+                conn.execute(empty_stmt)
+            return
+
+        columns_sql = ", ".join(select_cols)
+        self._drop_relation(VIEW_FACT_STOCK_DAILY)
+        stmt = text(
+            f"""
+            CREATE OR REPLACE VIEW `{VIEW_FACT_STOCK_DAILY}` AS
+            SELECT {columns_sql}
+            FROM `{source}`
+            """
+        )
+        with self.engine.begin() as conn:
+            conn.execute(stmt)
+        self.logger.info("已创建/更新事实视图 %s。", VIEW_FACT_STOCK_DAILY)
+
+    def _ensure_index_membership_view(self) -> None:
+        parts: list[str] = []
+        index_tables = [
+            ("hs300", "index_hs300_members"),
+            ("zz500", "index_zz500_members"),
+            ("sz50", "index_sz50_members"),
+        ]
+        for name, table in index_tables:
+            if not self._table_exists(table):
+                continue
+            parts.append(
+                f"SELECT '{name}' AS `index_name`, `date` AS `snapshot_date`, `code` FROM `{table}`"
+            )
+
+        self._drop_relation(VIEW_DIM_INDEX_MEMBERSHIP_SNAPSHOT)
+        if not parts:
+            stmt = text(
+                f"""
+                CREATE OR REPLACE VIEW `{VIEW_DIM_INDEX_MEMBERSHIP_SNAPSHOT}` AS
+                SELECT CAST(NULL AS CHAR(32)) AS `index_name`,
+                       CAST(NULL AS DATE) AS `snapshot_date`,
+                       CAST(NULL AS CHAR(20)) AS `code`
+                WHERE 1 = 0
+                """
+            )
+        else:
+            union_sql = " UNION ALL ".join(parts)
+            stmt = text(
+                f"""
+                CREATE OR REPLACE VIEW `{VIEW_DIM_INDEX_MEMBERSHIP_SNAPSHOT}` AS
+                {union_sql}
+                """
+            )
+        with self.engine.begin() as conn:
+            conn.execute(stmt)
+        self.logger.info("已创建/更新指数成分维度视图 %s。", VIEW_DIM_INDEX_MEMBERSHIP_SNAPSHOT)
+
+    def _ensure_universe_view(self) -> None:
+        if not (self._table_exists(VIEW_DIM_STOCK_BASIC) and self._table_exists(VIEW_FACT_STOCK_DAILY)):
+            self.logger.debug(
+                "依赖视图缺失（%s/%s），创建空视图 a_share_universe 以便占位。",
+                VIEW_DIM_STOCK_BASIC,
+                VIEW_FACT_STOCK_DAILY,
+            )
+            self._drop_relation(VIEW_A_SHARE_UNIVERSE)
+            empty_stmt = text(
+                f"""
+                CREATE OR REPLACE VIEW `{VIEW_A_SHARE_UNIVERSE}` AS
+                SELECT
+                  CAST(NULL AS DATE) AS `date`,
+                  CAST(NULL AS CHAR(20)) AS `code`,
+                  CAST(NULL AS CHAR(64)) AS `code_name`,
+                  CAST(NULL AS CHAR(8)) AS `tradeStatus`,
+                  CAST(NULL AS DOUBLE) AS `amount`,
+                  CAST(NULL AS DOUBLE) AS `volume`,
+                  CAST(NULL AS DOUBLE) AS `open`,
+                  CAST(NULL AS DOUBLE) AS `high`,
+                  CAST(NULL AS DOUBLE) AS `low`,
+                  CAST(NULL AS DOUBLE) AS `close`,
+                  CAST(NULL AS DATE) AS `ipoDate`,
+                  CAST(NULL AS CHAR(8)) AS `type`,
+                  CAST(NULL AS CHAR(8)) AS `status`,
+                  CAST(NULL AS SIGNED) AS `in_hs300`,
+                  CAST(NULL AS SIGNED) AS `in_zz500`,
+                  CAST(NULL AS SIGNED) AS `in_sz50`
+                WHERE 1 = 0
+                """
+            )
+            with self.engine.begin() as conn:
+                conn.execute(empty_stmt)
+            return
+
+        dim_meta = set(self._column_meta(VIEW_DIM_STOCK_BASIC).keys())
+        fact_meta = set(self._column_meta(VIEW_FACT_STOCK_DAILY).keys())
+        if not {"code", "date"}.intersection(fact_meta) or "code" not in dim_meta:
+            self.logger.warning("维度/事实视图缺少 code/date 列，跳过 a_share_universe 视图创建。")
+            return
+
+        date_ref = "trade_date" if "trade_date" in fact_meta else "date"
+        date_expr = f"f.`{date_ref}`"
+        trade_status_expr = "b.`tradeStatus`" if "tradeStatus" in dim_meta else "NULL"
+        amount_expr = "f.`amount`" if "amount" in fact_meta else "NULL"
+        volume_expr = "f.`volume`" if "volume" in fact_meta else "NULL"
+        close_expr = "f.`close`" if "close" in fact_meta else "NULL"
+        open_expr = "f.`open`" if "open" in fact_meta else "NULL"
+        high_expr = "f.`high`" if "high" in fact_meta else "NULL"
+        low_expr = "f.`low`" if "low" in fact_meta else "NULL"
+        ipo_expr = "b.`ipoDate`" if "ipoDate" in dim_meta else "NULL"
+        type_expr = "b.`type`" if "type" in dim_meta else "NULL"
+        status_expr = "b.`status`" if "status" in dim_meta else "NULL"
+
+        membership_exists = self._table_exists(VIEW_DIM_INDEX_MEMBERSHIP_SNAPSHOT)
+        membership_select = ""
+        membership_join = ""
+        if membership_exists:
+            membership_select = """
+              ,im.`in_hs300`
+              ,im.`in_zz500`
+              ,im.`in_sz50`
+            """
+            membership_join = (
+                f"""
+                LEFT JOIN (
+                  SELECT
+                    im.`code`,
+                    MAX(CASE WHEN im.`index_name` = 'hs300' THEN 1 ELSE 0 END) AS `in_hs300`,
+                    MAX(CASE WHEN im.`index_name` = 'zz500' THEN 1 ELSE 0 END) AS `in_zz500`,
+                    MAX(CASE WHEN im.`index_name` = 'sz50' THEN 1 ELSE 0 END) AS `in_sz50`
+                  FROM `{VIEW_DIM_INDEX_MEMBERSHIP_SNAPSHOT}` im
+                  JOIN (
+                    SELECT `index_name`, MAX(`snapshot_date`) AS `snapshot_date`
+                    FROM `{VIEW_DIM_INDEX_MEMBERSHIP_SNAPSHOT}`
+                    GROUP BY `index_name`
+                  ) latest_snapshot
+                    ON im.`index_name` = latest_snapshot.`index_name`
+                   AND im.`snapshot_date` = latest_snapshot.`snapshot_date`
+                  GROUP BY im.`code`
+                ) im ON f.`code` = im.`code`
+                """
+            )
+
+        status_filter = "COALESCE(b.`tradeStatus`, '1') = '1'" if "tradeStatus" in dim_meta else "1 = 1"
+
+        self._drop_relation(VIEW_A_SHARE_UNIVERSE)
+        stmt = text(
+            f"""
+            CREATE OR REPLACE VIEW `{VIEW_A_SHARE_UNIVERSE}` AS
+            SELECT
+              {date_expr} AS `date`,
+              f.`code`,
+              b.`code_name`,
+              {trade_status_expr} AS `tradeStatus`,
+              {amount_expr} AS `amount`,
+              {volume_expr} AS `volume`,
+              {open_expr} AS `open`,
+              {high_expr} AS `high`,
+              {low_expr} AS `low`,
+              {close_expr} AS `close`,
+              {ipo_expr} AS `ipoDate`,
+              {type_expr} AS `type`,
+              {status_expr} AS `status`
+              {membership_select}
+            FROM `{VIEW_FACT_STOCK_DAILY}` f
+            JOIN (
+              SELECT `code`, MAX(`{date_ref}`) AS `latest_date`
+              FROM `{VIEW_FACT_STOCK_DAILY}`
+              GROUP BY `code`
+            ) latest
+              ON f.`code` = latest.`code` AND f.`{date_ref}` = latest.`latest_date`
+            JOIN `{VIEW_DIM_STOCK_BASIC}` b ON f.`code` = b.`code`
+            {membership_join}
+            WHERE {status_filter}
+              AND UPPER(COALESCE(b.`code_name`, '')) NOT LIKE '%ST%'
+            """
+        )
+        with self.engine.begin() as conn:
+            conn.execute(stmt)
+        self.logger.info("已创建/更新视图 %s。", VIEW_A_SHARE_UNIVERSE)
 
     # ---------- MA5-MA20 strategy ----------
     def _ensure_indicator_table(self, table: str) -> None:
@@ -684,12 +1054,27 @@ class SchemaManager:
                 )
             self.logger.info("指数环境快照表 %s 已添加唯一索引 %s。", table, unique_name)
 
+        run_idx = "idx_env_index_snapshot_run"
+        if not self._index_exists(table, run_idx):
+            with self.engine.begin() as conn:
+                conn.execute(
+                    text(
+                        f"""
+                        CREATE INDEX `{run_idx}`
+                        ON `{table}` (`monitor_date`, `run_id`)
+                        """
+                    )
+                )
+            self.logger.info("指数环境快照表 %s 已新增索引 %s。", table, run_idx)
+
     def _ensure_open_monitor_view(
         self,
         view: str,
         eval_table: str,
         env_table: str,
         env_index_table: str,
+        quote_table: str,
+        compat_view: str,
     ) -> None:
         if not (view and eval_table and env_table and env_index_table):
             return
@@ -710,6 +1095,34 @@ class SchemaManager:
         industry_expr = "dsi.`industry`" if dim_stock_exists else "NULL"
         board_name_expr = "dsb.`board_name`" if board_dim_exists else "NULL"
         board_code_expr = "dsb.`board_code`" if board_dim_exists else "NULL"
+        quote_join = ""
+        live_open_expr = "e.`live_open`"
+        live_high_expr = "e.`live_high`"
+        live_low_expr = "e.`live_low`"
+        live_latest_expr = "e.`live_latest`"
+        live_pct_expr = "e.`live_pct_change`"
+        live_volume_expr = "e.`live_volume`"
+        live_amount_expr = "e.`live_amount`"
+        live_gap_expr = "e.`live_gap_pct`"
+        live_intraday_expr = "e.`live_intraday_vol_ratio`"
+        if quote_table and self._table_exists(quote_table):
+            quote_join = (
+                f"""
+                LEFT JOIN `{quote_table}` q
+                  ON e.`monitor_date` = q.`monitor_date`
+                 AND e.`run_id` = q.`run_id`
+                 AND e.`code` = q.`code`
+                """
+            )
+            live_open_expr = "COALESCE(e.`live_open`, q.`live_open`)"
+            live_high_expr = "COALESCE(e.`live_high`, q.`live_high`)"
+            live_low_expr = "COALESCE(e.`live_low`, q.`live_low`)"
+            live_latest_expr = "COALESCE(e.`live_latest`, q.`live_latest`)"
+            live_pct_expr = "COALESCE(e.`live_pct_change`, q.`live_pct_change`)"
+            live_volume_expr = "COALESCE(e.`live_volume`, q.`live_volume`)"
+            live_amount_expr = "COALESCE(e.`live_amount`, q.`live_amount`)"
+            live_gap_expr = "COALESCE(e.`live_gap_pct`, q.`live_gap_pct`)"
+            live_intraday_expr = "COALESCE(e.`live_intraday_vol_ratio`, q.`live_intraday_vol_ratio`)"
 
         stmt = text(
             f"""
@@ -727,9 +1140,9 @@ class SchemaManager:
               e.`live_trade_date`,
               e.`signal_age`,
               e.`valid_days`,
-              e.`live_gap_pct`,
-              e.`live_pct_change`,
-              e.`live_intraday_vol_ratio`,
+              {live_gap_expr} AS `live_gap_pct`,
+              {live_pct_expr} AS `live_pct_change`,
+              {live_intraday_expr} AS `live_intraday_vol_ratio`,
               e.`dev_ma5`,
               e.`dev_ma20`,
               e.`dev_ma5_atr`,
@@ -764,6 +1177,12 @@ class SchemaManager:
               e.`risk_note`,
               e.`checked_at`,
               e.`snapshot_hash`,
+              {live_open_expr} AS `live_open`,
+              {live_high_expr} AS `live_high`,
+              {live_low_expr} AS `live_low`,
+              {live_latest_expr} AS `live_latest`,
+              {live_volume_expr} AS `live_volume`,
+              {live_amount_expr} AS `live_amount`,
               env.`env_weekly_asof_trade_date`,
               env.`env_weekly_risk_level`,
               env.`env_weekly_scene`,
@@ -792,6 +1211,7 @@ class SchemaManager:
               ON e.`monitor_date` = env.`monitor_date` AND e.`run_id` = env.`run_id`
             LEFT JOIN `{env_index_table}` idx
               ON e.`env_index_snapshot_hash` = idx.`snapshot_hash`
+            {quote_join}
             {stock_join}
             {board_join}
             """
@@ -799,6 +1219,18 @@ class SchemaManager:
         with self.engine.begin() as conn:
             conn.execute(stmt)
         self.logger.info("已创建/更新开盘监测宽视图 %s。", view)
+
+        if compat_view and compat_view != view:
+            self._drop_relation(compat_view)
+            compat_stmt = text(
+                f"""
+                CREATE OR REPLACE VIEW `{compat_view}` AS
+                SELECT * FROM `{view}`
+                """
+            )
+            with self.engine.begin() as conn:
+                conn.execute(compat_stmt)
+            self.logger.info("已创建/更新兼容视图 %s -> %s。", compat_view, view)
 
 
 def ensure_schema() -> None:

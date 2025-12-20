@@ -47,6 +47,7 @@ from .schema_manager import (
     TABLE_STRATEGY_OPEN_MONITOR_QUOTE,
     TABLE_STRATEGY_SIGNAL_EVENTS,
     STRATEGY_CODE_MA5_MA20_TREND,
+    VIEW_STRATEGY_OPEN_MONITOR_WIDE,
 )
 from .utils.convert import to_float as _to_float
 from .utils.logger import setup_logger
@@ -225,6 +226,7 @@ class OpenMonitorParams:
 
     # 输出表：开盘检查结果
     output_table: str = TABLE_STRATEGY_OPEN_MONITOR_EVAL
+    open_monitor_view: str = VIEW_STRATEGY_OPEN_MONITOR_WIDE
 
     # 回看近 N 个交易日的 BUY 信号
     signal_lookback_days: int = 3
@@ -293,10 +295,10 @@ class OpenMonitorParams:
     unique_code_latest_date_only: bool = True
 
     # 输出模式：FULL 保留全部字段，COMPACT 只保留核心字段
-    output_mode: str = "FULl"
+    output_mode: str = "FULL"
 
-    # 环境快照持久化：默认关闭，防止 open_monitor 写入 env 表
-    persist_env_snapshot: bool = False
+    # 环境快照持久化：与行情/评估表保持一致，默认写入
+    persist_env_snapshot: bool = True
 
     @classmethod
     def from_config(cls) -> "OpenMonitorParams":
@@ -389,6 +391,10 @@ class OpenMonitorParams:
             strategy_code=str(sec.get("strategy_code", default_strategy_code)).strip()
             or default_strategy_code,
             output_table=str(sec.get("output_table", cls.output_table)).strip() or cls.output_table,
+            open_monitor_view=str(
+                sec.get("open_monitor_view", cls.open_monitor_view)
+            ).strip()
+            or cls.open_monitor_view,
             signal_lookback_days=_get_int("signal_lookback_days", cls.signal_lookback_days),
             quote_source=quote_source,
             cross_valid_days=_get_int("cross_valid_days", cls.cross_valid_days),
@@ -550,7 +556,7 @@ class MA5MA20OpenMonitorRunner:
         return 240
 
     def _calc_run_id(self, ts: dt.datetime) -> str:
-        bucket_minutes = max(int(self.params.run_id_minutes or 5), 1)
+        window_minutes = max(int(self.params.run_id_minutes or 5), 1)
 
         auction_start = dt.time(9, 15)
         lunch_break_start = dt.time(11, 30)
@@ -566,11 +572,9 @@ class MA5MA20OpenMonitorRunner:
             return "POSTCLOSE"
 
         minute_of_day = ts.hour * 60 + ts.minute
-        bucket_minute = (minute_of_day // bucket_minutes) * bucket_minutes
-        bucket_time = dt.datetime.combine(
-            ts.date(), dt.time(bucket_minute // 60, bucket_minute % 60)
-        )
-        return bucket_time.strftime("%Y-%m-%d %H:%M")
+        slot_minute = (minute_of_day // window_minutes) * window_minutes
+        slot_time = dt.datetime.combine(ts.date(), dt.time(slot_minute // 60, slot_minute % 60))
+        return slot_time.strftime("%Y-%m-%d %H:%M")
 
     def _load_avg_volume(
         self, latest_trade_date: str, codes: List[str], window: int = 20
@@ -840,21 +844,21 @@ class MA5MA20OpenMonitorRunner:
         if not (table and monitor_date and self._table_exists(table)):
             return None
 
-        def _load_latest(match_bucket: bool) -> pd.DataFrame:
-            bucket_clause = "`run_id` = :b AND" if match_bucket else ""
+        def _load_latest(match_run_id: bool) -> pd.DataFrame:
+            run_clause = "`run_id` = :b AND" if match_run_id else ""
             stmt = text(
                 f"""
                 SELECT * FROM `{table}`
-                WHERE {bucket_clause} `monitor_date` = :d
+                WHERE {run_clause} `monitor_date` = :d
                 ORDER BY `checked_at` DESC
                 LIMIT 1
                 """
             )
 
             params: dict[str, Any] = {"d": monitor_date}
-            if match_bucket and run_id is not None:
+            if match_run_id and run_id is not None:
                 params["b"] = run_id
-            elif match_bucket:
+            elif match_run_id:
                 return pd.DataFrame()
 
             with self.db_writer.engine.begin() as conn:
@@ -862,9 +866,9 @@ class MA5MA20OpenMonitorRunner:
 
         try:
             if run_id is None:
-                df = _load_latest(match_bucket=False)
+                df = _load_latest(match_run_id=False)
             else:
-                df = _load_latest(match_bucket=True)
+                df = _load_latest(match_run_id=True)
         except Exception as exc:  # noqa: BLE001
             self.logger.debug("读取环境快照失败：%s", exc)
             return None
@@ -1104,12 +1108,12 @@ class MA5MA20OpenMonitorRunner:
             code = str(row.get("code") or "").strip()
             date_val = str(row.get("sig_date") or "").strip()
             monitor = str(row.get("monitor_date") or "").strip()
-            bucket = str(row.get("run_id") or "").strip()
-            if code and date_val and monitor and bucket:
-                existing.add((monitor, date_val, code, bucket))
+            run_id_val = str(row.get("run_id") or "").strip()
+            if code and date_val and monitor and run_id_val:
+                existing.add((monitor, date_val, code, run_id_val))
         return existing
 
-    def _delete_existing_bucket_rows(
+    def _delete_existing_run_rows(
         self, table: str, monitor_date: str, run_id: str, codes: List[str]
     ) -> int:
         if not (
@@ -3720,25 +3724,25 @@ class MA5MA20OpenMonitorRunner:
         monitor_dates = quotes["monitor_date"].dropna().astype(str).unique().tolist()
         if self._table_exists(table) and monitor_dates:
             for monitor in monitor_dates:
-                buckets = (
+                run_ids = (
                     quotes.loc[quotes["monitor_date"].astype(str) == monitor, "run_id"]
                     .dropna()
                     .astype(str)
                     .unique()
                     .tolist()
                 )
-                for bucket in buckets:
-                    bucket_codes = quotes.loc[
+                for run_id in run_ids:
+                    run_id_codes = quotes.loc[
                         (quotes["monitor_date"].astype(str) == monitor)
-                        & (quotes["run_id"].astype(str) == bucket),
+                        & (quotes["run_id"].astype(str) == run_id),
                         "code",
                     ].dropna().astype(str).unique().tolist()
-                    if bucket_codes:
-                        self._delete_existing_bucket_rows(
+                    if run_id_codes:
+                        self._delete_existing_run_rows(
                             table,
                             monitor,
-                            bucket,
-                            bucket_codes,
+                            run_id,
+                            run_id_codes,
                         )
 
         try:
@@ -3841,19 +3845,19 @@ class MA5MA20OpenMonitorRunner:
 
         if table_exists and monitor_date and codes:
             deleted_total = 0
-            buckets = (
+            run_ids = (
                 df["run_id"].dropna().astype(str).unique().tolist()
                 if "run_id" in df.columns
                 else []
             )
-            for bucket in buckets:
-                if not bucket:
+            for run_id_val in run_ids:
+                if not run_id_val:
                     continue
-                deleted_total += self._delete_existing_bucket_rows(
-                    table, monitor_date, bucket, codes
+                deleted_total += self._delete_existing_run_rows(
+                    table, monitor_date, run_id_val, codes
                 )
             if deleted_total > 0:
-                self.logger.info("检测到同 bucket 旧快照：已覆盖删除 %s 条。", deleted_total)
+                self.logger.info("检测到同 run_id 旧快照：已覆盖删除 %s 条。", deleted_total)
 
         if df.empty:
             self.logger.info("本次开盘监测结果全部为重复快照，跳过写入。")
@@ -3864,6 +3868,34 @@ class MA5MA20OpenMonitorRunner:
             self.logger.info("开盘监测结果已写入表 %s：%s 条", table, len(df))
         except Exception as exc:  # noqa: BLE001
             self.logger.error("写入开盘监测表失败：%s", exc)
+
+    def _load_open_monitor_view_data(
+        self, monitor_date: str, run_id: str | None
+    ) -> pd.DataFrame:
+        view = self.params.open_monitor_view
+        if not (view and monitor_date and self._table_exists(view)):
+            return pd.DataFrame()
+
+        clauses = ["`monitor_date` = :d"]
+        params: dict[str, Any] = {"d": monitor_date}
+        if run_id:
+            clauses.append("`run_id` = :b")
+            params["b"] = run_id
+        where_clause = " AND ".join(clauses)
+        stmt = text(
+            f"""
+            SELECT *
+            FROM `{view}`
+            WHERE {where_clause}
+            ORDER BY `checked_at` DESC, `sig_date` DESC, `code`
+            """
+        )
+        try:
+            with self.db_writer.engine.begin() as conn:
+                return pd.read_sql_query(stmt, conn, params=params)
+        except Exception as exc:  # noqa: BLE001
+            self.logger.debug("读取开盘监测视图 %s 失败：%s", view, exc)
+            return pd.DataFrame()
 
     def _export_csv(self, df: pd.DataFrame) -> None:
         if df.empty or (not self.params.export_csv):
@@ -3966,8 +3998,8 @@ class MA5MA20OpenMonitorRunner:
         checked_at = dt.datetime.now()
         monitor_date = checked_at.date().isoformat()
         run_id = self._calc_run_id(checked_at)
-        env_snapshot_bucket = run_id
-        env_snapshot_matched_bucket = False
+        env_snapshot_run_id = run_id
+        env_snapshot_matched_run_id = False
 
         latest_trade_date, signal_dates, signals = self._load_recent_buy_signals()
         if not latest_trade_date or signals.empty:
@@ -3987,27 +4019,27 @@ class MA5MA20OpenMonitorRunner:
             monitor_date, run_id, allow_fallback=True
         )
         if env_context:
-            loaded_bucket = str(env_context.get("run_id") or "")
-            env_snapshot_bucket = loaded_bucket or env_snapshot_bucket
-            env_snapshot_matched_bucket = bool(loaded_bucket == str(run_id))
+            loaded_run_id = str(env_context.get("run_id") or "")
+            env_snapshot_run_id = loaded_run_id or env_snapshot_run_id
+            env_snapshot_matched_run_id = bool(loaded_run_id == str(run_id))
             if self.weekly_env_fallback_asof_date:
                 self.logger.info(
                     "已加载周线回退环境（asof_date=%s，run_id=%s）",
                     self.weekly_env_fallback_asof_date,
-                    env_snapshot_bucket,
+                    env_snapshot_run_id,
                 )
-            elif env_snapshot_matched_bucket:
+            elif env_snapshot_matched_run_id:
                 self.logger.info(
                     "已加载环境快照（monitor_date=%s, run_id=%s）",
                     monitor_date,
-                    env_snapshot_bucket,
+                    env_snapshot_run_id,
                 )
             else:
                 self.logger.info(
                     "已加载当日最新环境快照（monitor_date=%s，未匹配 run_id=%s，实际=%s）",
                     monitor_date,
                     run_id,
-                    env_snapshot_bucket,
+                    env_snapshot_run_id,
                 )
         if not env_context:
             self.logger.warning(
@@ -4142,7 +4174,7 @@ class MA5MA20OpenMonitorRunner:
         if not result.empty and "run_id" in result.columns:
             run_id_val = str(result.iloc[0].get("run_id") or "").strip()
             run_id = run_id_val or run_id
-            env_snapshot_matched_bucket = bool(
+            env_snapshot_matched_run_id = bool(
                 env_context
                 and str(env_context.get("run_id") or "") == str(run_id)
             )
@@ -4150,12 +4182,12 @@ class MA5MA20OpenMonitorRunner:
         if (
             self.params.persist_env_snapshot
             and env_context
-            and not env_snapshot_matched_bucket
+            and not env_snapshot_matched_run_id
         ):
             self._persist_env_snapshot(
                 env_context,
                 monitor_date,
-                run_id or env_snapshot_bucket,
+                run_id or env_snapshot_run_id,
                 checked_at,
                 weekly_gate_policy,
             )
@@ -4212,4 +4244,7 @@ class MA5MA20OpenMonitorRunner:
             )
 
         self._persist_results(result)
-        self._export_csv(result)
+        export_df = self._load_open_monitor_view_data(monitor_date, run_id)
+        if export_df.empty:
+            export_df = result
+        self._export_csv(export_df)

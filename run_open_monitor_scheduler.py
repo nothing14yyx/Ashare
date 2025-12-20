@@ -135,7 +135,6 @@ def main() -> None:
     if interval_min <= 0:
         raise ValueError("interval must be positive")
 
-    snapshot_bucket = "PREOPEN"
     ensured_monitor_date: str | None = None
 
     def _ensure_env_snapshot(now: dt.datetime) -> str:
