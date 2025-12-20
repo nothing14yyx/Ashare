@@ -12,15 +12,16 @@ from .db import DatabaseConfig, MySQLWriter
 
 STRATEGY_CODE_MA5_MA20_TREND = "MA5_MA20_TREND"
 
-# 统一策略信号体系表命名：把旧的 strategy_ma5_ma20_* 收敛到 strategy_*
-TABLE_STRATEGY_SIGNALS = "strategy_signals"
-TABLE_STRATEGY_SIGNAL_INDICATORS = "strategy_signal_indicators"
+# 统一策略信号体系表命名：按单一职责拆分
+TABLE_MARKET_INDICATOR_DAILY = "market_indicator_daily"
+TABLE_STRATEGY_SIGNAL_EVENTS = "strategy_signal_events"
 TABLE_STRATEGY_SIGNAL_CANDIDATES = "strategy_signal_candidates"
 VIEW_STRATEGY_SIGNAL_CANDIDATES = "v_strategy_signal_candidates"
 
 # 开盘监测输出
 TABLE_STRATEGY_OPEN_MONITOR_EVAL = "strategy_open_monitor_eval"
 TABLE_STRATEGY_OPEN_MONITOR_ENV = "strategy_open_monitor_env"
+TABLE_STRATEGY_OPEN_MONITOR_QUOTE = "strategy_open_monitor_quote"
 VIEW_STRATEGY_OPEN_MONITOR_WIDE = "v_strategy_open_monitor_wide"
 
 # 大盘/指数环境快照
@@ -29,7 +30,8 @@ TABLE_ENV_INDEX_SNAPSHOT = "strategy_env_index_snapshot"
 
 @dataclass(frozen=True)
 class TableNames:
-    signals_table: str
+    indicator_table: str
+    signal_events_table: str
     candidates_table: str
     candidates_view: str
     candidates_as_view: bool
@@ -37,6 +39,7 @@ class TableNames:
     env_snapshot_table: str
     env_index_snapshot_table: str
     open_monitor_view: str
+    open_monitor_quote_table: str
 
 
 class SchemaManager:
@@ -48,13 +51,17 @@ class SchemaManager:
     def ensure_all(self) -> None:
         tables = self._resolve_table_names()
 
-        self._ensure_signals_table(tables.signals_table)
+        self._ensure_indicator_table(tables.indicator_table)
+        self._ensure_signal_events_table(tables.signal_events_table)
         if tables.candidates_as_view:
-            self._ensure_candidates_view(tables.candidates_view, tables.signals_table)
+            self._ensure_candidates_view(
+                tables.candidates_view, tables.signal_events_table, tables.indicator_table
+            )
         else:
             self._ensure_candidates_table(tables.candidates_table)
 
         self._ensure_open_monitor_eval_table(tables.open_monitor_eval_table)
+        self._ensure_open_monitor_quote_table(tables.open_monitor_quote_table)
         self._ensure_env_snapshot_table(tables.env_snapshot_table)
         self._ensure_env_index_snapshot_table(tables.env_index_snapshot_table)
         self._ensure_open_monitor_view(
@@ -68,10 +75,19 @@ class SchemaManager:
         strat_cfg = get_section("strategy_ma5_ma20_trend") or {}
         open_monitor_cfg = get_section("open_monitor") or {}
 
-        default_signals = strat_cfg.get("signals_table", TABLE_STRATEGY_SIGNALS)
-        signals_table = (
-            str(open_monitor_cfg.get("signals_table", default_signals)).strip()
-            or TABLE_STRATEGY_SIGNALS
+        default_indicator = strat_cfg.get("indicator_table", TABLE_MARKET_INDICATOR_DAILY)
+        indicator_table = (
+            str(open_monitor_cfg.get("indicator_table", default_indicator)).strip()
+            or TABLE_MARKET_INDICATOR_DAILY
+        )
+        default_events = (
+            strat_cfg.get("signal_events_table")
+            or strat_cfg.get("signals_table")
+            or TABLE_STRATEGY_SIGNAL_EVENTS
+        )
+        signal_events_table = (
+            str(open_monitor_cfg.get("signal_events_table", default_events)).strip()
+            or TABLE_STRATEGY_SIGNAL_EVENTS
         )
         candidates_table = (
             str(strat_cfg.get("candidates_table", TABLE_STRATEGY_SIGNAL_CANDIDATES)).strip()
@@ -109,9 +125,19 @@ class SchemaManager:
             ).strip()
             or VIEW_STRATEGY_OPEN_MONITOR_WIDE
         )
+        open_monitor_quote_table = (
+            str(
+                open_monitor_cfg.get(
+                    "quote_table",
+                    TABLE_STRATEGY_OPEN_MONITOR_QUOTE,
+                )
+            ).strip()
+            or TABLE_STRATEGY_OPEN_MONITOR_QUOTE
+        )
 
         return TableNames(
-            signals_table=signals_table,
+            indicator_table=indicator_table,
+            signal_events_table=signal_events_table,
             candidates_table=candidates_table,
             candidates_view=candidates_view,
             candidates_as_view=candidates_as_view,
@@ -119,6 +145,7 @@ class SchemaManager:
             env_snapshot_table=env_snapshot_table,
             env_index_snapshot_table=env_index_snapshot_table,
             open_monitor_view=open_monitor_view,
+            open_monitor_quote_table=open_monitor_quote_table,
         )
 
     # ---------- generic helpers ----------
@@ -263,9 +290,9 @@ class SchemaManager:
         self.logger.info("已创建表 %s。", table)
 
     # ---------- MA5-MA20 strategy ----------
-    def _ensure_signals_table(self, table: str) -> None:
+    def _ensure_indicator_table(self, table: str) -> None:
         columns = {
-            "date": "DATE NOT NULL",
+            "trade_date": "DATE NOT NULL",
             "code": "VARCHAR(20) NOT NULL",
             "close": "DOUBLE NULL",
             "volume": "DOUBLE NULL",
@@ -283,25 +310,44 @@ class SchemaManager:
             "kdj_d": "DOUBLE NULL",
             "kdj_j": "DOUBLE NULL",
             "atr14": "DOUBLE NULL",
-            "stop_ref": "DOUBLE NULL",
             "ret_10": "DOUBLE NULL",
             "ret_20": "DOUBLE NULL",
             "limit_up_cnt_20": "DOUBLE NULL",
             "ma20_bias": "DOUBLE NULL",
             "yearline_state": "VARCHAR(50) NULL",
-            "risk_tag": "VARCHAR(255) NULL",
-            "risk_note": "VARCHAR(255) NULL",
-            "signal": "VARCHAR(10) NULL",
-            "reason": "VARCHAR(255) NULL",
         }
         if not self._table_exists(table):
-            self._create_table(table, columns, primary_key=("date", "code"))
+            self._create_table(table, columns, primary_key=("trade_date", "code"))
             return
         self._add_missing_columns(table, columns)
 
+    def _ensure_signal_events_table(self, table: str) -> None:
+        columns = {
+            "sig_date": "DATE NOT NULL",
+            "code": "VARCHAR(20) NOT NULL",
+            "strategy_code": "VARCHAR(32) NOT NULL",
+            "signal": "VARCHAR(10) NULL",
+            "reason": "VARCHAR(255) NULL",
+            "risk_tag": "VARCHAR(255) NULL",
+            "risk_note": "VARCHAR(255) NULL",
+            "stop_ref": "DOUBLE NULL",
+            "extra_json": "TEXT NULL",
+        }
+        if not self._table_exists(table):
+            self._create_table(
+                table,
+                columns,
+                primary_key=("sig_date", "code", "strategy_code"),
+            )
+            return
+        self._add_missing_columns(table, columns)
+        self._ensure_varchar_length(table, "risk_tag", 255)
+        self._ensure_varchar_length(table, "risk_note", 255)
+        self._ensure_varchar_length(table, "reason", 255)
+
     def _ensure_candidates_table(self, table: str) -> None:
         columns = {
-            "date": "DATE NOT NULL",
+            "sig_date": "DATE NOT NULL",
             "code": "VARCHAR(20) NOT NULL",
             "close": "DOUBLE NULL",
             "ma5": "DOUBLE NULL",
@@ -320,22 +366,29 @@ class SchemaManager:
             "reason": "VARCHAR(255) NULL",
         }
         if not self._table_exists(table):
-            self._create_table(table, columns, primary_key=("date", "code"))
+            self._create_table(table, columns, primary_key=("sig_date", "code"))
             return
         self._add_missing_columns(table, columns)
 
-    def _ensure_candidates_view(self, view: str, signals_table: str) -> None:
+    def _ensure_candidates_view(
+        self, view: str, events_table: str, indicator_table: str
+    ) -> None:
         stmt = text(
             f"""
             CREATE OR REPLACE VIEW `{view}` AS
             SELECT
-              `date`,`code`,`close`,
-              `ma5`,`ma20`,`ma60`,`ma250`,
-              `vol_ratio`,`macd_hist`,`kdj_k`,`kdj_d`,`atr14`,`stop_ref`,
-              `yearline_state`,`risk_tag`,`risk_note`,
-              `reason`
-            FROM `{signals_table}`
-            WHERE `signal` = 'BUY'
+              e.`sig_date`,
+              e.`code`,
+              ind.`close`,
+              ind.`ma5`,ind.`ma20`,ind.`ma60`,ind.`ma250`,
+              ind.`vol_ratio`,ind.`macd_hist`,ind.`kdj_k`,ind.`kdj_d`,ind.`atr14`,
+              e.`stop_ref`,
+              ind.`yearline_state`,e.`risk_tag`,e.`risk_note`,
+              e.`reason`
+            FROM `{events_table}` e
+            LEFT JOIN `{indicator_table}` ind
+              ON e.`sig_date` = ind.`trade_date` AND e.`code` = ind.`code`
+            WHERE e.`signal` = 'BUY'
             """
         )
         with self.engine.begin() as conn:
@@ -343,6 +396,32 @@ class SchemaManager:
         self.logger.info("已创建/更新候选视图 %s。", view)
 
     # ---------- Open monitor ----------
+    def _ensure_open_monitor_quote_table(self, table: str) -> None:
+        columns = {
+            "monitor_date": "DATE NOT NULL",
+            "dedupe_bucket": "VARCHAR(32) NOT NULL",
+            "code": "VARCHAR(20) NOT NULL",
+            "live_trade_date": "DATE NULL",
+            "live_open": "DOUBLE NULL",
+            "live_high": "DOUBLE NULL",
+            "live_low": "DOUBLE NULL",
+            "live_latest": "DOUBLE NULL",
+            "live_volume": "DOUBLE NULL",
+            "live_amount": "DOUBLE NULL",
+            "live_gap_pct": "DOUBLE NULL",
+            "live_pct_change": "DOUBLE NULL",
+            "live_intraday_vol_ratio": "DOUBLE NULL",
+        }
+        if not self._table_exists(table):
+            self._create_table(
+                table,
+                columns,
+                primary_key=("monitor_date", "dedupe_bucket", "code"),
+            )
+            return
+        self._add_missing_columns(table, columns)
+        self._ensure_varchar_length(table, "dedupe_bucket", 32)
+
     def _ensure_open_monitor_eval_table(self, table: str) -> None:
         columns = {
             "monitor_date": "VARCHAR(10) NOT NULL",
