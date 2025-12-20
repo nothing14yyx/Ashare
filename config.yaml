@@ -129,7 +129,8 @@ strategy_ma5_ma20_trend:
   pullback_band: 0.01
   kdj_low_threshold: 30
 
-  signals_table: strategy_signals
+  indicator_table: market_indicator_daily
+  signal_events_table: strategy_signal_events
   candidates_table: strategy_signal_candidates  # 仅在 candidates_as_view=false 时写表
 
   # 用视图替代 candidates 表（更简洁：候选清单实时从 signals 最新日筛选）
@@ -142,8 +143,11 @@ strategy_ma5_ma20_trend:
 # 开盘监测：检查“前一交易日收盘 BUY 信号”是否可在今日开盘执行
 open_monitor:
   enabled: true
-  # signals_table 默认沿用 strategy_ma5_ma20_trend.signals_table，可显式覆盖
-  # signals_table: strategy_signals
+  # signal_events_table 默认沿用 strategy_ma5_ma20_trend.signal_events_table，可显式覆盖
+  # indicator_table 默认沿用 strategy_ma5_ma20_trend.indicator_table
+  # signal_events_table: strategy_signal_events
+  # indicator_table: market_indicator_daily
+  quote_table: strategy_open_monitor_quote
   output_table: strategy_open_monitor_eval
   # 指数代码与回看窗口
   index_code: sh.000001

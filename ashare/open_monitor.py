@@ -1,14 +1,14 @@
 """开盘监测：检查“前一交易日收盘信号”在今日开盘是否仍可执行。
 
 目标：
-- 读取 strategy_signals 中“最新交易日”的 BUY 信号（通常是昨天收盘跑出来的）。
+- 读取 strategy_signal_events 中“最新交易日”的 BUY 信号（通常是昨天收盘跑出来的）。
 - 在开盘/集合竞价阶段拉取实时行情（今开/最新价），做二次过滤：
   - 高开过多（追高风险/买不到合理价）
   - 低开破位（跌破 MA20 / 大幅低开）
   - 涨停（大概率买不到）
 
 输出：
-- 可选写入 MySQL：strategy_open_monitor（默认 append）
+- 可选写入 MySQL：strategy_open_monitor_eval、strategy_open_monitor_quote（默认 append）
 - 可选导出 CSV 到 output/open_monitor
 
 注意：
@@ -41,9 +41,12 @@ from .env_snapshot_utils import resolve_weekly_asof_date
 from .ma5_ma20_trend_strategy import _atr, _macd
 from .schema_manager import (
     TABLE_ENV_INDEX_SNAPSHOT,
+    TABLE_MARKET_INDICATOR_DAILY,
     TABLE_STRATEGY_OPEN_MONITOR_ENV,
     TABLE_STRATEGY_OPEN_MONITOR_EVAL,
-    TABLE_STRATEGY_SIGNALS,
+    TABLE_STRATEGY_OPEN_MONITOR_QUOTE,
+    TABLE_STRATEGY_SIGNAL_EVENTS,
+    STRATEGY_CODE_MA5_MA20_TREND,
 )
 from .utils.convert import to_float as _to_float
 from .utils.logger import setup_logger
@@ -214,8 +217,11 @@ class OpenMonitorParams:
 
     enabled: bool = True
 
-    # 信号来源表：默认沿用策略 signals_table（默认 strategy_signals）
-    signals_table: str = TABLE_STRATEGY_SIGNALS
+    # 信号来源表：默认使用 strategy_signal_events
+    signal_events_table: str = TABLE_STRATEGY_SIGNAL_EVENTS
+    indicator_table: str = TABLE_MARKET_INDICATOR_DAILY
+    quote_table: str = TABLE_STRATEGY_OPEN_MONITOR_QUOTE
+    strategy_code: str = STRATEGY_CODE_MA5_MA20_TREND
 
     # 输出表：开盘检查结果
     output_table: str = TABLE_STRATEGY_OPEN_MONITOR_EVAL
@@ -298,12 +304,20 @@ class OpenMonitorParams:
         if not isinstance(sec, dict):
             sec = {}
 
-        # 默认 signals_table 与策略保持一致
+        # 默认信号/指标表与策略保持一致
         strat = get_section("strategy_ma5_ma20_trend") or {}
         if isinstance(strat, dict):
-            default_signals = strat.get("signals_table", cls.signals_table)
+            default_indicator = strat.get("indicator_table", cls.indicator_table)
+            default_events = (
+                strat.get("signal_events_table")
+                or strat.get("signals_table")
+                or cls.signal_events_table
+            )
+            default_strategy_code = strat.get("strategy_code", STRATEGY_CODE_MA5_MA20_TREND)
         else:
-            default_signals = cls.signals_table
+            default_indicator = cls.indicator_table
+            default_events = cls.signal_events_table
+            default_strategy_code = STRATEGY_CODE_MA5_MA20_TREND
 
         logger = logging.getLogger(__name__)
 
@@ -365,7 +379,15 @@ class OpenMonitorParams:
 
         return cls(
             enabled=_get_bool("enabled", cls.enabled),
-            signals_table=str(sec.get("signals_table", default_signals)).strip() or default_signals,
+            signal_events_table=str(
+                sec.get("signal_events_table", default_events)
+            ).strip()
+            or default_events,
+            indicator_table=str(sec.get("indicator_table", default_indicator)).strip()
+            or default_indicator,
+            quote_table=str(sec.get("quote_table", cls.quote_table)).strip() or cls.quote_table,
+            strategy_code=str(sec.get("strategy_code", default_strategy_code)).strip()
+            or default_strategy_code,
             output_table=str(sec.get("output_table", cls.output_table)).strip() or cls.output_table,
             signal_lookback_days=_get_int("signal_lookback_days", cls.signal_lookback_days),
             quote_source=quote_source,
@@ -1256,7 +1278,8 @@ class MA5MA20OpenMonitorRunner:
         return {d: i for i, d in enumerate(dates)}
 
     def _load_recent_buy_signals(self) -> Tuple[str | None, List[str], pd.DataFrame]:
-        table = self.params.signals_table
+        events_table = self.params.signal_events_table
+        indicator_table = self.params.indicator_table
         monitor_date = dt.date.today().isoformat()
         # 严格最近 N 个交易日窗口：只由 signal_lookback_days 决定
         lookback = max(int(self.params.signal_lookback_days or 0), 1)
@@ -1264,11 +1287,18 @@ class MA5MA20OpenMonitorRunner:
         try:
             with self.db_writer.engine.begin() as conn:
                 max_df = pd.read_sql_query(
-                    text(f"SELECT MAX(`date`) AS max_date FROM `{table}`"),
+                    text(
+                        f"""
+                        SELECT MAX(`sig_date`) AS max_date
+                        FROM `{events_table}`
+                        WHERE `strategy_code` = :strategy
+                        """
+                    ),
                     conn,
+                    params={"strategy": self.params.strategy_code},
                 )
         except Exception as exc:  # noqa: BLE001
-            self.logger.error("读取 signals_table=%s 失败：%s", table, exc)
+            self.logger.error("读取 signal_events_table=%s 失败：%s", events_table, exc)
             return None, [], pd.DataFrame()
 
         if max_df.empty:
@@ -1280,20 +1310,26 @@ class MA5MA20OpenMonitorRunner:
 
         latest_trade_date = str(max_date)[:10]
 
-        # 1) 先取严格“最近 N 个交易日窗口”（优先日线表；无日线表则回退 signals_table 的日期序列）
+        # 1) 先取严格“最近 N 个交易日窗口”（优先日线表；无日线表则回退信号/指标表的日期序列）
         base_table = self._daily_table()
+        date_col = "date"
         if not self._table_exists(base_table):
-            base_table = table
+            if self._table_exists(indicator_table):
+                base_table = indicator_table
+                date_col = "trade_date"
+            else:
+                base_table = events_table
+                date_col = "sig_date"
 
         try:
             with self.db_writer.engine.begin() as conn:
                 trade_dates_df = pd.read_sql_query(
                     text(
                         f"""
-                        SELECT DISTINCT CAST(`date` AS CHAR) AS d
+                        SELECT DISTINCT CAST(`{date_col}` AS CHAR) AS d
                         FROM `{base_table}`
-                        WHERE `date` <= :base_date
-                        ORDER BY `date` DESC
+                        WHERE `{date_col}` <= :base_date
+                        ORDER BY `{date_col}` DESC
                         LIMIT :n
                         """
                     ),
@@ -1324,16 +1360,21 @@ class MA5MA20OpenMonitorRunner:
                 buy_dates_df = pd.read_sql_query(
                     text(
                         f"""
-                        SELECT DISTINCT `date`
-                        FROM `{table}`
+                        SELECT DISTINCT `sig_date`
+                        FROM `{events_table}`
                         WHERE `signal` = 'BUY'
-                          AND `date` <= :latest
-                          AND `date` >= :earliest
-                        ORDER BY `date` DESC
+                          AND `strategy_code` = :strategy
+                          AND `sig_date` <= :latest
+                          AND `sig_date` >= :earliest
+                        ORDER BY `sig_date` DESC
                         """
                     ),
                     conn,
-                    params={"latest": window_latest, "earliest": window_earliest},
+                    params={
+                        "latest": window_latest,
+                        "earliest": window_earliest,
+                        "strategy": self.params.strategy_code,
+                    },
                 )
         except Exception as exc:  # noqa: BLE001
             self.logger.error("读取窗口内 BUY 信号日期失败：%s", exc)
@@ -1349,7 +1390,7 @@ class MA5MA20OpenMonitorRunner:
             )
             return latest_trade_date, [], pd.DataFrame()
 
-        signal_dates = [str(v)[:10] for v in buy_dates_df["date"].tolist() if str(v).strip()]
+        signal_dates = [str(v)[:10] for v in buy_dates_df["sig_date"].tolist() if str(v).strip()]
         self.logger.info(
             "回看最近 %s 个交易日窗口（%s~%s，最新=%s）BUY 信号：%s",
             lookback,
@@ -1359,9 +1400,90 @@ class MA5MA20OpenMonitorRunner:
             signal_dates,
         )
 
-        available_cols = set(self._get_table_columns(table))
+        events_stmt = text(
+            f"""
+            SELECT
+              `sig_date`,
+              `code`,
+              `signal`,
+              `reason`,
+              `risk_tag`,
+              `risk_note`,
+              `stop_ref`
+            FROM `{events_table}`
+            WHERE `sig_date` IN :dates
+              AND `signal` = 'BUY'
+              AND `strategy_code` = :strategy
+            """
+        ).bindparams(bindparam("dates", expanding=True))
+
+        with self.db_writer.engine.begin() as conn:
+            try:
+                events_df = pd.read_sql_query(
+                    events_stmt,
+                    conn,
+                    params={"dates": signal_dates, "strategy": self.params.strategy_code},
+                )
+            except Exception as exc:  # noqa: BLE001
+                self.logger.error("读取 %s BUY 信号失败：%s", events_table, exc)
+                return latest_trade_date, signal_dates, pd.DataFrame()
+
+        if events_df.empty:
+            self.logger.info("%s 内无 BUY 信号，跳过开盘监测。", signal_dates)
+            return latest_trade_date, signal_dates, events_df
+
+        events_df["code"] = events_df["code"].astype(str)
+        events_df["sig_date"] = pd.to_datetime(events_df["sig_date"], errors="coerce")
+
+        indicator_cols = [
+            "trade_date",
+            "code",
+            "close",
+            "ma5",
+            "ma20",
+            "ma60",
+            "ma250",
+            "vol_ratio",
+            "macd_hist",
+            "kdj_k",
+            "kdj_d",
+            "atr14",
+            "ret_10",
+            "ret_20",
+            "limit_up_cnt_20",
+            "ma20_bias",
+            "yearline_state",
+        ]
+        ind_df = pd.DataFrame()
+        if indicator_table and self._table_exists(indicator_table):
+            try:
+                with self.db_writer.engine.begin() as conn:
+                    ind_df = pd.read_sql_query(
+                        text(
+                            f"""
+                            SELECT {",".join(f"`{c}`" for c in indicator_cols)}
+                            FROM `{indicator_table}`
+                            WHERE `trade_date` IN :dates AND `code` IN :codes
+                            """
+                        ).bindparams(bindparam("dates", expanding=True), bindparam("codes", expanding=True)),
+                        conn,
+                        params={
+                            "dates": signal_dates,
+                            "codes": events_df["code"].dropna().astype(str).unique().tolist(),
+                        },
+                    )
+            except Exception as exc:  # noqa: BLE001
+                self.logger.debug("读取指标表 %s 失败，将跳过指标合并：%s", indicator_table, exc)
+                ind_df = pd.DataFrame()
+
+        merged = events_df.copy()
+        if not ind_df.empty:
+            ind_df = ind_df.rename(columns={"trade_date": "sig_date"})
+            ind_df["sig_date"] = pd.to_datetime(ind_df["sig_date"], errors="coerce")
+            merged = merged.merge(ind_df, on=["sig_date", "code"], how="left")
+
         base_cols = [
-            "date",
+            "sig_date",
             "code",
             "close",
             "ma5",
@@ -1376,6 +1498,7 @@ class MA5MA20OpenMonitorRunner:
             "stop_ref",
             "signal",
             "reason",
+            "yearline_state",
         ]
         optional_cols = [
             "ret_10",
@@ -1385,64 +1508,41 @@ class MA5MA20OpenMonitorRunner:
             "risk_tag",
             "risk_note",
         ]
-        select_cols = base_cols + [c for c in optional_cols if c in available_cols]
-        col_sql = ",".join([f"`{c}`" for c in select_cols])
+        for col in base_cols + optional_cols:
+            if col not in merged.columns:
+                merged[col] = None
 
-        stmt = text(
-            f"""
-            SELECT {col_sql}
-            FROM `{table}`
-            WHERE `date` IN :dates AND `signal` = 'BUY'
-            """
-        ).bindparams(bindparam("dates", expanding=True))
-
-        with self.db_writer.engine.begin() as conn:
-            try:
-                df = pd.read_sql_query(stmt, conn, params={"dates": signal_dates})
-            except Exception as exc:  # noqa: BLE001
-                self.logger.error("读取 %s BUY 信号失败：%s", table, exc)
-                return latest_trade_date, signal_dates, pd.DataFrame()
-
-        if df.empty:
-            self.logger.info("%s 内无 BUY 信号，跳过开盘监测。", signal_dates)
-            return latest_trade_date, signal_dates, df
-
-        for col in optional_cols:
-            if col not in df.columns:
-                df[col] = None
-
-        df["code"] = df["code"].astype(str)
-        df["sig_date"] = df["date"].astype(str).str[:10]
+        merged["sig_date"] = merged["sig_date"].dt.strftime("%Y-%m-%d")
 
         # 严格去重：同一 code 只保留最新信号日（date）那条记录。
         # 这能避免同一批次 open_monitor 出现重复 code（但信号日/入选原因不同）的情况。
         if self.params.unique_code_latest_date_only:
-            before = len(df)
-            df["_date_dt"] = pd.to_datetime(df["sig_date"], errors="coerce")
-            df = df.sort_values(by=["code", "_date_dt"], ascending=[True, False])
-            df = df.drop_duplicates(subset=["code"], keep="first")
-            df = df.drop(columns=["_date_dt"], errors="ignore")
-            dropped = before - len(df)
+            before = len(merged)
+            merged["_date_dt"] = pd.to_datetime(merged["sig_date"], errors="coerce")
+            merged = merged.sort_values(by=["code", "_date_dt"], ascending=[True, False])
+            merged = merged.drop_duplicates(subset=["code"], keep="first")
+            merged = merged.drop(columns=["_date_dt"], errors="ignore")
+            dropped = before - len(merged)
             if dropped > 0:
                 self.logger.info(
                     "同一 code 多次触发 BUY：已按最新信号日去重 %s 条（保留 %s 条）。",
                     dropped,
-                    len(df),
+                    len(merged),
                 )
             # 同步更新 signal_dates（仅用于日志展示/后续涨跌幅回补循环），避免误解。
-            signal_dates = sorted(df["sig_date"].dropna().unique().tolist(), reverse=True)
-        min_date = df["sig_date"].min()
+            signal_dates = sorted(merged["sig_date"].dropna().unique().tolist(), reverse=True)
+        min_date = merged["sig_date"].min()
         trade_age_map = self._load_trade_age_map(latest_trade_date, str(min_date), monitor_date)
-        df["signal_age"] = df["sig_date"].map(trade_age_map)
+        merged["signal_age"] = merged["sig_date"].map(trade_age_map)
 
         try:
             for d in signal_dates:
-                codes = df.loc[df["sig_date"] == d, "code"].dropna().unique().tolist()
+                codes = merged.loc[merged["sig_date"] == d, "code"].dropna().unique().tolist()
                 pct_map = self._load_signal_day_pct_change(d, codes)
-                mask = df["sig_date"] == d
-                df.loc[mask, "_signal_day_pct_change"] = df.loc[mask, "code"].map(pct_map)
+                mask = merged["sig_date"] == d
+                merged.loc[mask, "_signal_day_pct_change"] = merged.loc[mask, "code"].map(pct_map)
         except Exception:
-            df["_signal_day_pct_change"] = None
+            merged["_signal_day_pct_change"] = None
 
         signal_prefix_map = {
             "close": "sig_close",
@@ -1459,7 +1559,7 @@ class MA5MA20OpenMonitorRunner:
             "signal": "sig_signal",
             "reason": "sig_reason",
         }
-        df = df.rename(columns={k: v for k, v in signal_prefix_map.items() if k in df.columns})
+        df = merged.rename(columns={k: v for k, v in signal_prefix_map.items() if k in merged.columns})
         for src, target in signal_prefix_map.items():
             if target not in df.columns:
                 df[target] = None
@@ -1469,29 +1569,84 @@ class MA5MA20OpenMonitorRunner:
         if not latest_trade_date or not codes:
             return pd.DataFrame()
 
-        table = self.params.signals_table
-        stmt = text(
-            f"""
-            SELECT
-              `date`,`code`,`close`,`ma5`,`ma20`,`ma60`,`ma250`,
-              `vol_ratio`,`macd_hist`,`atr14`,`stop_ref`
-            FROM `{table}`
-            WHERE `date` = :d AND `code` IN :codes
-            """
-        ).bindparams(bindparam("codes", expanding=True))
+        indicator_table = self.params.indicator_table
+        events_table = self.params.signal_events_table
+        if not indicator_table or not self._table_exists(indicator_table):
+            return pd.DataFrame()
 
+        codes = [str(c) for c in codes if str(c).strip()]
+        if not codes:
+            return pd.DataFrame()
+
+        indicator_cols = [
+            "trade_date",
+            "code",
+            "close",
+            "ma5",
+            "ma20",
+            "ma60",
+            "ma250",
+            "vol_ratio",
+            "macd_hist",
+            "atr14",
+        ]
+        indicator_stmt = (
+            text(
+                f"""
+                SELECT {",".join(f"`{c}`" for c in indicator_cols)}
+                FROM `{indicator_table}`
+                WHERE `trade_date` = :d AND `code` IN :codes
+                """
+            ).bindparams(bindparam("codes", expanding=True))
+        )
         try:
             with self.db_writer.engine.begin() as conn:
-                df = pd.read_sql_query(stmt, conn, params={"d": latest_trade_date, "codes": codes})
+                ind_df = pd.read_sql_query(
+                    indicator_stmt,
+                    conn,
+                    params={"d": latest_trade_date, "codes": codes},
+                )
         except Exception as exc:  # noqa: BLE001
             self.logger.debug("读取最新指标失败，将跳过最新快照：%s", exc)
             return pd.DataFrame()
 
-        if df is None or df.empty:
+        if ind_df is None or ind_df.empty:
             return pd.DataFrame()
 
-        df["code"] = df["code"].astype(str)
-        return df
+        stop_df = pd.DataFrame()
+        if events_table and self._table_exists(events_table):
+            try:
+                with self.db_writer.engine.begin() as conn:
+                    stop_df = pd.read_sql_query(
+                        text(
+                            f"""
+                            SELECT `sig_date`,`code`,`stop_ref`
+                            FROM `{events_table}`
+                            WHERE `sig_date` = :d
+                              AND `strategy_code` = :strategy
+                              AND `code` IN :codes
+                            """
+                        ).bindparams(bindparam("codes", expanding=True)),
+                        conn,
+                        params={
+                            "d": latest_trade_date,
+                            "codes": codes,
+                            "strategy": self.params.strategy_code,
+                        },
+                    )
+            except Exception as exc:  # noqa: BLE001
+                self.logger.debug("读取 stop_ref 失败：%s", exc)
+                stop_df = pd.DataFrame()
+
+        ind_df["code"] = ind_df["code"].astype(str)
+        merged = ind_df.copy()
+        if not stop_df.empty:
+            stop_df = stop_df.rename(columns={"sig_date": "trade_date"})
+            stop_df["trade_date"] = pd.to_datetime(stop_df["trade_date"]).dt.strftime("%Y-%m-%d")
+            merged["trade_date"] = pd.to_datetime(merged["trade_date"]).dt.strftime("%Y-%m-%d")
+            merged = merged.merge(stop_df, on=["trade_date", "code"], how="left")
+        merged["trade_date"] = pd.to_datetime(merged["trade_date"]).dt.strftime("%Y-%m-%d")
+        return merged
 
     def _load_index_history(self, latest_trade_date: str) -> dict[str, Any]:
         code = str(self.params.index_code or "").strip()
@@ -3517,6 +3672,69 @@ class MA5MA20OpenMonitorRunner:
     # -------------------------
     # Persist & export
     # -------------------------
+    def _persist_quote_snapshots(self, df: pd.DataFrame) -> None:
+        if df.empty or not self.params.write_to_db:
+            return
+        table = self.params.quote_table
+        if not table:
+            return
+
+        keep_cols = [
+            "monitor_date",
+            "dedupe_bucket",
+            "code",
+            "live_trade_date",
+            "live_open",
+            "live_high",
+            "live_low",
+            "live_latest",
+            "live_volume",
+            "live_amount",
+            "live_gap_pct",
+            "live_pct_change",
+            "live_intraday_vol_ratio",
+        ]
+        for col in keep_cols:
+            if col not in df.columns:
+                df[col] = None
+        quotes = df[keep_cols].copy()
+        quotes["monitor_date"] = pd.to_datetime(quotes["monitor_date"]).dt.date
+        quotes["live_trade_date"] = pd.to_datetime(quotes["live_trade_date"]).dt.date
+        quotes["dedupe_bucket"] = quotes["dedupe_bucket"].fillna(
+            self._calc_dedupe_bucket(dt.datetime.now())
+        )
+        quotes["code"] = quotes["code"].astype(str)
+
+        monitor_dates = quotes["monitor_date"].dropna().astype(str).unique().tolist()
+        if self._table_exists(table) and monitor_dates:
+            for monitor in monitor_dates:
+                buckets = (
+                    quotes.loc[quotes["monitor_date"].astype(str) == monitor, "dedupe_bucket"]
+                    .dropna()
+                    .astype(str)
+                    .unique()
+                    .tolist()
+                )
+                for bucket in buckets:
+                    bucket_codes = quotes.loc[
+                        (quotes["monitor_date"].astype(str) == monitor)
+                        & (quotes["dedupe_bucket"].astype(str) == bucket),
+                        "code",
+                    ].dropna().astype(str).unique().tolist()
+                    if bucket_codes:
+                        self._delete_existing_bucket_rows(
+                            table,
+                            monitor,
+                            bucket,
+                            bucket_codes,
+                        )
+
+        try:
+            self.db_writer.write_dataframe(quotes, table, if_exists="append")
+            self.logger.info("开盘监测实时行情快照已写入表 %s：%s 条", table, len(quotes))
+        except Exception as exc:  # noqa: BLE001
+            self.logger.error("写入开盘监测行情快照失败：%s", exc)
+
     def _persist_results(self, df: pd.DataFrame) -> None:
         if df.empty:
             return
@@ -3583,6 +3801,9 @@ class MA5MA20OpenMonitorRunner:
         df = df.drop_duplicates(
             subset=["monitor_date", "sig_date", "code", "dedupe_bucket"]
         )
+
+        self._persist_quote_snapshots(df)
+
         if table_columns:
             keep_cols = [c for c in df.columns if c in table_columns]
             df = df[keep_cols]

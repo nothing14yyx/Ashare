@@ -6,7 +6,8 @@
   history_daily_kline（全量日线表；运行时按日期窗口截取，避免依赖 history_recent_xxx_days VIEW）
 
 输出：
-  - strategy_signals：
+  - market_indicator_daily：指标明细（按信号计算窗口写入）
+  - strategy_signal_events：信号事件（signal/reason/risk/stop 等）
       - signals_write_scope=latest：仅写入最新交易日（默认）
       - signals_write_scope=window：写入本次计算窗口内的全部交易日（用于回填历史/回测）
   - 默认通过 VIEW 列出全部 BUY 信号（历史）
@@ -32,8 +33,10 @@ from .config import get_section
 from .db import DatabaseConfig, MySQLWriter
 from .indicator_utils import consecutive_true
 from .schema_manager import (
+    STRATEGY_CODE_MA5_MA20_TREND,
+    TABLE_MARKET_INDICATOR_DAILY,
     TABLE_STRATEGY_SIGNAL_CANDIDATES,
-    TABLE_STRATEGY_SIGNALS,
+    TABLE_STRATEGY_SIGNAL_EVENTS,
     VIEW_STRATEGY_SIGNAL_CANDIDATES,
 )
 from .utils import setup_logger
@@ -66,7 +69,8 @@ class MA5MA20Params:
     kdj_low_threshold: float = 30.0
 
     # 输出表/视图
-    signals_table: str = TABLE_STRATEGY_SIGNALS
+    indicator_table: str = TABLE_MARKET_INDICATOR_DAILY
+    signal_events_table: str = TABLE_STRATEGY_SIGNAL_EVENTS
     candidates_table: str = (
         TABLE_STRATEGY_SIGNAL_CANDIDATES
     )  # 仅在 candidates_as_view=False 时写表
@@ -86,6 +90,16 @@ class MA5MA20Params:
         if not sec:
             return cls()
         kwargs = {}
+        indicator_table = sec.get("indicator_table")
+        if indicator_table is None:
+            indicator_table = sec.get("signals_indicator_table")
+        if indicator_table is not None:
+            kwargs["indicator_table"] = str(indicator_table).strip()
+        events_table = sec.get("signal_events_table")
+        if events_table is None:
+            events_table = sec.get("signals_table")
+        if events_table is not None:
+            kwargs["signal_events_table"] = str(events_table).strip()
         for k in cls.__dataclass_fields__.keys():  # type: ignore[attr-defined]
             if k in sec:
                 kwargs[k] = sec[k]
@@ -266,14 +280,20 @@ class MA5MA20StrategyRunner:
         return resolved if resolved > 0 else 1
 
     def _load_recent_buy_codes(self, latest_date: dt.date) -> set[str]:
-        table = self.params.signals_table
+        table = self.params.signal_events_table
         if not self._table_exists(table):
             return set()
 
         lookback = self._resolve_snapshot_buy_lookback()
         base_table = self._daily_table_name()
+        date_col = "date"
         if not self._table_exists(base_table):
-            base_table = table
+            if self._table_exists(self.params.indicator_table):
+                base_table = self.params.indicator_table
+                date_col = "trade_date"
+            else:
+                base_table = table
+                date_col = "sig_date"
         base_date_str = latest_date.isoformat()
 
         try:
@@ -281,10 +301,10 @@ class MA5MA20StrategyRunner:
                 trade_dates_df = pd.read_sql_query(
                     text(
                         f"""
-                        SELECT DISTINCT CAST(`date` AS CHAR) AS d
+                        SELECT DISTINCT CAST(`{date_col}` AS CHAR) AS d
                         FROM `{base_table}`
-                        WHERE `date` <= :base_date
-                        ORDER BY `date` DESC
+                        WHERE `{date_col}` <= :base_date
+                        ORDER BY `{date_col}` DESC
                         LIMIT {lookback}
                         """
                     ),
@@ -313,12 +333,17 @@ class MA5MA20StrategyRunner:
                         SELECT DISTINCT `code`
                         FROM `{table}`
                         WHERE `signal` = 'BUY'
-                          AND `date` <= :latest
-                          AND `date` >= :earliest
+                          AND `strategy_code` = :strategy
+                          AND `sig_date` <= :latest
+                          AND `sig_date` >= :earliest
                         """
                     ),
                     conn,
-                    params={"latest": window_latest, "earliest": window_earliest},
+                    params={
+                        "latest": window_latest,
+                        "earliest": window_earliest,
+                        "strategy": STRATEGY_CODE_MA5_MA20_TREND,
+                    },
                 )
         except Exception as exc:  # noqa: BLE001
             self.logger.warning("读取近期 BUY 信号代码失败：%s", exc)
@@ -882,23 +907,18 @@ class MA5MA20StrategyRunner:
             self.logger.debug("检查表 %s 是否存在失败：%s", table, exc)
             return False
 
-    def _write_signals(
+    def _write_indicator_daily(
         self, latest_date: dt.date, signals: pd.DataFrame, codes: List[str]
     ) -> None:
-        tbl = self.params.signals_table
-
+        table = self.params.indicator_table
         scope = (getattr(self.params, "signals_write_scope", "latest") or "latest").strip().lower()
         if scope not in {"latest", "window"}:
             self.logger.warning("signals_write_scope=%s 无效，已回退为 latest。", scope)
             scope = "latest"
 
-        if scope == "latest":
-            to_write = signals[signals["date"].dt.date == latest_date].copy()
-        else:
-            to_write = signals.copy()
-
-        if to_write.empty:
-            self.logger.warning("signals_write_scope=%s 下无任何信号行，已跳过写入。", scope)
+        base = signals[signals["date"].dt.date == latest_date].copy() if scope == "latest" else signals.copy()
+        if base.empty:
+            self.logger.warning("signals_write_scope=%s 下无任何指标行，已跳过写入。", scope)
             return
 
         keep_cols = [
@@ -920,57 +940,42 @@ class MA5MA20StrategyRunner:
             "kdj_d",
             "kdj_j",
             "atr14",
-            "stop_ref",
-            "signal",
-            "reason",
             "ret_10",
             "ret_20",
             "limit_up_cnt_20",
             "ma20_bias",
             "yearline_state",
-            "risk_tag",
-            "risk_note",
         ]
-        to_write = to_write[keep_cols].copy()
-        to_write["date"] = pd.to_datetime(to_write["date"]).dt.date
-        to_write["code"] = to_write["code"].astype(str)
-
-        for col in ["risk_tag", "risk_note", "reason"]:
-            if col in to_write.columns:
-                to_write[col] = (
-                    to_write[col]
-                    .fillna("")
-                    .astype(str)
-                    .str.slice(0, 250)
-                )
+        indicator_df = base[keep_cols].copy()
+        indicator_df = indicator_df.rename(columns={"date": "trade_date"})
+        indicator_df["trade_date"] = pd.to_datetime(indicator_df["trade_date"]).dt.date
+        indicator_df["code"] = indicator_df["code"].astype(str)
 
         if scope == "latest":
             delete_stmt = (
-                text(f"DELETE FROM `{tbl}` WHERE `date` = :d AND `code` IN :codes")
+                text(f"DELETE FROM `{table}` WHERE `trade_date` = :d AND `code` IN :codes")
                 .bindparams(bindparam("codes", expanding=True))
             )
-            del_codes = to_write["code"].tolist()
+            del_codes = indicator_df["code"].tolist()
             with self.db_writer.engine.begin() as conn:
                 conn.execute(delete_stmt, {"d": latest_date, "codes": del_codes})
         else:
-            start_d = min(to_write["date"])
-            end_d = max(to_write["date"])
-
+            start_d = min(indicator_df["trade_date"])
+            end_d = max(indicator_df["trade_date"])
             codes_clean = [str(c) for c in (codes or []) if str(c).strip()]
             delete_by_date_only = (not codes_clean) or (len(codes_clean) > 2000)
-
             with self.db_writer.engine.begin() as conn:
                 if delete_by_date_only:
                     delete_stmt = text(
-                        f"DELETE FROM `{tbl}` WHERE `date` BETWEEN :start_date AND :end_date"
+                        f"DELETE FROM `{table}` WHERE `trade_date` BETWEEN :start_date AND :end_date"
                     )
                     conn.execute(delete_stmt, {"start_date": start_d, "end_date": end_d})
                 else:
                     delete_stmt = (
                         text(
                             f"""
-                            DELETE FROM `{tbl}`
-                            WHERE `date` BETWEEN :start_date AND :end_date
+                            DELETE FROM `{table}`
+                            WHERE `trade_date` BETWEEN :start_date AND :end_date
                               AND `code` IN :codes
                             """
                         )
@@ -985,13 +990,120 @@ class MA5MA20StrategyRunner:
                         )
 
             self.logger.info(
-                "signals_write_scope=window：已覆盖写入 %s~%s（%s）。",
+                "signals_write_scope=window：指标已覆盖写入 %s~%s（%s）。",
                 start_d,
                 end_d,
                 "all-codes" if delete_by_date_only else f"{len(codes_clean)} codes",
             )
 
-        self.db_writer.write_dataframe(to_write, tbl, if_exists="append")
+        self.db_writer.write_dataframe(indicator_df, table, if_exists="append")
+
+    def _write_signal_events(
+        self, latest_date: dt.date, signals: pd.DataFrame, codes: List[str]
+    ) -> None:
+        table = self.params.signal_events_table
+        scope = (getattr(self.params, "signals_write_scope", "latest") or "latest").strip().lower()
+        if scope not in {"latest", "window"}:
+            self.logger.warning("signals_write_scope=%s 无效，已回退为 latest。", scope)
+            scope = "latest"
+
+        base = signals[signals["date"].dt.date == latest_date].copy() if scope == "latest" else signals.copy()
+        if base.empty:
+            self.logger.warning("signals_write_scope=%s 下无任何信号事件，已跳过写入。", scope)
+            return
+
+        keep_cols = [
+            "date",
+            "code",
+            "signal",
+            "reason",
+            "risk_tag",
+            "risk_note",
+            "stop_ref",
+        ]
+        events_df = base[keep_cols].copy()
+        events_df = events_df.rename(columns={"date": "sig_date"})
+        events_df["sig_date"] = pd.to_datetime(events_df["sig_date"]).dt.date
+        events_df["code"] = events_df["code"].astype(str)
+        events_df["strategy_code"] = STRATEGY_CODE_MA5_MA20_TREND
+        for col in ["risk_tag", "risk_note", "reason"]:
+            if col in events_df.columns:
+                events_df[col] = (
+                    events_df[col]
+                    .fillna("")
+                    .astype(str)
+                    .str.slice(0, 250)
+                )
+        events_df["extra_json"] = None
+
+        if scope == "latest":
+            delete_stmt = (
+                text(
+                    f"""
+                    DELETE FROM `{table}`
+                    WHERE `sig_date` = :d AND `code` IN :codes AND `strategy_code` = :strategy
+                    """
+                ).bindparams(bindparam("codes", expanding=True))
+            )
+            del_codes = events_df["code"].tolist()
+            with self.db_writer.engine.begin() as conn:
+                conn.execute(
+                    delete_stmt,
+                    {
+                        "d": latest_date,
+                        "codes": del_codes,
+                        "strategy": STRATEGY_CODE_MA5_MA20_TREND,
+                    },
+                )
+        else:
+            start_d = min(events_df["sig_date"])
+            end_d = max(events_df["sig_date"])
+            codes_clean = [str(c) for c in (codes or []) if str(c).strip()]
+            delete_by_date_only = (not codes_clean) or (len(codes_clean) > 2000)
+            with self.db_writer.engine.begin() as conn:
+                if delete_by_date_only:
+                    delete_stmt = text(
+                        f"""
+                        DELETE FROM `{table}`
+                        WHERE `sig_date` BETWEEN :start_date AND :end_date
+                          AND `strategy_code` = :strategy
+                        """
+                    )
+                    conn.execute(
+                        delete_stmt,
+                        {"start_date": start_d, "end_date": end_d, "strategy": STRATEGY_CODE_MA5_MA20_TREND},
+                    )
+                else:
+                    delete_stmt = (
+                        text(
+                            f"""
+                            DELETE FROM `{table}`
+                            WHERE `sig_date` BETWEEN :start_date AND :end_date
+                              AND `strategy_code` = :strategy
+                              AND `code` IN :codes
+                            """
+                        ).bindparams(bindparam("codes", expanding=True))
+                    )
+                    chunk_size = 800
+                    for i in range(0, len(codes_clean), chunk_size):
+                        part_codes = codes_clean[i : i + chunk_size]
+                        conn.execute(
+                            delete_stmt,
+                            {
+                                "start_date": start_d,
+                                "end_date": end_d,
+                                "codes": part_codes,
+                                "strategy": STRATEGY_CODE_MA5_MA20_TREND,
+                            },
+                        )
+            self.logger.info(
+                "signals_write_scope=window：事件已覆盖写入 %s~%s（%s）。",
+                start_d,
+                end_d,
+                "all-codes" if delete_by_date_only else f"{len(codes_clean)} codes",
+            )
+
+        self.db_writer.write_dataframe(events_df, table, if_exists="append")
 
     def _write_candidates(self, latest_date: dt.date, signals: pd.DataFrame) -> None:
         tbl = self.params.candidates_table
@@ -1028,7 +1140,8 @@ class MA5MA20StrategyRunner:
             "reason",
         ]
         cands = cands[keep_cols].copy()
-        cands["date"] = pd.to_datetime(cands["date"]).dt.date
+        cands = cands.rename(columns={"date": "sig_date"})
+        cands["sig_date"] = pd.to_datetime(cands["sig_date"]).dt.date
         cands["code"] = cands["code"].astype(str)
 
         self._clear_table(tbl)
@@ -1101,7 +1214,8 @@ class MA5MA20StrategyRunner:
                 ignore_index=True,
             )
 
-        self._write_signals(latest_date, sig_for_write, calc_codes)
+        self._write_indicator_daily(latest_date, sig, calc_codes)
+        self._write_signal_events(latest_date, sig_for_write, calc_codes)
         if not bool(getattr(self.params, "candidates_as_view", False)):
             self._write_candidates(latest_date, sig_for_candidates)
 

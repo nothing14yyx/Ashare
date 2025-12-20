@@ -5,7 +5,7 @@
 
 说明：
   - 读取 config.yaml 的 open_monitor 配置。
-  - 默认读取 strategy_signals “最新交易日”的 BUY 信号。
+  - 默认读取 strategy_signal_events “最新交易日”的 BUY 信号，并合并 market_indicator_daily 指标。
   - 拉取实时行情后输出“可执行/不可执行”清单，并可选写入 DB / 导出 CSV。
 """
 
