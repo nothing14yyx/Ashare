@@ -63,7 +63,7 @@ class SchemaManager:
         self._ensure_dim_stock_basic_view()
         self._ensure_fact_stock_daily_view()
         self._ensure_index_membership_view()
-        self._ensure_universe_view()
+        self._ensure_universe_table()
 
         self._ensure_indicator_table(tables.indicator_table)
         self._ensure_signal_events_table(tables.signal_events_table)

@@ -13,6 +13,7 @@ import logging
 import os
 import socket
 import time
+from typing import Any
 
 import baostock as bs
 
@@ -111,21 +112,111 @@ class BaostockSession:
 
     def logout(self) -> None:
         """登出 Baostock 并重置状态。"""
-        if not self.logged_in:
-            return
-
         try:
-            with contextlib.redirect_stdout(io.StringIO()) as buf:
-                bs.logout()
-            out = buf.getvalue().strip()
-            if out:
-                self.logger.debug("baostock: %s", out)
+            if self.logged_in:
+                with contextlib.redirect_stdout(io.StringIO()) as buf:
+                    bs.logout()
+                out = buf.getvalue().strip()
+                if out:
+                    self.logger.debug("baostock: %s", out)
         except Exception as exc:  # noqa: BLE001
             self.logger.warning("登出失败：%s", exc)
         finally:
+            # baostock 的 logout 在部分版本/异常路径下可能不会彻底关闭底层 socket，
+            # 在 -Wd 下会看到 ResourceWarning: unclosed <socket.socket ...>。
+            # 这里做一次“尽力而为”的反射式清理：只在 baostock 模块对象树里查找 socket 并关闭。
+            self._force_close_baostock_sockets()
             # 无论登出是否成功，都要清理状态，避免遗留连接或阻塞退出
             self.logged_in = False
             self._last_alive_ts = 0.0
+
+    def _force_close_baostock_sockets(self) -> None:
+        """尽最大努力关闭 baostock 库内部遗留的 socket，避免解释器退出时报 ResourceWarning。
+
+        注意：这里不会扫描全局所有对象（避免误伤 DB/HTTP 等连接），仅遍历 baostock 模块可达对象。
+        """
+        try:
+            root = bs
+        except Exception:  # noqa: BLE001
+            return
+
+        visited: set[int] = set()
+        closed_count = 0
+
+        def _close_sock(sock_obj: socket.socket) -> None:
+            nonlocal closed_count
+            try:
+                # 已关闭的 socket.close() 再调用一般是安全的，但仍做 try/except 兜底
+                sock_obj.close()
+                closed_count += 1
+            except Exception:  # noqa: BLE001
+                return
+
+        def _walk(obj: Any, depth: int) -> None:
+            if obj is None:
+                return
+            if depth > 4:
+                return
+
+            oid = id(obj)
+            if oid in visited:
+                return
+            visited.add(oid)
+
+            # 直接命中 socket
+            if isinstance(obj, socket.socket):
+                _close_sock(obj)
+                return
+
+            # 基础类型不展开
+            if isinstance(obj, (str, bytes, int, float, bool)):
+                return
+
+            # 常见容器展开
+            if isinstance(obj, (list, tuple, set, frozenset)):
+                for item in obj:
+                    _walk(item, depth + 1)
+                return
+            if isinstance(obj, dict):
+                for item in obj.values():
+                    _walk(item, depth + 1)
+                return
+
+            # 常见“连接属性名”优先探测（避免全量遍历 __dict__ 太重）
+            for attr in (
+                "sock",
+                "socket",
+                "_sock",
+                "_socket",
+                "conn",
+                "connection",
+                "client",
+                "_client",
+                "tcpCliSock",
+                "tcp_socket",
+            ):
+                try:
+                    if hasattr(obj, attr):
+                        _walk(getattr(obj, attr), depth + 1)
+                except Exception:  # noqa: BLE001
+                    continue
+
+            # 最后再尽力遍历对象字典（限制深度 + visited 防爆）
+            try:
+                obj_dict = getattr(obj, "__dict__", None)
+                if isinstance(obj_dict, dict):
+                    for v in obj_dict.values():
+                        _walk(v, depth + 1)
+            except Exception:  # noqa: BLE001
+                return
+
+        try:
+            _walk(root, 0)
+        except Exception:  # noqa: BLE001
+            return
+
+        if closed_count:
+            self.logger.debug("已强制关闭 baostock 遗留 socket：%s 个", closed_count)
 
     def ensure_alive(self, force_refresh: bool = False, force_check: bool = False) -> None:
         """确保会话可用，必要时重新登录或主动探测。
