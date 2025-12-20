@@ -6,11 +6,11 @@
   history_daily_kline（全量日线表；运行时按日期窗口截取，避免依赖 history_recent_xxx_days VIEW）
 
 输出：
-  - strategy_ma5_ma20_signals：
+  - strategy_signals：
       - signals_write_scope=latest：仅写入最新交易日（默认）
       - signals_write_scope=window：写入本次计算窗口内的全部交易日（用于回填历史/回测）
   - 默认通过 VIEW 列出全部 BUY 信号（历史）
-    （v_strategy_ma5_ma20_candidates；如需物理表可关闭 candidates_as_view）
+    （v_strategy_signal_candidates；如需物理表可关闭 candidates_as_view）
 
 说明：
   - 本实现先做“日线低频版本”作为选股/清单层。
@@ -32,9 +32,9 @@ from .config import get_section
 from .db import DatabaseConfig, MySQLWriter
 from .indicator_utils import consecutive_true
 from .schema_manager import (
-    TABLE_STRATEGY_MA5_MA20_CANDIDATES,
-    TABLE_STRATEGY_MA5_MA20_SIGNALS,
-    VIEW_STRATEGY_MA5_MA20_CANDIDATES,
+    TABLE_STRATEGY_SIGNAL_CANDIDATES,
+    TABLE_STRATEGY_SIGNALS,
+    VIEW_STRATEGY_SIGNAL_CANDIDATES,
 )
 from .utils import setup_logger
 
@@ -66,14 +66,14 @@ class MA5MA20Params:
     kdj_low_threshold: float = 30.0
 
     # 输出表/视图
-    signals_table: str = TABLE_STRATEGY_MA5_MA20_SIGNALS
+    signals_table: str = TABLE_STRATEGY_SIGNALS
     candidates_table: str = (
-        TABLE_STRATEGY_MA5_MA20_CANDIDATES
+        TABLE_STRATEGY_SIGNAL_CANDIDATES
     )  # 仅在 candidates_as_view=False 时写表
 
     # 可选：用视图替代 candidates 表（更简洁；候选清单实时从 signals 最新日筛选）
     candidates_as_view: bool = True
-    candidates_view: str = VIEW_STRATEGY_MA5_MA20_CANDIDATES
+    candidates_view: str = VIEW_STRATEGY_SIGNAL_CANDIDATES
 
     # signals 写入范围：
     # - latest：仅写入最新交易日（默认，低开销）

@@ -1,14 +1,14 @@
 """开盘监测：检查“前一交易日收盘信号”在今日开盘是否仍可执行。
 
 目标：
-- 读取 strategy_ma5_ma20_signals 中“最新交易日”的 BUY 信号（通常是昨天收盘跑出来的）。
+- 读取 strategy_signals 中“最新交易日”的 BUY 信号（通常是昨天收盘跑出来的）。
 - 在开盘/集合竞价阶段拉取实时行情（今开/最新价），做二次过滤：
   - 高开过多（追高风险/买不到合理价）
   - 低开破位（跌破 MA20 / 大幅低开）
   - 涨停（大概率买不到）
 
 输出：
-- 可选写入 MySQL：strategy_ma5_ma20_open_monitor（默认 append）
+- 可选写入 MySQL：strategy_open_monitor（默认 append）
 - 可选导出 CSV 到 output/open_monitor
 
 注意：
@@ -43,7 +43,7 @@ from .schema_manager import (
     TABLE_ENV_INDEX_SNAPSHOT,
     TABLE_STRATEGY_OPEN_MONITOR,
     TABLE_STRATEGY_OPEN_MONITOR_ENV,
-    TABLE_STRATEGY_MA5_MA20_SIGNALS,
+    TABLE_STRATEGY_SIGNALS,
 )
 from .utils.convert import to_float as _to_float
 from .utils.logger import setup_logger
@@ -214,8 +214,8 @@ class OpenMonitorParams:
 
     enabled: bool = True
 
-    # 信号来源表：默认沿用 MA5-MA20 策略 signals_table
-    signals_table: str = TABLE_STRATEGY_MA5_MA20_SIGNALS
+    # 信号来源表：默认沿用策略 signals_table（默认 strategy_signals）
+    signals_table: str = TABLE_STRATEGY_SIGNALS
 
     # 输出表：开盘检查结果
     output_table: str = TABLE_STRATEGY_OPEN_MONITOR

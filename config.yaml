@@ -129,12 +129,12 @@ strategy_ma5_ma20_trend:
   pullback_band: 0.01
   kdj_low_threshold: 30
 
-  signals_table: strategy_ma5_ma20_signals
-  candidates_table: strategy_ma5_ma20_candidates  # 仅在 candidates_as_view=false 时写表
+  signals_table: strategy_signals
+  candidates_table: strategy_signal_candidates  # 仅在 candidates_as_view=false 时写表
 
   # 用视图替代 candidates 表（更简洁：候选清单实时从 signals 最新日筛选）
   candidates_as_view: true
-  candidates_view: v_strategy_ma5_ma20_candidates
+  candidates_view: v_strategy_signal_candidates
 
   # signals 写入范围：latest=仅最新交易日（默认），window=回填本次计算窗口内全部交易日
   signals_write_scope: window
@@ -143,8 +143,8 @@ strategy_ma5_ma20_trend:
 open_monitor:
   enabled: true
   # signals_table 默认沿用 strategy_ma5_ma20_trend.signals_table，可显式覆盖
-  # signals_table: strategy_ma5_ma20_signals
-  output_table: strategy_ma5_ma20_open_monitor
+  # signals_table: strategy_signals
+  output_table: strategy_open_monitor
   # 指数代码与回看窗口
   index_code: sh.000001
   index_hist_lookback_days: 250

@@ -10,12 +10,19 @@ from sqlalchemy.engine import Engine
 from .config import get_section
 from .db import DatabaseConfig, MySQLWriter
 
+STRATEGY_CODE_MA5_MA20_TREND = "MA5_MA20_TREND"
+
+# 统一策略信号体系表命名：把旧的 strategy_ma5_ma20_* 收敛到 strategy_*
+TABLE_STRATEGY_SIGNALS = "strategy_signals"
 TABLE_STRATEGY_SIGNAL_INDICATORS = "strategy_signal_indicators"
-TABLE_STRATEGY_MA5_MA20_SIGNALS = "strategy_ma5_ma20_signals"
-TABLE_STRATEGY_MA5_MA20_CANDIDATES = "strategy_ma5_ma20_candidates"
-VIEW_STRATEGY_MA5_MA20_CANDIDATES = "v_strategy_ma5_ma20_candidates"
-TABLE_STRATEGY_OPEN_MONITOR = "strategy_ma5_ma20_open_monitor"
-TABLE_STRATEGY_OPEN_MONITOR_ENV = "strategy_ma5_ma20_open_monitor_env"
+TABLE_STRATEGY_SIGNAL_CANDIDATES = "strategy_signal_candidates"
+VIEW_STRATEGY_SIGNAL_CANDIDATES = "v_strategy_signal_candidates"
+
+# 开盘监测输出
+TABLE_STRATEGY_OPEN_MONITOR = "strategy_open_monitor"
+TABLE_STRATEGY_OPEN_MONITOR_ENV = "strategy_open_monitor_env"
+
+# 大盘/指数环境快照
 TABLE_ENV_INDEX_SNAPSHOT = "strategy_env_index_snapshot"
 
 
@@ -53,18 +60,18 @@ class SchemaManager:
         strat_cfg = get_section("strategy_ma5_ma20_trend") or {}
         open_monitor_cfg = get_section("open_monitor") or {}
 
-        default_signals = strat_cfg.get("signals_table", TABLE_STRATEGY_MA5_MA20_SIGNALS)
+        default_signals = strat_cfg.get("signals_table", TABLE_STRATEGY_SIGNALS)
         signals_table = (
             str(open_monitor_cfg.get("signals_table", default_signals)).strip()
-            or TABLE_STRATEGY_MA5_MA20_SIGNALS
+            or TABLE_STRATEGY_SIGNALS
         )
         candidates_table = (
-            str(strat_cfg.get("candidates_table", TABLE_STRATEGY_MA5_MA20_CANDIDATES)).strip()
-            or TABLE_STRATEGY_MA5_MA20_CANDIDATES
+            str(strat_cfg.get("candidates_table", TABLE_STRATEGY_SIGNAL_CANDIDATES)).strip()
+            or TABLE_STRATEGY_SIGNAL_CANDIDATES
         )
         candidates_view = (
-            str(strat_cfg.get("candidates_view", VIEW_STRATEGY_MA5_MA20_CANDIDATES)).strip()
-            or VIEW_STRATEGY_MA5_MA20_CANDIDATES
+            str(strat_cfg.get("candidates_view", VIEW_STRATEGY_SIGNAL_CANDIDATES)).strip()
+            or VIEW_STRATEGY_SIGNAL_CANDIDATES
         )
         candidates_as_view = bool(strat_cfg.get("candidates_as_view", True))
 
