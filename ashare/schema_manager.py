@@ -23,8 +23,10 @@ TABLE_STRATEGY_INDICATOR_DAILY = "strategy_indicator_daily"
 TABLE_STRATEGY_SIGNAL_EVENTS = "strategy_signal_events"
 TABLE_STRATEGY_SIGNAL_CANDIDATES = "strategy_signal_candidates"
 VIEW_STRATEGY_SIGNAL_CANDIDATES = "v_strategy_signal_candidates"
+TABLE_STRATEGY_CHIP_FILTER = "strategy_chip_filter"
 TABLE_STRATEGY_TRADE_METRICS = "strategy_trade_metrics"
 VIEW_STRATEGY_BACKTEST = "v_backtest"
+VIEW_STRATEGY_PNL = "v_pnl"
 
 # 开盘监测输出
 TABLE_STRATEGY_OPEN_MONITOR_EVAL = "strategy_open_monitor_eval"
@@ -77,6 +79,8 @@ class SchemaManager:
             )
         self._ensure_trade_metrics_table()
         self._ensure_backtest_view()
+        self._ensure_chip_filter_table()
+        self._ensure_v_pnl_view()
 
         self._ensure_open_monitor_eval_table(tables.open_monitor_eval_table)
         self._ensure_open_monitor_quote_table(tables.open_monitor_quote_table)
@@ -715,6 +719,7 @@ class SchemaManager:
             "chip_ok": "TINYINT(1) NULL",
             "gdhs_delta_pct": "DOUBLE NULL",
             "gdhs_announce_date": "DATE NULL",
+            "chip_reason": "VARCHAR(255) NULL",
             "fear_score": "DOUBLE NULL",
             "wave_type": "VARCHAR(64) NULL",
             "extra_json": "TEXT NULL",
@@ -738,6 +743,7 @@ class SchemaManager:
         self._ensure_numeric_column(table, "gdhs_delta_pct", "DOUBLE NULL")
         self._ensure_numeric_column(table, "fear_score", "DOUBLE NULL")
         self._ensure_date_column(table, "gdhs_announce_date", not_null=False)
+        self._ensure_varchar_length(table, "chip_reason", 255)
         unique_name = "ux_signal_events_strategy_date_code"
         if not self._index_exists(table, unique_name):
             with self.engine.begin() as conn:
@@ -841,6 +847,30 @@ class SchemaManager:
         self._ensure_numeric_column(table, "holding_days", "INT NULL")
         self._ensure_varchar_length(table, "exit_reason", 255)
 
+    def _ensure_chip_filter_table(self) -> None:
+        columns = {
+            "sig_date": "DATE NOT NULL",
+            "code": "VARCHAR(20) NOT NULL",
+            "announce_date": "DATE NULL",
+            "gdhs_delta_pct": "DOUBLE NULL",
+            "gdhs_delta_raw": "DOUBLE NULL",
+            "chip_ok": "TINYINT(1) NULL",
+            "chip_reason": "VARCHAR(255) NULL",
+            "vol_ratio": "DOUBLE NULL",
+            "updated_at": "DATETIME(6) NULL",
+        }
+        table = TABLE_STRATEGY_CHIP_FILTER
+        if not self._table_exists(table):
+            self._create_table(table, columns, primary_key=("sig_date", "code"))
+            return
+        self._add_missing_columns(table, columns)
+        self._ensure_numeric_column(table, "chip_ok", "TINYINT(1) NULL")
+        self._ensure_numeric_column(table, "gdhs_delta_pct", "DOUBLE NULL")
+        self._ensure_numeric_column(table, "gdhs_delta_raw", "DOUBLE NULL")
+        self._ensure_numeric_column(table, "vol_ratio", "DOUBLE NULL")
+        self._ensure_varchar_length(table, "chip_reason", 255)
+        self._ensure_datetime_column(table, "updated_at")
+
     def _ensure_backtest_view(self) -> None:
         table = TABLE_STRATEGY_TRADE_METRICS
         view = VIEW_STRATEGY_BACKTEST
@@ -878,6 +908,32 @@ class SchemaManager:
         with self.engine.begin() as conn:
             conn.execute(stmt)
         self.logger.info("已创建/更新回测视图 %s。", view)
+
+    def _ensure_v_pnl_view(self) -> None:
+        table = TABLE_STRATEGY_TRADE_METRICS
+        view = VIEW_STRATEGY_PNL
+        if not self._table_exists(table):
+            self._drop_relation(view)
+            return
+        stmt = text(
+            f"""
+            CREATE OR REPLACE VIEW `{view}` AS
+            SELECT
+              `strategy_code`,
+              `code`,
+              COUNT(*) AS `trade_cnt`,
+              SUM(CASE WHEN `pnl_pct` > 0 THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0) AS `win_rate`,
+              AVG(`pnl_atr_ratio`) AS `avg_pnl_atr_ratio`,
+              AVG(`pnl_pct`) AS `avg_pnl_pct`
+            FROM `{table}`
+            WHERE `exit_date` IS NOT NULL
+            GROUP BY `strategy_code`, `code`
+            HAVING `avg_pnl_atr_ratio` > 1.5
+            """
+        )
+        with self.engine.begin() as conn:
+            conn.execute(stmt)
+        self.logger.info("已创建/更新视图 %s。", view)
 
     # ---------- Open monitor ----------
     def _ensure_open_monitor_quote_table(self, table: str) -> None:
