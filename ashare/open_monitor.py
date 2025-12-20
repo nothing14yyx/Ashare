@@ -101,6 +101,34 @@ def make_snapshot_hash(row: Dict[str, Any]) -> str:
     return hashlib.md5(serialized.encode("utf-8")).hexdigest()
 
 
+def derive_index_gate_action(regime: str | None, position_hint: float | None) -> str | None:
+    regime_norm = str(regime or "").strip().upper() or None
+    pos_hint_val = _to_float(position_hint)
+
+    if regime_norm in {"BREAKDOWN", "BEAR_CONFIRMED"}:
+        return "STOP"
+
+    if regime_norm == "RISK_OFF":
+        return "WAIT"
+
+    if regime_norm == "PULLBACK":
+        if pos_hint_val is not None and pos_hint_val <= 0.3:
+            return "WAIT"
+        return "ALLOW"
+
+    if regime_norm == "RISK_ON":
+        return "ALLOW"
+
+    if pos_hint_val is not None:
+        if pos_hint_val <= 0:
+            return "STOP"
+        if pos_hint_val < 0.3:
+            return "WAIT"
+        return "ALLOW"
+
+    return None
+
+
 def _strip_baostock_prefix(code: str) -> str:
     code = str(code or "").strip()
     if code.startswith("sh.") or code.startswith("sz."):
@@ -887,6 +915,8 @@ class MA5MA20OpenMonitorRunner:
             "weekly_plan_a_exposure_cap": row.get("env_weekly_plan_a_exposure_cap"),
             "weekly_bias": row.get("env_weekly_bias"),
             "weekly_status": row.get("env_weekly_status"),
+            "weekly_structure_status": row.get("env_weekly_structure_status"),
+            "weekly_pattern_status": row.get("env_weekly_pattern_status"),
             "weekly_gating_enabled": row.get("env_weekly_gating_enabled"),
             "weekly_tags": row.get("env_weekly_tags"),
             "weekly_money_proxy": row.get("env_weekly_money_proxy"),
@@ -951,6 +981,9 @@ class MA5MA20OpenMonitorRunner:
         _backfill("weekly_money_tags")
         _backfill("weekly_direction_confirmed")
         _backfill("weekly_key_levels")
+        _backfill("weekly_structure_status")
+        _backfill("weekly_pattern_status")
+        _backfill("weekly_status", "weekly_structure_status")
 
         index_snapshot_hash = row.get("env_index_snapshot_hash")
         loaded_index_snapshot = self._load_index_snapshot_by_hash(index_snapshot_hash)
@@ -968,6 +1001,9 @@ class MA5MA20OpenMonitorRunner:
             ),
             "weekly_bias": weekly_scenario.get("weekly_bias"),
             "weekly_status": weekly_scenario.get("weekly_status"),
+            "weekly_structure_status": weekly_scenario.get("weekly_structure_status")
+            or weekly_scenario.get("weekly_status"),
+            "weekly_pattern_status": weekly_scenario.get("weekly_pattern_status"),
             "weekly_direction_confirmed": weekly_scenario.get(
                 "weekly_direction_confirmed"
             ),
@@ -2078,7 +2114,6 @@ class MA5MA20OpenMonitorRunner:
             "WAIT": 2,
             "ALLOW_SMALL": 1,
             "ALLOW": 0,
-            "GO": 0,
             "NOT_APPLIED": -1,
             None: -1,
         }
@@ -2088,17 +2123,23 @@ class MA5MA20OpenMonitorRunner:
                 normalized.append((severity[None], None))
                 continue
             action_norm = str(action).strip().upper()
+            if action_norm == "GO":
+                action_norm = "ALLOW"
             score = severity.get(action_norm, 0)
             normalized.append((score, action_norm))
         if not normalized:
             return None
         normalized.sort(key=lambda x: x[0], reverse=True)
-        return normalized[0][1]
+        top_action = normalized[0][1]
+        if top_action == "GO":
+            return "ALLOW"
+        return top_action
 
     def _build_index_env_snapshot(
         self,
         asof_indicators: dict[str, Any],
         live_quote: dict[str, Any],
+        env_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         snapshot: dict[str, Any] = {}
         if isinstance(asof_indicators, dict):
@@ -2153,10 +2194,8 @@ class MA5MA20OpenMonitorRunner:
         ):
             dev_ma20_atr = (live_latest - asof_ma20) / max(asof_atr14, 1e-6)
 
-        gate_action = "GO"
         gate_reason_parts: list[str] = []
         if live_latest is not None and asof_ma60 is not None and live_latest < asof_ma60:
-            gate_action = "WAIT"
             gate_reason_parts.append("指数低于MA60")
 
         if (
@@ -2166,14 +2205,32 @@ class MA5MA20OpenMonitorRunner:
             and live_latest < asof_ma20
             and asof_ma20 < asof_ma60
         ):
-            gate_action = "STOP"
             gate_reason_parts.append("指数跌破MA20且MA20<MA60")
 
-        if asof_macd_hist is not None and asof_macd_hist < 0 and gate_action != "STOP":
-            gate_action = "WAIT"
+        if asof_macd_hist is not None and asof_macd_hist < 0:
             gate_reason_parts.append("MACD柱子为负")
 
-        position_cap = {"GO": 1.0, "WAIT": 0.5, "STOP": 0.0}.get(gate_action, 1.0)
+        regime = None
+        pos_hint = None
+        if isinstance(env_context, dict):
+            regime = env_context.get("regime")
+            pos_hint = env_context.get("position_hint_raw") or env_context.get("position_hint")
+
+        gate_action = derive_index_gate_action(regime, pos_hint) or "ALLOW"
+        regime_norm = str(regime or "").strip().upper()
+        pos_hint_val = _to_float(pos_hint)
+        if regime_norm or pos_hint_val is not None:
+            pos_hint_display = (
+                f"{pos_hint_val:.2f}" if pos_hint_val is not None else "-"
+            )
+            gate_reason_parts.insert(
+                0, f"regime={regime_norm or '-'} pos_hint={pos_hint_display}"
+            )
+
+        position_cap_map = {"ALLOW": 1.0, "ALLOW_SMALL": 0.5, "WAIT": 0.5, "STOP": 0.0}
+        position_cap = position_cap_map.get(gate_action, 1.0)
+        if pos_hint_val is not None:
+            position_cap = min(position_cap, max(pos_hint_val, 0.0))
 
         snapshot["env_index_dev_ma20_atr"] = _to_float(dev_ma20_atr)
         snapshot["env_index_gate_action"] = gate_action
@@ -2340,6 +2397,8 @@ class MA5MA20OpenMonitorRunner:
         env_weekly_plan_a_exposure_cap = None
         env_weekly_bias = None
         env_weekly_status = None
+        env_weekly_structure_status = None
+        env_weekly_pattern_status = None
         if isinstance(env_context, dict):
             env_weekly_asof_trade_date = env_context.get("weekly_asof_trade_date")
             env_weekly_risk_level = env_context.get("weekly_risk_level")
@@ -2351,7 +2410,11 @@ class MA5MA20OpenMonitorRunner:
                 env_context.get("weekly_plan_a_exposure_cap")
             )
             env_weekly_bias = env_context.get("weekly_bias")
-            env_weekly_status = env_context.get("weekly_status")
+            env_weekly_structure_status = env_context.get("weekly_structure_status")
+            env_weekly_pattern_status = env_context.get("weekly_pattern_status")
+            env_weekly_status = env_weekly_structure_status or env_context.get("weekly_status")
+        if env_weekly_pattern_status is None:
+            env_weekly_pattern_status = env_weekly_status
         env_index_code = index_intraday.get("env_index_code")
         env_index_asof_trade_date = index_intraday.get("env_index_asof_trade_date")
         env_index_asof_close = _to_float(index_intraday.get("env_index_asof_close"))
@@ -2377,6 +2440,8 @@ class MA5MA20OpenMonitorRunner:
             if index_intraday.get("env_index_gate_action") is not None
             else None
         )
+        if env_index_gate_action == "GO":
+            env_index_gate_action = "ALLOW"
         env_index_gate_reason = index_intraday.get("env_index_gate_reason")
         env_index_position_cap = _to_float(index_intraday.get("env_index_position_cap"))
 
@@ -2589,6 +2654,8 @@ class MA5MA20OpenMonitorRunner:
         env_weekly_asof_trade_dates: List[str | None] = []
         env_weekly_risk_levels: List[str | None] = []
         env_weekly_scene_list: List[str | None] = []
+        env_weekly_structure_statuses: List[str | None] = []
+        env_weekly_pattern_statuses: List[str | None] = []
         env_weekly_gate_action_list: List[str | None] = []
         env_final_gate_action_list: List[str | None] = []
         board_statuses: List[str | None] = []
@@ -3213,7 +3280,9 @@ class MA5MA20OpenMonitorRunner:
                         append_note = "周线风险高：观望/防守"
                         status_reason = f"{status_reason}；{append_note}" if status_reason else append_note
                         reason = f"{reason}；{append_note}" if reason and reason != "OK" else append_note
-                    elif env_weekly_risk_level == "MEDIUM" and env_weekly_status == "FORMING":
+                    elif env_weekly_risk_level == "MEDIUM" and (
+                        env_weekly_structure_status or env_weekly_status
+                    ) == "FORMING":
                         soft_note = "周线MEDIUM+FORMING → 软门控限仓"
                         strong_enough = (
                             strength_score is not None
@@ -3267,7 +3336,7 @@ class MA5MA20OpenMonitorRunner:
                                 else soft_note
                             )
                     elif env_weekly_risk_level == "MEDIUM":
-                        if env_weekly_bias == "BEARISH" and env_weekly_status in {
+                        if env_weekly_bias == "BEARISH" and env_weekly_pattern_status in {
                             "BREAKOUT_DOWN",
                             "CONFIRMED",
                             "FORMING",
@@ -3433,6 +3502,10 @@ class MA5MA20OpenMonitorRunner:
             env_weekly_scene_list.append(
                 str(env_weekly_scene)[:32] if env_weekly_scene is not None else None
             )
+            env_weekly_structure_statuses.append(
+                env_weekly_structure_status or env_weekly_status
+            )
+            env_weekly_pattern_statuses.append(env_weekly_pattern_status)
             env_weekly_gate_action_list.append(weekly_gate_action)
 
             actions.append(action)
@@ -3466,6 +3539,8 @@ class MA5MA20OpenMonitorRunner:
         merged["env_weekly_asof_trade_date"] = env_weekly_asof_trade_dates
         merged["env_weekly_risk_level"] = env_weekly_risk_levels
         merged["env_weekly_scene"] = env_weekly_scene_list
+        merged["env_weekly_structure_status"] = env_weekly_structure_statuses
+        merged["env_weekly_pattern_status"] = env_weekly_pattern_statuses
         merged["env_weekly_gate_action"] = env_weekly_gate_action_list
         merged["env_final_gate_action"] = env_final_gate_action_list
         merged["env_index_snapshot_hash"] = env_index_snapshot_hashes
@@ -3587,6 +3662,8 @@ class MA5MA20OpenMonitorRunner:
             "env_weekly_asof_trade_date",
             "env_weekly_risk_level",
             "env_weekly_scene",
+            "env_weekly_structure_status",
+            "env_weekly_pattern_status",
             "env_weekly_gate_action",
             "industry",
             "board_name",
@@ -3657,6 +3734,8 @@ class MA5MA20OpenMonitorRunner:
             "env_weekly_asof_trade_date",
             "env_weekly_risk_level",
             "env_weekly_scene",
+            "env_weekly_structure_status",
+            "env_weekly_pattern_status",
             "env_weekly_gate_action",
             "candidate_stage",
             "candidate_state",
@@ -4096,7 +4175,9 @@ class MA5MA20OpenMonitorRunner:
                 )
         index_history = self._load_index_history(latest_trade_date)
         index_live_quote = self._fetch_index_live_quote()
-        index_env_snapshot = self._build_index_env_snapshot(index_history, index_live_quote)
+        index_env_snapshot = self._build_index_env_snapshot(
+            index_history, index_live_quote, env_context
+        )
         env_index_snapshot_hash = None
         if index_env_snapshot:
             index_snapshot_payload = {

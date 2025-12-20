@@ -613,6 +613,8 @@ class WeeklyPlanSystem:
             "weekly_scene_code": None,
             "weekly_bias": "NEUTRAL",
             "weekly_status": "FORMING",
+            "weekly_structure_status": None,
+            "weekly_pattern_status": None,
             "weekly_key_levels": {},
             "weekly_key_levels_str": None,
             "weekly_structure_tags": [],
@@ -675,6 +677,7 @@ class WeeklyPlanSystem:
 
         direction_confirmed = candidate.status == "CONFIRMED"
         structure_status = "CONFIRMED" if direction_confirmed else "FORMING"
+        pattern_status = candidate.status
         risk_score, risk_level = self._risk(
             candidate.bias, candidate.status, direction_confirmed
         )
@@ -726,6 +729,16 @@ class WeeklyPlanSystem:
                 exposure_cap = float(pos_hint) if pos_hint is not None else None
             except Exception:  # noqa: BLE001
                 exposure_cap = None
+        if exposure_cap is None:
+            risk_level_norm = str(risk_level or "").upper()
+            default_cap_map = {"HIGH": 0.10, "MEDIUM": 0.25, "LOW": 0.60}
+            exposure_cap = default_cap_map.get(risk_level_norm)
+        if exposure_cap is not None:
+            exposure_cap = float(exposure_cap)
+            if candidate.bias == "BEARISH":
+                exposure_cap = min(exposure_cap, 0.25)
+            if not current_week_closed:
+                exposure_cap = min(exposure_cap, 0.20)
 
         money_proxy = {
             "vol_ratio_20": float(df["wk_vol_ratio_20"].iloc[-1])
@@ -743,6 +756,8 @@ class WeeklyPlanSystem:
                 "weekly_scene_code": f"{candidate.scene}_{candidate.status}",
                 "weekly_bias": candidate.bias,
                 "weekly_status": structure_status,
+                "weekly_structure_status": structure_status,
+                "weekly_pattern_status": pattern_status,
                 "weekly_key_levels": key_levels,
                 "weekly_key_levels_str": key_levels_str,
                 "weekly_structure_tags": candidate.structure_tags,
@@ -774,4 +789,3 @@ class WeeklyPlanSystem:
             pd.Series(plan_payload).to_json(force_ascii=False), 2000
         )
         return plan
-

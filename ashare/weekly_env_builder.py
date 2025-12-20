@@ -429,6 +429,8 @@ class WeeklyEnvironmentBuilder:
             "weekly_scene_code": None,
             "weekly_bias": "NEUTRAL",
             "weekly_status": "FORMING",
+            "weekly_structure_status": "FORMING",
+            "weekly_pattern_status": None,
             "weekly_key_levels_str": None,
             "weekly_plan_a_if": None,
             "weekly_plan_a_then": None,
@@ -471,6 +473,10 @@ class WeeklyEnvironmentBuilder:
         scenario["weekly_plan_b_then"] = self._clip(plan.get("weekly_plan_b_then"), 64)
         scenario["weekly_plan_b_recover_if"] = self._clip(plan.get("weekly_plan_b_recover_if"), 128)
         scenario["weekly_plan_json"] = self._clip(plan.get("weekly_plan_json"), 2000)
+        scenario["weekly_structure_status"] = (
+            plan.get("weekly_structure_status") or plan.get("weekly_status")
+        )
+        scenario["weekly_pattern_status"] = plan.get("weekly_pattern_status")
         if not scenario["weekly_current_week_closed"]:
             scenario["weekly_note"] = "本周未收盘，等待区间破位/突破（周收盘有效）"
 
@@ -481,8 +487,8 @@ class WeeklyEnvironmentBuilder:
                 tags.extend([str(v) for v in vals if str(v)])
         if plan.get("weekly_bias"):
             tags.append(f"BIAS_{plan['weekly_bias']}")
-        if plan.get("weekly_status"):
-            tags.append(f"STATUS_{plan['weekly_status']}")
+        if plan.get("weekly_structure_status"):
+            tags.append(f"STATUS_{plan['weekly_structure_status']}")
         scenario["weekly_structure_tags"] = plan.get("weekly_structure_tags", [])
         scenario["weekly_confirm_tags"] = plan.get("weekly_confirm_tags", [])
         scenario["weekly_tags"] = ";".join(tags)[:255] if tags else None
@@ -572,7 +578,10 @@ class WeeklyEnvironmentBuilder:
             "weekly_plan_b_recover_if": weekly_scenario.get("weekly_plan_b_recover_if"),
             "weekly_plan_json": weekly_scenario.get("weekly_plan_json"),
             "weekly_bias": weekly_scenario.get("weekly_bias"),
-            "weekly_status": weekly_scenario.get("weekly_status"),
+            "weekly_status": weekly_scenario.get("weekly_structure_status")
+            or weekly_scenario.get("weekly_status"),
+            "weekly_structure_status": weekly_scenario.get("weekly_structure_status"),
+            "weekly_pattern_status": weekly_scenario.get("weekly_pattern_status"),
             "weekly_direction_confirmed": weekly_scenario.get(
                 "weekly_direction_confirmed"
             ),
@@ -601,8 +610,8 @@ class WeeklyEnvironmentBuilder:
                     scenario_tags.extend([str(t) for t in tags if str(t)])
             if weekly_scenario.get("weekly_bias"):
                 scenario_tags.append(f"BIAS_{weekly_scenario['weekly_bias']}")
-            if weekly_scenario.get("weekly_status"):
-                scenario_tags.append(f"STATUS_{weekly_scenario['weekly_status']}")
+            if weekly_scenario.get("weekly_structure_status"):
+                scenario_tags.append(f"STATUS_{weekly_scenario['weekly_structure_status']}")
             if weekly_scenario.get("weekly_tags") and not scenario_tags:
                 scenario_tags.extend(str(weekly_scenario.get("weekly_tags")).split(";"))
         env_context["weekly_tags"] = ";".join(scenario_tags)[:255] if scenario_tags else None
@@ -648,6 +657,7 @@ class WeeklyEnvironmentBuilder:
         gating_enabled = bool(_get_env("weekly_gating_enabled"))
         risk_level = str(_get_env("weekly_risk_level") or "").upper()
         status = str(_get_env("weekly_status") or "").upper()
+        structure_status = str(_get_env("weekly_structure_status") or status).upper()
 
         if not gating_enabled:
             return "ALLOW"
@@ -655,7 +665,7 @@ class WeeklyEnvironmentBuilder:
         if risk_level == "HIGH":
             return "WAIT"
 
-        if risk_level == "MEDIUM" and status == "FORMING":
+        if risk_level == "MEDIUM" and structure_status == "FORMING":
             return "WAIT"
 
         if risk_level in {"LOW", "MEDIUM"}:
