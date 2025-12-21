@@ -1,12 +1,10 @@
 import os
 from pathlib import Path
 
-from openpyxl.styles.builtins import output
-
-# ===== 这里改成你的项目根目录 =====
-PROJECT_ROOT = Path(r"D:\PythonProjects25-12\AShare")
-# 输出的总文本文件
-OUTPUT_FILE = PROJECT_ROOT  / "project_for_llm.txt"
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent
+OUTPUT_DIR = SCRIPT_DIR / "output"
+OUTPUT_FILE = OUTPUT_DIR / "project_for_llm.txt"
 
 # 想导出的文件后缀（按需增减）
 INCLUDE_EXT = {
@@ -28,7 +26,7 @@ EXCLUDE_DIRS = {
     "venv",
     ".venv",
     "dbn_trading_auto",
-    "output"
+    "output",
 }
 
 
@@ -40,6 +38,7 @@ def main() -> None:
     files: list[Path] = []
 
     output_resolved = OUTPUT_FILE.resolve()
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     for root, dirs, filenames in os.walk(PROJECT_ROOT):
         root_path = Path(root)

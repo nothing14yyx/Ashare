@@ -7,8 +7,8 @@ export_db_snapshot.py
 - 默认从项目根目录 config.yaml 读取数据库配置（顶层 database.*）
 - 也支持通过环境变量 ASHARE_CONFIG_FILE 指定配置文件路径
 - 生成两份文件：
-  1) output/db_snapshot_YYYYMMDD_HHMMSS.md
-  2) output/db_snapshot_YYYYMMDD_HHMMSS.json
+  1) tool/output/db_snapshot_YYYYMMDD_HHMMSS.md
+  2) tool/output/db_snapshot_YYYYMMDD_HHMMSS.json
 """
 
 from __future__ import annotations
@@ -54,7 +54,7 @@ class DBConfig:
 
 
 def _project_root() -> Path:
-    # .../AShare/ashare/export_db_snapshot.py -> parents[1] == .../AShare
+    # .../AShare/tool/export_db_snapshot.py -> parents[1] == .../AShare
     return Path(__file__).resolve().parents[1]
 
 
@@ -312,8 +312,8 @@ def main() -> None:
     parser.add_argument(
         "--outdir",
         type=str,
-        default="output",
-        help="输出目录（默认：output）",
+        default=str(Path(__file__).resolve().parent / "output"),
+        help="输出目录（默认：tool/output）",
     )
     parser.add_argument(
         "--sample-rows",
