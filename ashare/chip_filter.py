@@ -6,7 +6,7 @@ from typing import Iterable, List, Tuple
 import numpy as np
 
 import pandas as pd
-from sqlalchemy import bindparam, text
+from sqlalchemy import bindparam, inspect, text
 
 from .db import DatabaseConfig, MySQLWriter
 from .schema_manager import TABLE_STRATEGY_CHIP_FILTER
@@ -101,6 +101,14 @@ class ChipFilter:
         if df.empty or not self._table_exists(self.table):
             return
         sig_dates = df["sig_date"].dropna().unique().tolist()
+        try:
+            table_columns = {
+                col.get("name")
+                for col in inspect(self.db_writer.engine).get_columns(self.table)
+                if isinstance(col, dict)
+            }
+        except Exception:
+            table_columns = set()
         if sig_dates:
             delete_stmt = (
                 text(
@@ -113,7 +121,10 @@ class ChipFilter:
             with self.db_writer.engine.begin() as conn:
                 codes = df["code"].dropna().astype(str).unique().tolist()
                 conn.execute(delete_stmt, {"dates": sig_dates, "codes": codes})
-        self.db_writer.write_dataframe(df, self.table, if_exists="append")
+        aligned = df.copy()
+        if table_columns:
+            aligned = aligned[[c for c in aligned.columns if c in table_columns]].copy()
+        self.db_writer.write_dataframe(aligned, self.table, if_exists="append")
 
     def apply(self, signals: pd.DataFrame, *, gdhs_table: str = "a_share_gdhs_detail") -> pd.DataFrame:
         if signals.empty:
@@ -217,7 +228,10 @@ class ChipFilter:
         missing_gdhs = merged["chip_delta"].isna() | merged["announce_date"].isna()
         chip_reason = chip_reason.mask(missing_gdhs, "DATA_MISSING_GDHS")
         missing_vol = merged["vol_ratio"].isna()
-        chip_reason = chip_reason.mask(missing_vol & chip_reason.isna(), "DATA_MISSING_VOL_RATIO")
+        vol_ratio_used = merged["vol_ratio"].fillna(1.0)
+        chip_reason = chip_reason.mask(
+            missing_vol & chip_reason.isna(), "DATA_MISSING_VOL_RATIO_FALLBACK"
+        )
 
         delta_raw = pd.to_numeric(merged.get("gdhs_delta_raw"), errors="coerce")
         outlier_mask = (merged["chip_delta"].abs() > 80) | (delta_raw.abs() > 1_000_000)
@@ -226,7 +240,9 @@ class ChipFilter:
 
         chip_reason = chip_reason.mask(merged["stale_hit"] & chip_reason.isna(), "DATA_STALE_GDHS")
 
-        can_eval = chip_reason.isna()
+        can_eval = ~(
+            missing_gdhs | outlier_mask | merged["stale_hit"].fillna(False)
+        )
         concentrate = can_eval & (merged["chip_delta"] <= -10)
         disperse = can_eval & (merged["chip_delta"] >= 20)
         deadzone = can_eval & merged["deadzone_hit"]
@@ -245,7 +261,7 @@ class ChipFilter:
                 daily_drop_candidates.append(pd.to_numeric(merged[col], errors="coerce"))
         daily_drop = next((s for s in daily_drop_candidates if not s.isna().all()), pd.Series(np.nan, index=merged.index))
         weaken_price = (merged["close"] < merged["ma20"]) | (
-            (merged["vol_ratio"] > 1.5) & (daily_drop < 0)
+            (vol_ratio_used > 1.5) & (daily_drop < 0)
         )
         chip_score.loc[can_eval & weaken_price.fillna(False)] -= 0.3
 
@@ -262,6 +278,9 @@ class ChipFilter:
         chip_score = chip_score.clip(-1.0, 1.0)
         chip_reason = chip_reason.mask(can_eval & chip_reason.isna(), "CHIP_NEUTRAL")
         chip_score = chip_score.where(~chip_reason.isna(), chip_score)
+        chip_ok = chip_reason.isin({"CHIP_CONCENTRATE", "CHIP_NEUTRAL"}) | (
+            chip_score >= 0.0
+        )
 
         merged["chip_score"] = chip_score
         merged["chip_reason"] = chip_reason
@@ -277,6 +296,7 @@ class ChipFilter:
             "chip_score",
             "chip_reason",
             "vol_ratio",
+            "chip_ok",
             "age_days",
             "deadzone_hit",
             "stale_hit",

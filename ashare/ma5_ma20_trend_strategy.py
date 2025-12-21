@@ -1103,7 +1103,22 @@ class MA5MA20StrategyRunner:
 
         if chip_df.empty:
             signals = _fill_vol_ratio(signals, sig_dates, codes)
-            chip_df = ChipFilter().apply(signals[["date", "code", "vol_ratio"]].copy())
+            chip_cols = [
+                "date",
+                "code",
+                "vol_ratio",
+                "close",
+                "ma20",
+                "runup_pct",
+                "fear_score",
+                "pct_chg",
+                "pct_change",
+                "change_pct",
+                "ret_1d",
+                "ret",
+            ]
+            chip_inputs = [c for c in chip_cols if c in signals.columns]
+            chip_df = ChipFilter().apply(signals[chip_inputs].copy())
 
         stale_mask = pd.Series(False, index=chip_df.index)
         if not chip_df.empty:
@@ -1132,7 +1147,22 @@ class MA5MA20StrategyRunner:
                 refreshed = pd.DataFrame()
                 if not re_sig.empty:
                     re_sig = _fill_vol_ratio(re_sig, stale_dates, stale_codes)
-                    refreshed = ChipFilter().apply(re_sig[["date", "code", "vol_ratio"]].copy())
+                    refresh_cols = [
+                        "date",
+                        "code",
+                        "vol_ratio",
+                        "close",
+                        "ma20",
+                        "runup_pct",
+                        "fear_score",
+                        "pct_chg",
+                        "pct_change",
+                        "change_pct",
+                        "ret_1d",
+                        "ret",
+                    ]
+                    refresh_inputs = [c for c in refresh_cols if c in re_sig.columns]
+                    refreshed = ChipFilter().apply(re_sig[refresh_inputs].copy())
                 if not refreshed.empty:
                     refreshed = refreshed.copy()
                     refreshed["sig_date"] = pd.to_datetime(refreshed["sig_date"], errors="coerce")
@@ -1200,11 +1230,17 @@ class MA5MA20StrategyRunner:
         final_cap = pd.Series(base_cap, index=out.index, dtype=float)
         gate_tag = pd.Series("", index=out.index, dtype="object")
 
-        required_cols = ["close", "ma20", "ma5", "vol_ratio", "macd_hist"]
+        required_cols = ["close", "ma20", "ma5", "macd_hist"]
         missing_core = out[required_cols].isna().any(axis=1)
         final_action = final_action.mask(missing_core, "HOLD")
         final_reason = final_reason.mask(missing_core, "DATA_MISSING")
         final_cap = final_cap.mask(missing_core, 0.0)
+        vol_missing = out["vol_ratio"].isna()
+        final_reason = final_reason.mask(
+            vol_missing & ~missing_core, "VOL_RATIO_FALLBACK"
+        )
+        final_cap = final_cap.mask(vol_missing & ~missing_core, 0.2)
+        vol_ratio_filled = pd.to_numeric(out.get("vol_ratio"), errors="coerce").fillna(1.0)
 
         rsi = pd.to_numeric(out.get("rsi14"), errors="coerce")
         bias = pd.to_numeric(out.get("ma20_bias"), errors="coerce")
@@ -1264,14 +1300,14 @@ class MA5MA20StrategyRunner:
             hist_cross_down_flag = bool(hist_cross_down_flag)
 
         exit_flag = macd_shrink_flag | hist_cross_down_flag
-        soft_stop = (out["close"] > out["ma20"]) & (out["vol_ratio"] < 1.0) & (
+        soft_stop = (out["close"] > out["ma20"]) & (vol_ratio_filled < 1.0) & (
             exit_flag
         )
         final_action = final_action.mask(soft_stop, "SELL")
         final_reason = final_reason.mask(soft_stop, "动能衰减/缩量")
         final_cap = final_cap.mask(soft_stop, 0.0)
 
-        reduce_mask = (out["ma5"] < out["ma20"]) & (out["vol_ratio"] < 1.0)
+        reduce_mask = (out["ma5"] < out["ma20"]) & (vol_ratio_filled < 1.0)
         final_action = final_action.mask(reduce_mask & ~soft_stop, "REDUCE")
         final_reason = final_reason.mask(reduce_mask & ~soft_stop, "弱势缩量减仓")
         final_cap = final_cap.mask(reduce_mask, 0.0)
@@ -1289,7 +1325,14 @@ class MA5MA20StrategyRunner:
             final_cap = final_cap.mask(sell_raw, 0.0)
 
             buy_confirm_raw = raw_signal_upper == "BUY_CONFIRM"
-            degrade_wait = buy_confirm_raw & entry_mask & (chip_score < -0.5)
+            vol_guard = vol_ratio_filled < 1.0
+            structure_weak = (out["ma5"] < out["ma20"]) | (out["macd_hist"] <= 0)
+            chip_reason_str = chip_reason.astype("string") if isinstance(chip_reason, pd.Series) else pd.Series("", index=out.index, dtype="string")
+            disperse_risk = chip_reason_str.eq("CHIP_DISPERSE_STRONG")
+            outlier_risk = chip_reason_str.str.contains("OUTLIER", case=False, na=False)
+            degrade_wait = buy_confirm_raw & entry_mask & (
+                outlier_risk | (disperse_risk & (structure_weak | vol_guard))
+            )
             final_action = final_action.mask(degrade_wait, "WAIT")
             wait_reason = chip_reason.fillna("CHIP_WEAK") if isinstance(chip_reason, pd.Series) else "CHIP_WEAK"
             final_reason = final_reason.mask(degrade_wait, wait_reason)
@@ -1321,7 +1364,7 @@ class MA5MA20StrategyRunner:
 
         entry_mask = ~final_action.isin(["SELL", "REDUCE"])
         vol_ratio = pd.to_numeric(out.get("vol_ratio"), errors="coerce")
-        low_vol_entry = vol_ratio < 1.5
+        low_vol_entry = vol_ratio_filled < 1.5
         final_cap = final_cap.mask(entry_mask & low_vol_entry & (final_cap > 0), 0.3)
 
         exit_mask = final_action.isin(["SELL", "REDUCE"])
