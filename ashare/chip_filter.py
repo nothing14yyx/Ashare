@@ -142,16 +142,15 @@ class ChipFilter:
         for code, sig_slice in sig_df.groupby("code", sort=False):
             chip_slice = chip_df[chip_df["code"] == code]
             if chip_slice.empty:
-                merged_parts.append(
+                part = (
                     sig_slice.assign(
                         announce_date=pd.NaT,
                         gdhs_delta_pct=pd.NA,
                         gdhs_delta_raw=pd.NA,
                     )
                 )
-                continue
-            merged_parts.append(
-                pd.merge_asof(
+            else:
+                part = pd.merge_asof(
                     sig_slice,
                     chip_slice,
                     left_on="sig_date",
@@ -159,9 +158,35 @@ class ChipFilter:
                     direction="backward",
                     allow_exact_matches=True,
                 )
-            )
+            part = part.copy()
+            part["code"] = code
+            part = part.dropna(how="all")
+            if not part.empty:
+                merged_parts.append(part)
 
-        merged = pd.concat(merged_parts, ignore_index=True)
+        cleaned_parts = []
+        for part in merged_parts:
+            if part is None:
+                continue
+            trimmed = part.dropna(how="all")
+            if not trimmed.empty:
+                cleaned_parts.append(trimmed)
+
+        if not cleaned_parts:
+            return pd.DataFrame()
+
+        merged = pd.concat(cleaned_parts, ignore_index=True)
+        if "code" not in merged.columns:
+            self.logger.warning("strategy_chip_filter 缺少 code 列，已跳过写入。")
+            return pd.DataFrame()
+
+        bad = merged["code"].isna() | (merged["code"].astype(str).str.strip() == "")
+        if bad.any():
+            self.logger.warning("strategy_chip_filter 丢弃 code 为空的行数=%s", int(bad.sum()))
+            merged = merged.loc[~bad].copy()
+        if merged.empty:
+            return pd.DataFrame()
+
         merged["gdhs_delta_pct"] = pd.to_numeric(merged.get("gdhs_delta_pct"), errors="coerce")
         merged["vol_ratio"] = pd.to_numeric(merged.get("vol_ratio"), errors="coerce")
         chip_reason = pd.Series("", index=merged.index, dtype="object")

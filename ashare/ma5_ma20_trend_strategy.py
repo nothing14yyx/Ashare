@@ -1143,8 +1143,24 @@ class MA5MA20StrategyRunner:
             .apply(lambda x: (x < 0).all(), raw=True)
             .reset_index(level=0, drop=True)
         )
+        out["macd_shrink"] = macd_shrink
+        macd_shrink_series = out.get("macd_shrink")
+        if isinstance(macd_shrink_series, pd.Series) and macd_shrink_series.dtype != bool:
+            macd_shrink_flag = (macd_shrink_series < 0).fillna(False)
+        elif isinstance(macd_shrink_series, pd.Series):
+            macd_shrink_flag = macd_shrink_series.fillna(False)
+        else:
+            macd_shrink_flag = pd.Series(False, index=out.index, dtype=bool)
+
+        hist_cross_down_flag = out.get("hist_cross_down", False)
+        if isinstance(hist_cross_down_flag, pd.Series):
+            hist_cross_down_flag = hist_cross_down_flag.fillna(False)
+        else:
+            hist_cross_down_flag = bool(hist_cross_down_flag)
+
+        exit_flag = macd_shrink_flag | hist_cross_down_flag
         soft_stop = (out["close"] > out["ma20"]) & (out["vol_ratio"] < 1.0) & (
-            macd_shrink.fillna(False) | out.get("hist_cross_down", False)
+            exit_flag
         )
         final_action = final_action.mask(soft_stop, "SELL")
         final_reason = final_reason.mask(soft_stop, "动能衰减/缩量")
