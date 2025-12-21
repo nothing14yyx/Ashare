@@ -1012,6 +1012,37 @@ class MA5MA20StrategyRunner:
         return pattern
 
     def _attach_chip_factors(self, signals: pd.DataFrame) -> pd.DataFrame:
+        def _fill_vol_ratio(sig_df: pd.DataFrame, dates: List[dt.date], code_list: List[str]) -> pd.DataFrame:
+            if "vol_ratio" in sig_df.columns and not sig_df["vol_ratio"].isna().any():
+                return sig_df
+            try:
+                vr_stmt = text(
+                    """
+                    SELECT `date` AS date, code, vol_ratio
+                    FROM strategy_indicator_daily
+                    WHERE `date` IN :dates AND code IN :codes
+                    """
+                ).bindparams(bindparam("dates", expanding=True), bindparam("codes", expanding=True))
+                with self.db_writer.engine.begin() as conn:
+                    vr_df = pd.read_sql_query(
+                        vr_stmt,
+                        conn,
+                        params={"dates": dates, "codes": code_list},
+                    )
+            except Exception:
+                vr_df = pd.DataFrame()
+
+            if vr_df.empty:
+                return sig_df
+
+            merged_sig = sig_df.merge(vr_df, on=["date", "code"], how="left", suffixes=("", "_ind"))
+            merged_sig["vol_ratio"] = pd.to_numeric(merged_sig["vol_ratio"], errors="coerce").fillna(
+                pd.to_numeric(merged_sig.get("vol_ratio_ind"), errors="coerce")
+            )
+            if "vol_ratio_ind" in merged_sig.columns:
+                merged_sig = merged_sig.drop(columns=["vol_ratio_ind"])
+            return merged_sig
+
         if signals.empty:
             signals["chip_ok"] = np.nan
             signals["gdhs_delta_pct"] = np.nan
@@ -1052,13 +1083,48 @@ class MA5MA20StrategyRunner:
                     chip_df = pd.DataFrame()
 
         if chip_df.empty:
+            signals = _fill_vol_ratio(signals, sig_dates, codes)
             chip_df = ChipFilter().apply(signals[["date", "code", "vol_ratio"]].copy())
+
+        stale_mask = pd.Series(False, index=chip_df.index)
+        if not chip_df.empty:
+            chip_reason_col = chip_df.get("chip_reason")
+            if chip_reason_col is None:
+                chip_reason_col = pd.Series(pd.NA, index=chip_df.index, dtype="object")
+            vol_source = (
+                chip_df["vol_ratio"]
+                if "vol_ratio" in chip_df.columns
+                else pd.Series(np.nan, index=chip_df.index)
+            )
+            vol_col = pd.to_numeric(vol_source, errors="coerce")
+            chip_df["chip_reason"] = chip_reason_col
+            stale_mask = (
+                chip_reason_col.isna()
+                | (chip_reason_col == "")
+                | chip_reason_col.eq("DATA_MISSING")
+                | vol_col.isna()
+            )
+        if not chip_df.empty and stale_mask.any():
+            stale_rows = chip_df.loc[stale_mask, ["sig_date", "code"]].dropna()
+            if not stale_rows.empty:
+                stale_dates = pd.to_datetime(stale_rows["sig_date"], errors="coerce").dt.date.dropna().unique().tolist()
+                stale_codes = stale_rows["code"].astype(str).unique().tolist()
+                re_sig = signals[signals["date"].dt.date.isin(stale_dates) & signals["code"].isin(stale_codes)].copy()
+                if not re_sig.empty:
+                    re_sig = _fill_vol_ratio(re_sig, stale_dates, stale_codes)
+                    refreshed = ChipFilter().apply(re_sig[["date", "code", "vol_ratio"]].copy())
+                    if not refreshed.empty:
+                        refreshed = refreshed.copy()
+                        refreshed["sig_date"] = pd.to_datetime(refreshed["sig_date"], errors="coerce")
+                        chip_df = chip_df[~stale_mask].copy()
+                        chip_df = pd.concat([chip_df, refreshed], ignore_index=True)
+                        chip_df = chip_df.drop_duplicates(subset=["sig_date", "code"], keep="last")
 
         if chip_df.empty:
             signals["chip_ok"] = np.nan
             signals["gdhs_delta_pct"] = np.nan
             signals["gdhs_announce_date"] = pd.NaT
-            signals["chip_reason"] = "DATA_MISSING"
+            signals["chip_reason"] = "DATA_MISSING_GDHS"
             return signals
 
         chip_df = chip_df.rename(columns={"announce_date": "gdhs_announce_date"})
@@ -1080,9 +1146,20 @@ class MA5MA20StrategyRunner:
         merged["chip_reason"] = merged.get("chip_reason")
         gdhs_missing = merged["gdhs_announce_date"].isna() & merged["gdhs_delta_pct"].isna()
         chip_all_missing = gdhs_missing & merged["chip_ok"].isna()
-        missing_chip_mask = merged["chip_reason"].isna() & (gdhs_missing | chip_all_missing)
-        merged.loc[missing_chip_mask, "chip_reason"] = "DATA_MISSING"
-        merged.loc[missing_chip_mask, "chip_ok"] = pd.NA
+        vol_missing = merged["vol_ratio"].isna()
+        missing_reason_mask = merged["chip_reason"].isna() | (merged["chip_reason"] == "")
+        missing_reason = np.select(
+            [
+                missing_reason_mask & (gdhs_missing | chip_all_missing),
+                missing_reason_mask & vol_missing,
+            ],
+            ["DATA_MISSING_GDHS", "DATA_MISSING_VOL_RATIO"],
+            default=None,
+        )
+        missing_reason_series = pd.Series(missing_reason, index=merged.index, dtype="object")
+        missing_reason_mask = missing_reason_series.notna()
+        merged.loc[missing_reason_mask, "chip_reason"] = missing_reason_series[missing_reason_mask].values
+        merged.loc[missing_reason_mask, "chip_ok"] = pd.NA
         return merged
 
     def _decide_final_action(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -1186,13 +1263,15 @@ class MA5MA20StrategyRunner:
         final_cap = final_cap.mask(chip_reject, 0.0)
 
         chip_missing = (
-            chip_reason == "DATA_MISSING"
+            chip_reason.astype("string").str.startswith("DATA_MISSING").fillna(False)
             if isinstance(chip_reason, pd.Series)
             else pd.Series(False, index=out.index)
         )
-        final_action = final_action.mask(chip_missing & ~chip_reject, "HOLD")
-        final_reason = final_reason.mask(chip_missing & ~chip_reject, "DATA_MISSING")
-        final_cap = final_cap.mask(chip_missing, 0.0)
+        if isinstance(chip_reason, pd.Series):
+            missing_reason_fill = chip_reason
+        else:
+            missing_reason_fill = pd.Series(chip_reason, index=out.index)
+        final_reason = final_reason.mask(chip_missing & final_reason.isna(), missing_reason_fill)
 
         entry_mask = ~final_action.isin(["SELL", "REDUCE"])
         vol_ratio = pd.to_numeric(out.get("vol_ratio"), errors="coerce")

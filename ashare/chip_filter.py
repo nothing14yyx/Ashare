@@ -53,8 +53,6 @@ class ChipFilter:
         delta_abs_col = None
         if "股东户数-变动数量" in columns:
             delta_abs_col = "股东户数-变动数量"
-        elif "股东户数-上次" in columns:
-            delta_abs_col = "股东户数-上次"
         elif "holder_change" in columns:
             delta_abs_col = "holder_change"
         return code_col, announce_col, delta_pct_col, delta_abs_col
@@ -192,22 +190,29 @@ class ChipFilter:
 
         merged["gdhs_delta_pct"] = pd.to_numeric(merged.get("gdhs_delta_pct"), errors="coerce")
         merged["vol_ratio"] = pd.to_numeric(merged.get("vol_ratio"), errors="coerce")
-        chip_reason = pd.Series("", index=merged.index, dtype="object")
-        chip_reason = chip_reason.mask(
-            merged["gdhs_delta_pct"].isna() | merged["announce_date"].isna(),
-            "DATA_MISSING",
-        )
+        chip_reason = pd.Series(pd.NA, index=merged.index, dtype="object")
+
+        missing_gdhs = merged["gdhs_delta_pct"].isna() | merged["announce_date"].isna()
+        chip_reason = chip_reason.mask(missing_gdhs, "DATA_MISSING_GDHS")
+        missing_vol = merged["vol_ratio"].isna()
+        chip_reason = chip_reason.mask(missing_vol & chip_reason.isna(), "DATA_MISSING_VOL_RATIO")
+
         delta_raw = pd.to_numeric(merged.get("gdhs_delta_raw"), errors="coerce")
-        outlier = (merged["gdhs_delta_pct"].abs() > 80) | (delta_raw.abs() > 1_000_000)
-        outlier = outlier.fillna(False)
-        chip_reason = chip_reason.mask(outlier, "DATA_OUTLIER_GDHS")
-        chip_ok = (merged["gdhs_delta_pct"] < -5) & (merged["vol_ratio"] > 1.3)
-        chip_ok = chip_ok.mask(chip_reason == "DATA_OUTLIER_GDHS", False)
-        chip_ok = chip_ok.where(~chip_reason.isin(["DATA_MISSING"]))
-        chip_reject = chip_reason.isna() & (chip_ok == False)  # noqa: E712
-        chip_reason = chip_reason.mask(chip_reject, "CHIP_REJECT")
+        outlier_mask = (merged["gdhs_delta_pct"].abs() > 80) | (delta_raw.abs() > 1_000_000)
+        outlier_mask = outlier_mask.fillna(False)
+        chip_reason = chip_reason.mask(outlier_mask & chip_reason.isna(), "DATA_OUTLIER_GDHS")
+
+        can_eval = chip_reason.isna()
+        chip_ok = pd.Series(pd.NA, index=merged.index, dtype="boolean")
+        chip_ok.loc[can_eval] = (merged.loc[can_eval, "gdhs_delta_pct"] < -5) & (
+            merged.loc[can_eval, "vol_ratio"] > 1.3
+        )
+
+        reject_mask = can_eval & (chip_ok == False)  # noqa: E712
+        chip_reason = chip_reason.mask(reject_mask, "CHIP_REJECT")
+
         merged["chip_ok"] = chip_ok
-        merged["chip_reason"] = chip_reason.replace("", None)
+        merged["chip_reason"] = chip_reason
         merged["sig_date"] = merged["sig_date"].dt.date
         merged["updated_at"] = dt.datetime.now()
 
