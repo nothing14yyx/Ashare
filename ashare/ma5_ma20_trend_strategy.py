@@ -1333,10 +1333,12 @@ class MA5MA20StrategyRunner:
             degrade_wait = buy_confirm_raw & entry_mask & (
                 outlier_risk | (disperse_risk & (structure_weak | vol_guard))
             )
-            final_action = final_action.mask(degrade_wait, "WAIT")
+            # 筹码/数据异常：避免把 BUY_CONFIRM “硬拦”成 WAIT（会直接从 candidates 池消失）
+            # 改为降级为 BUY + 小仓位，让信号还能进入候选池，但仓位明显受控
+            final_action = final_action.mask(degrade_wait, "BUY")
             wait_reason = chip_reason.fillna("CHIP_WEAK") if isinstance(chip_reason, pd.Series) else "CHIP_WEAK"
             final_reason = final_reason.mask(degrade_wait, wait_reason)
-            final_cap = final_cap.mask(degrade_wait, 0.0)
+            final_cap = final_cap.mask(degrade_wait, 0.1)
 
             weak_confirm = buy_confirm_raw & entry_mask & ~degrade_wait
             confirm_cap = np.where(chip_score >= 0.2, 0.2, 0.1)
