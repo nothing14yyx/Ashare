@@ -1567,13 +1567,21 @@ class MA5MA20StrategyRunner:
             self._write_candidates(latest_date, sig_for_candidates)
 
         latest_sig = sig[sig["date"].dt.date == latest_date]
-        cnt_buy = int((latest_sig["signal"] == "BUY").sum())
-        cnt_sell = int((latest_sig["signal"] == "SELL").sum())
-        cnt_hold = int((latest_sig["signal"] == "HOLD").sum())
+        action_col = "final_action" if "final_action" in latest_sig.columns else "signal"
+        action_series = latest_sig[action_col].fillna("HOLD").astype(str)
+        counts = action_series.value_counts(dropna=False)
+        order = ["BUY", "BUY_CONFIRM", "SELL", "REDUCE", "HOLD", "WAIT"]
+        ordered_counts = {k: int(counts.get(k, 0)) for k in order}
+        other_count = int(counts.drop(labels=order, errors="ignore").sum())
         self.logger.info(
-            "MA5-MA20 策略完成：%s BUY / %s SELL / %s HOLD（最新交易日：%s）",
-            cnt_buy,
-            cnt_sell,
-            cnt_hold,
+            "MA5-MA20 策略完成：最终动作(final_action)统计（最新交易日：%s）："
+            "BUY=%s, BUY_CONFIRM=%s, SELL=%s, REDUCE=%s, HOLD=%s, WAIT=%s, OTHER=%s",
             latest_date,
+            ordered_counts["BUY"],
+            ordered_counts["BUY_CONFIRM"],
+            ordered_counts["SELL"],
+            ordered_counts["REDUCE"],
+            ordered_counts["HOLD"],
+            ordered_counts["WAIT"],
+            other_count,
         )
