@@ -3,6 +3,6 @@ data
 dbn_trading_auto
 output/
 .idea
-/export_project.py
-/project_for_llm.txt
+tool/output/
+project_for_llm.txt
 ashare.log
