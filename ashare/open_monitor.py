@@ -1957,6 +1957,14 @@ class MA5MA20OpenMonitorRunner:
         if isinstance(env_context, dict):
             env_context["weekly_gate_policy"] = weekly_gate_policy
 
+        env_context, _, _ = self._attach_index_snapshot(
+            latest_trade_date,
+            monitor_date,
+            run_id,
+            checked_at,
+            env_context,
+        )
+
         self._persist_env_snapshot(
             env_context,
             monitor_date,
@@ -2282,6 +2290,75 @@ class MA5MA20OpenMonitorRunner:
         snapshot["env_index_gate_reason"] = "；".join(gate_reason_parts) or None
         snapshot["env_index_position_cap"] = position_cap
         return snapshot
+
+    def _attach_index_snapshot(
+        self,
+        latest_trade_date: str,
+        monitor_date: str,
+        run_id: str,
+        checked_at: dt.datetime,
+        env_context: dict[str, Any] | None = None,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any], str | None]:
+        ctx = env_context if isinstance(env_context, dict) else {}
+        index_history = self._load_index_history(latest_trade_date)
+        index_live_quote = self._fetch_index_live_quote()
+        index_env_snapshot = self._build_index_env_snapshot(
+            index_history, index_live_quote, ctx
+        )
+        env_index_snapshot_hash = None
+        if index_env_snapshot:
+            index_snapshot_payload = {
+                "monitor_date": monitor_date,
+                "run_id": run_id,
+                "checked_at": checked_at,
+                "index_code": index_env_snapshot.get("env_index_code"),
+                "asof_trade_date": index_env_snapshot.get("env_index_asof_trade_date"),
+                "live_trade_date": index_env_snapshot.get("env_index_live_trade_date"),
+                "asof_close": _to_float(index_env_snapshot.get("env_index_asof_close")),
+                "asof_ma20": _to_float(index_env_snapshot.get("env_index_asof_ma20")),
+                "asof_ma60": _to_float(index_env_snapshot.get("env_index_asof_ma60")),
+                "asof_macd_hist": _to_float(index_env_snapshot.get("env_index_asof_macd_hist")),
+                "asof_atr14": _to_float(index_env_snapshot.get("env_index_asof_atr14")),
+                "live_open": _to_float(index_env_snapshot.get("env_index_live_open")),
+                "live_high": _to_float(index_env_snapshot.get("env_index_live_high")),
+                "live_low": _to_float(index_env_snapshot.get("env_index_live_low")),
+                "live_latest": _to_float(index_env_snapshot.get("env_index_live_latest")),
+                "live_pct_change": _to_float(index_env_snapshot.get("env_index_live_pct_change")),
+                "live_volume": _to_float(index_env_snapshot.get("env_index_live_volume")),
+                "live_amount": _to_float(index_env_snapshot.get("env_index_live_amount")),
+                "dev_ma20_atr": _to_float(index_env_snapshot.get("env_index_dev_ma20_atr")),
+                "gate_action": index_env_snapshot.get("env_index_gate_action"),
+                "gate_reason": index_env_snapshot.get("env_index_gate_reason"),
+                "position_cap": _to_float(index_env_snapshot.get("env_index_position_cap")),
+            }
+            index_snapshot_payload["snapshot_hash"] = make_snapshot_hash(index_snapshot_payload)
+            env_index_snapshot_hash = self._persist_index_snapshot(
+                index_snapshot_payload,
+                table=self.params.env_index_snapshot_table,
+            ) or index_snapshot_payload["snapshot_hash"]
+            index_env_snapshot["env_index_snapshot_hash"] = env_index_snapshot_hash
+
+        if isinstance(ctx, dict):
+            ctx["index_intraday"] = index_env_snapshot
+            ctx["env_index_snapshot_hash"] = env_index_snapshot_hash
+
+        if index_env_snapshot:
+            gate_action = index_env_snapshot.get("env_index_gate_action")
+            gate_reason = index_env_snapshot.get("env_index_gate_reason") or "-"
+            live_pct = _to_float(index_env_snapshot.get("env_index_live_pct_change"))
+            dev_ma20_atr = _to_float(index_env_snapshot.get("env_index_dev_ma20_atr"))
+            self.logger.info(
+                "指数快照：code=%s asof=%s live=%s pct=%.2f%% dev_ma20_atr=%s 门控=%s（%s）",
+                index_env_snapshot.get("env_index_code"),
+                index_env_snapshot.get("env_index_asof_trade_date"),
+                index_env_snapshot.get("env_index_live_trade_date"),
+                0.0 if live_pct is None else live_pct,
+                f"{dev_ma20_atr:.2f}" if dev_ma20_atr is not None else "-",
+                gate_action or "-",
+                gate_reason,
+            )
+
+        return ctx or env_context, index_env_snapshot, env_index_snapshot_hash
 
     def _is_pullback_signal(self, signal_reason: str) -> bool:
         reason_text = str(signal_reason or "")
@@ -4196,10 +4273,13 @@ class MA5MA20OpenMonitorRunner:
             self.logger.info("实时行情已获取：%s 条", len(quotes))
 
         latest_snapshots = self._load_latest_snapshots(latest_trade_date, codes)
+        env_index_snapshot_hash_original = None
         env_context = self.load_env_snapshot_context(
             monitor_date, run_id, allow_fallback=True
         )
         if env_context:
+            if isinstance(env_context, dict):
+                env_index_snapshot_hash_original = env_context.get("env_index_snapshot_hash")
             loaded_run_id = str(env_context.get("run_id") or "")
             env_snapshot_run_id = loaded_run_id or env_snapshot_run_id
             env_snapshot_matched_run_id = bool(loaded_run_id == str(run_id))
@@ -4275,73 +4355,9 @@ class MA5MA20OpenMonitorRunner:
                     str(plan_b_if or "")[:120],
                     str(plan_b_recover or "")[:120],
                 )
-        index_history = self._load_index_history(latest_trade_date)
-        index_live_quote = self._fetch_index_live_quote()
-        index_env_snapshot = self._build_index_env_snapshot(
-            index_history, index_live_quote, env_context
+        env_context, index_env_snapshot, env_index_snapshot_hash = self._attach_index_snapshot(
+            latest_trade_date, monitor_date, run_id, checked_at, env_context
         )
-        env_index_snapshot_hash = None
-        if index_env_snapshot:
-            index_snapshot_payload = {
-                "monitor_date": monitor_date,
-                "run_id": run_id,
-                "checked_at": checked_at,
-                "index_code": index_env_snapshot.get("env_index_code"),
-                "asof_trade_date": index_env_snapshot.get("env_index_asof_trade_date"),
-                "live_trade_date": index_env_snapshot.get("env_index_live_trade_date"),
-                "asof_close": _to_float(
-                    index_env_snapshot.get("env_index_asof_close")
-                ),
-                "asof_ma20": _to_float(index_env_snapshot.get("env_index_asof_ma20")),
-                "asof_ma60": _to_float(index_env_snapshot.get("env_index_asof_ma60")),
-                "asof_macd_hist": _to_float(
-                    index_env_snapshot.get("env_index_asof_macd_hist")
-                ),
-                "asof_atr14": _to_float(index_env_snapshot.get("env_index_asof_atr14")),
-                "live_open": _to_float(index_env_snapshot.get("env_index_live_open")),
-                "live_high": _to_float(index_env_snapshot.get("env_index_live_high")),
-                "live_low": _to_float(index_env_snapshot.get("env_index_live_low")),
-                "live_latest": _to_float(
-                    index_env_snapshot.get("env_index_live_latest")
-                ),
-                "live_pct_change": _to_float(
-                    index_env_snapshot.get("env_index_live_pct_change")
-                ),
-                "live_volume": _to_float(index_env_snapshot.get("env_index_live_volume")),
-                "live_amount": _to_float(index_env_snapshot.get("env_index_live_amount")),
-                "dev_ma20_atr": _to_float(
-                    index_env_snapshot.get("env_index_dev_ma20_atr")
-                ),
-                "gate_action": index_env_snapshot.get("env_index_gate_action"),
-                "gate_reason": index_env_snapshot.get("env_index_gate_reason"),
-                "position_cap": _to_float(
-                    index_env_snapshot.get("env_index_position_cap")
-                ),
-            }
-            index_snapshot_payload["snapshot_hash"] = make_snapshot_hash(index_snapshot_payload)
-            env_index_snapshot_hash = self._persist_index_snapshot(
-                index_snapshot_payload,
-                table=self.params.env_index_snapshot_table,
-            ) or index_snapshot_payload["snapshot_hash"]
-            index_env_snapshot["env_index_snapshot_hash"] = env_index_snapshot_hash
-        if isinstance(env_context, dict):
-            env_context["index_intraday"] = index_env_snapshot
-            env_context["env_index_snapshot_hash"] = env_index_snapshot_hash
-        if index_env_snapshot:
-            gate_action = index_env_snapshot.get("env_index_gate_action")
-            gate_reason = index_env_snapshot.get("env_index_gate_reason") or "-"
-            live_pct = _to_float(index_env_snapshot.get("env_index_live_pct_change"))
-            dev_ma20_atr = _to_float(index_env_snapshot.get("env_index_dev_ma20_atr"))
-            self.logger.info(
-                "指数快照：code=%s asof=%s live=%s pct=%.2f%% dev_ma20_atr=%s 门控=%s（%s）",
-                index_env_snapshot.get("env_index_code"),
-                index_env_snapshot.get("env_index_asof_trade_date"),
-                index_env_snapshot.get("env_index_live_trade_date"),
-                0.0 if live_pct is None else live_pct,
-                f"{dev_ma20_atr:.2f}" if dev_ma20_atr is not None else "-",
-                gate_action or "-",
-                gate_reason,
-            )
         result = self._evaluate(
             signals,
             quotes,
@@ -4362,11 +4378,19 @@ class MA5MA20OpenMonitorRunner:
                 and str(env_context.get("run_id") or "") == str(run_id)
             )
 
-        if (
-            self.params.persist_env_snapshot
-            and env_context
-            and not env_snapshot_matched_run_id
-        ):
+        env_snapshot_should_update = False
+        if isinstance(env_context, dict):
+            env_snapshot_should_update = bool(
+                self.params.persist_env_snapshot
+                and env_context
+                and (
+                    (not env_snapshot_matched_run_id)
+                    or env_context.get("env_index_snapshot_hash")
+                    != env_index_snapshot_hash_original
+                )
+            )
+
+        if env_snapshot_should_update:
             self._persist_env_snapshot(
                 env_context,
                 monitor_date,
