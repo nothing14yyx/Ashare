@@ -3,6 +3,8 @@ from __future__ import annotations
 import datetime as dt
 from typing import Iterable, List, Tuple
 
+import numpy as np
+
 import pandas as pd
 from sqlalchemy import bindparam, text
 
@@ -138,17 +140,15 @@ class ChipFilter:
 
         chip_df = chip_df.sort_values(["code", "announce_date"], ignore_index=True)
 
-        merged_parts = []
+        merged_parts: list[pd.DataFrame] = []
         for code, sig_slice in sig_df.groupby("code", sort=False):
             chip_slice = chip_df[chip_df["code"] == code]
+
             if chip_slice.empty:
-                part = (
-                    sig_slice.assign(
-                        announce_date=pd.NaT,
-                        gdhs_delta_pct=pd.NA,
-                        gdhs_delta_raw=pd.NA,
-                    )
-                )
+                part = sig_slice.copy()
+                part["announce_date"] = pd.NaT
+                part["gdhs_delta_pct"] = np.nan
+                part["gdhs_delta_raw"] = np.nan
             else:
                 part = pd.merge_asof(
                     sig_slice,
@@ -158,24 +158,27 @@ class ChipFilter:
                     direction="backward",
                     allow_exact_matches=True,
                 )
+
             part = part.copy()
             part["code"] = code
-            part = part.dropna(how="all")
-            if not part.empty:
-                merged_parts.append(part)
 
-        cleaned_parts = []
-        for part in merged_parts:
-            if part is None:
+            # 关键：统一 dtype，避免 concat 时因“空/全 NA 块”的 dtype 推断变化触发 FutureWarning
+            part["announce_date"] = pd.to_datetime(part.get("announce_date"), errors="coerce")
+            part["gdhs_delta_pct"] = pd.to_numeric(part.get("gdhs_delta_pct"), errors="coerce")
+            part["gdhs_delta_raw"] = pd.to_numeric(part.get("gdhs_delta_raw"), errors="coerce")
+
+            # 过滤空块 / 全 NA 块（FutureWarning 的根源之一）
+            if part.empty:
                 continue
-            trimmed = part.dropna(how="all")
-            if not trimmed.empty:
-                cleaned_parts.append(trimmed)
+            if not part.notna().any().any():
+                continue
 
-        if not cleaned_parts:
+            merged_parts.append(part)
+
+        if not merged_parts:
             return pd.DataFrame()
 
-        merged = pd.concat(cleaned_parts, ignore_index=True)
+        merged = pd.concat(merged_parts, ignore_index=True)
         if "code" not in merged.columns:
             self.logger.warning("strategy_chip_filter 缺少 code 列，已跳过写入。")
             return pd.DataFrame()
