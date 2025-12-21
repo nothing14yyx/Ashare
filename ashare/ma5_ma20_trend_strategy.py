@@ -1175,13 +1175,21 @@ class MA5MA20StrategyRunner:
 
         chip_ok = out.get("chip_ok")
         chip_reason = out.get("chip_reason")
+        chip_reason = chip_reason.replace("", pd.NA) if isinstance(chip_reason, pd.Series) else chip_reason
         has_chip = chip_ok.notna() if isinstance(chip_ok, pd.Series) else pd.Series(False, index=out.index)
         chip_reject = has_chip & (chip_ok == False)  # noqa: E712
         final_action = final_action.mask(chip_reject, "WAIT")
-        final_reason = final_reason.mask(chip_reject, chip_reason.fillna("DATA_OUTLIER_GDHS"))
+        default_chip_reason = (
+            chip_reason.fillna("CHIP_REJECT") if isinstance(chip_reason, pd.Series) else "CHIP_REJECT"
+        )
+        final_reason = final_reason.mask(chip_reject, default_chip_reason)
         final_cap = final_cap.mask(chip_reject, 0.0)
 
-        chip_missing = chip_reason == "DATA_MISSING"
+        chip_missing = (
+            chip_reason == "DATA_MISSING"
+            if isinstance(chip_reason, pd.Series)
+            else pd.Series(False, index=out.index)
+        )
         final_action = final_action.mask(chip_missing & ~chip_reject, "HOLD")
         final_reason = final_reason.mask(chip_missing & ~chip_reject, "DATA_MISSING")
         final_cap = final_cap.mask(chip_missing, 0.0)
