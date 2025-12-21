@@ -1078,7 +1078,9 @@ class MA5MA20StrategyRunner:
         )
         merged["chip_ok"] = merged.get("chip_ok")
         merged["chip_reason"] = merged.get("chip_reason")
-        missing_chip_mask = merged["chip_reason"].isna()
+        gdhs_missing = merged["gdhs_announce_date"].isna() & merged["gdhs_delta_pct"].isna()
+        chip_all_missing = gdhs_missing & merged["chip_ok"].isna()
+        missing_chip_mask = merged["chip_reason"].isna() & (gdhs_missing | chip_all_missing)
         merged.loc[missing_chip_mask, "chip_reason"] = "DATA_MISSING"
         merged.loc[missing_chip_mask, "chip_ok"] = pd.NA
         return merged
