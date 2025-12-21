@@ -201,8 +201,8 @@ class ChipFilter:
         outlier = (merged["gdhs_delta_pct"].abs() > 80) | (delta_raw.abs() > 1_000_000)
         outlier = outlier.fillna(False)
         chip_reason = chip_reason.mask(outlier, "DATA_OUTLIER_GDHS")
-        chip_ok = (merged["gdhs_delta_pct"] < -5) & (merged["vol_ratio"] > 1.5)
-        chip_ok = chip_ok.mask(outlier, False)
+        chip_ok = (merged["gdhs_delta_pct"] < -5) & (merged["vol_ratio"] > 1.3)
+        chip_ok = chip_ok.mask(chip_reason == "DATA_OUTLIER_GDHS", False)
         chip_ok = chip_ok.where(~chip_reason.isin(["DATA_MISSING"]))
         chip_reject = chip_reason.isna() & (chip_ok == False)  # noqa: E712
         chip_reason = chip_reason.mask(chip_reject, "CHIP_REJECT")
