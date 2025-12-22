@@ -2978,7 +2978,7 @@ class MA5MA20OpenMonitorRunner:
         for idx, row in merged.iterrows():
             action = "EXECUTE"
             reason = "OK"
-            candidate_status = "ACTIVE"
+            candidate_status = "OK"
             status_reason = "结构/时效通过"
             status_hits: list[tuple[str, str]] = []
             entry_exposure_cap = None
@@ -3263,14 +3263,14 @@ class MA5MA20OpenMonitorRunner:
 
             candidate_stage = "ACTIVE" if primary_state == "OK" else "INACTIVE"
             candidate_state = primary_state
-            candidate_status = "ACTIVE" if candidate_stage == "ACTIVE" else candidate_state
+            candidate_status = candidate_state  # 统一口径：status 用 state，stage 仅表示 ACTIVE/INACTIVE
             status_reason = primary_reason or "结构/时效通过"
 
-            if candidate_status != "ACTIVE" and action not in {"STOP", "REDUCE_50%"}:
+            if candidate_stage != "ACTIVE" and action not in {"STOP", "REDUCE_50%"}:
                 action = "SKIP"
                 if (
                     runup_triggered
-                    and candidate_status != "RUNUP_TOO_LARGE"
+                    and candidate_stage != "RUNUP_TOO_LARGE"
                     and runup_detail
                 ):
                     status_reason = f"{status_reason}；{runup_detail}"
@@ -3422,7 +3422,7 @@ class MA5MA20OpenMonitorRunner:
                 breakdown_reason = f"大盘结构破位，执行跳过{pos_hint_text}"
                 if env_regime == "BREAKDOWN":
                     action = "SKIP"
-                    if candidate_status == "ACTIVE":
+                    if candidate_stage == "ACTIVE":
                         status_reason = "市场环境 BREAKDOWN，暂不执行"
                     if reason and reason != "OK":
                         reason = breakdown_reason + "；" + reason
@@ -3430,14 +3430,14 @@ class MA5MA20OpenMonitorRunner:
                         reason = breakdown_reason
                 elif env_regime == "RISK_OFF":
                     action = "WAIT"
-                    if candidate_status == "ACTIVE":
+                    if candidate_stage == "ACTIVE":
                         status_reason = "市场环境 RISK_OFF，轻仓观望"
                     if reason == "OK":
                         reason = f"大盘偏弱{pos_hint_text}"
                 elif env_regime == "PULLBACK" and not risk_tags_split and reason == "OK":
                     reason = f"大盘处于回踩阶段{pos_hint_text}"
 
-            if action == "EXECUTE" and candidate_status == "ACTIVE":
+            if action == "EXECUTE" and candidate_stage == "ACTIVE":
                 plan_tail = ""
                 if env_weekly_plan_a:
                     plan_tail = str(env_weekly_plan_a)
@@ -3572,7 +3572,7 @@ class MA5MA20OpenMonitorRunner:
                 if action in {"EXECUTE", "EXECUTE_SMALL"}:
                     action = "WAIT"
                 entry_exposure_cap = 0.0
-                if candidate_status == "ACTIVE":
+                if candidate_stage == "ACTIVE":
                     status_reason = (
                         f"{status_reason}；{gate_reason_text}"
                         if status_reason
@@ -3591,11 +3591,11 @@ class MA5MA20OpenMonitorRunner:
                 )
                 reason = f"{reason}；{wait_text}" if reason and reason != "OK" else wait_text
 
-            if candidate_status == "ACTIVE" and action in {"SKIP", "WAIT"}:
+            if candidate_stage == "ACTIVE" and action in {"SKIP", "WAIT"}:
                 status_reason = reason
 
             exposure_chain = None
-            if candidate_status == "ACTIVE":
+            if candidate_stage == "ACTIVE":
                 chain_parts = [f"{name}={val*100:.0f}%" for name, val in cap_candidates]
                 if entry_exposure_cap is not None:
                     chain_tail = f"{entry_exposure_cap*100:.0f}%"
@@ -3652,7 +3652,8 @@ class MA5MA20OpenMonitorRunner:
             env_index_snapshot_hashes.append(index_intraday.get("env_index_snapshot_hash"))
             env_final_gate_action_list.append(final_gate_action)
 
-            vol_ratio_val = _to_float(live_intraday_vol_ratio)
+            # summary 里展示“实际用于判断”的量比：优先盘中量比，其次回退到 asof/sig 量比
+            vol_ratio_val = _to_float(_vol_ratio_dec(row))
             dev_ma20_atr_val = _to_float(dev_ma20_atr)
             runup_atr_val = _to_float(runup_from_sigclose_atr)
             vol_ratio_txt = f"{vol_ratio_val:.2f}" if vol_ratio_val is not None else "-"

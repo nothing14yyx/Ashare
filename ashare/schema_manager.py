@@ -33,9 +33,8 @@ TABLE_STRATEGY_OPEN_MONITOR_EVAL = "strategy_open_monitor_eval"
 TABLE_STRATEGY_OPEN_MONITOR_ENV = "strategy_open_monitor_env"
 TABLE_STRATEGY_OPEN_MONITOR_QUOTE = "strategy_open_monitor_quote"
 VIEW_STRATEGY_OPEN_MONITOR_WIDE = "v_strategy_open_monitor_wide"
-# 兼容旧宽表命名
-VIEW_STRATEGY_OPEN_MONITOR_COMPAT = "strategy_open_monitor"
-
+# 开盘监测默认查询视图（精简字段；完整字段请查 v_strategy_open_monitor_wide）
+VIEW_STRATEGY_OPEN_MONITOR = "strategy_open_monitor"
 # 大盘/指数环境快照
 TABLE_ENV_INDEX_SNAPSHOT = "strategy_env_index_snapshot"
 
@@ -175,10 +174,10 @@ class SchemaManager:
             str(
                 open_monitor_cfg.get(
                     "open_monitor_compat_view",
-                    VIEW_STRATEGY_OPEN_MONITOR_COMPAT,
+                    VIEW_STRATEGY_OPEN_MONITOR,
                 )
             ).strip()
-            or VIEW_STRATEGY_OPEN_MONITOR_COMPAT
+            or VIEW_STRATEGY_OPEN_MONITOR
         )
 
         return TableNames(
