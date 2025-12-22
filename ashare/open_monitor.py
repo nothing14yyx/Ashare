@@ -37,7 +37,6 @@ from .baostock_core import BaostockDataFetcher
 from .baostock_session import BaostockSession
 from .config import get_section
 from .db import DatabaseConfig, MySQLWriter
-from .env_snapshot_utils import resolve_weekly_asof_date
 from .ma5_ma20_trend_strategy import _atr, _macd
 from .schema_manager import (
     TABLE_ENV_INDEX_SNAPSHOT,
@@ -49,6 +48,7 @@ from .schema_manager import (
     STRATEGY_CODE_MA5_MA20_TREND,
     VIEW_STRATEGY_OPEN_MONITOR,
     VIEW_STRATEGY_OPEN_MONITOR_WIDE,
+    VIEW_STRATEGY_READY_SIGNALS,
 )
 from .utils.convert import to_float as _to_float
 from .utils.logger import setup_logger
@@ -447,6 +447,7 @@ class OpenMonitorParams:
     # 信号来源表：默认使用 strategy_signal_events
     signal_events_table: str = TABLE_STRATEGY_SIGNAL_EVENTS
     indicator_table: str = TABLE_STRATEGY_INDICATOR_DAILY
+    ready_signals_view: str = VIEW_STRATEGY_READY_SIGNALS
     quote_table: str = TABLE_STRATEGY_OPEN_MONITOR_QUOTE
     strategy_code: str = STRATEGY_CODE_MA5_MA20_TREND
 
@@ -614,6 +615,10 @@ class OpenMonitorParams:
             or default_events,
             indicator_table=str(sec.get("indicator_table", default_indicator)).strip()
             or default_indicator,
+            ready_signals_view=str(
+                sec.get("ready_signals_view", cls.ready_signals_view)
+            ).strip()
+            or cls.ready_signals_view,
             quote_table=str(sec.get("quote_table", cls.quote_table)).strip() or cls.quote_table,
             strategy_code=str(sec.get("strategy_code", default_strategy_code)).strip()
             or default_strategy_code,
@@ -947,9 +952,25 @@ class MA5MA20OpenMonitorRunner:
                 index_snapshot = raw_index_snapshot
         env_index_hash = index_snapshot.get("env_index_snapshot_hash")
         payload["env_index_snapshot_hash"] = env_index_hash
-        payload["env_final_gate_action"] = self._merge_gate_actions(
-            weekly_gate_action, index_snapshot.get("env_index_gate_action")
+        payload["env_final_gate_action"] = env_context.get("env_final_gate_action")
+        if payload["env_final_gate_action"] is None:
+            self.logger.error(
+                "环境快照缺少 env_final_gate_action，已跳过写入（monitor_date=%s, run_id=%s）。",
+                monitor_date,
+                run_id,
+            )
+            return
+        cap_candidates = [
+            env_context.get("env_final_cap_pct") if isinstance(env_context, dict) else None,
+            env_context.get("effective_position_hint") if isinstance(env_context, dict) else None,
+            env_context.get("position_hint") if isinstance(env_context, dict) else None,
+            index_snapshot.get("env_index_position_cap") if isinstance(index_snapshot, dict) else None,
+        ]
+        payload["env_final_cap_pct"] = next(
+            ( _to_float(c) for c in cap_candidates if _to_float(c) is not None),
+            None,
         )
+        payload["env_final_reason_json"] = env_context.get("env_final_reason_json")
 
         if not self._table_exists(table):
             self.logger.error("环境快照表 %s 不存在，已跳过写入。", table)
@@ -1080,37 +1101,28 @@ class MA5MA20OpenMonitorRunner:
         table = self.params.env_snapshot_table
         if not (table and monitor_date and self._table_exists(table)):
             return None
+        if run_id is None:
+            self.logger.error("读取环境快照时缺少 run_id（monitor_date=%s）。", monitor_date)
+            return None
 
-        def _load_latest(match_run_id: bool) -> pd.DataFrame:
-            run_clause = "`run_id` = :b AND" if match_run_id else ""
-            stmt = text(
-                f"""
-                SELECT * FROM `{table}`
-                WHERE {run_clause} `monitor_date` = :d
-                ORDER BY `checked_at` DESC
-                LIMIT 1
-                """
-            )
-
-            params: dict[str, Any] = {"d": monitor_date}
-            if match_run_id and run_id is not None:
-                params["b"] = run_id
-            elif match_run_id:
-                return pd.DataFrame()
-
-            with self.db_writer.engine.begin() as conn:
-                return pd.read_sql_query(stmt, conn, params=params)
+        stmt = text(
+            f"""
+            SELECT * FROM `{table}`
+            WHERE `run_id` = :b AND `monitor_date` = :d
+            ORDER BY `checked_at` DESC
+            LIMIT 1
+            """
+        )
 
         try:
-            if run_id is None:
-                df = _load_latest(match_run_id=False)
-            else:
-                df = _load_latest(match_run_id=True)
+            with self.db_writer.engine.begin() as conn:
+                df = pd.read_sql_query(stmt, conn, params={"d": monitor_date, "b": run_id})
         except Exception as exc:  # noqa: BLE001
             self.logger.debug("读取环境快照失败：%s", exc)
             return None
 
         if df.empty:
+            self.logger.error("未找到环境快照（monitor_date=%s, run_id=%s）。", monitor_date, run_id)
             return None
 
         row = df.iloc[0]
@@ -1233,6 +1245,9 @@ class MA5MA20OpenMonitorRunner:
             ),
             "run_id": row.get("run_id"),
             "env_index_snapshot_hash": index_snapshot_hash,
+            "env_final_gate_action": row.get("env_final_gate_action"),
+            "env_final_cap_pct": row.get("env_final_cap_pct"),
+            "env_final_reason_json": row.get("env_final_reason_json"),
         }
         index_snapshot = loaded_index_snapshot or {
             "env_index_code": row.get("env_index_code"),
@@ -1268,49 +1283,11 @@ class MA5MA20OpenMonitorRunner:
         self,
         monitor_date: str,
         run_id: str | None = None,
-        *,
-        allow_fallback: bool = True,
     ) -> dict[str, Any] | None:
-        """公开的环境快照读取接口，必要时可回退到当日最新。"""
+        """公开的环境快照读取接口，严格按 monitor_date + run_id 匹配。"""
 
         self.weekly_env_fallback_asof_date = None
-        env_context = self._load_env_snapshot_context(monitor_date, run_id)
-        if env_context:
-            return env_context
-
-        if allow_fallback and run_id is not None:
-            env_context = self._load_env_snapshot_context(monitor_date, None)
-            if env_context:
-                return env_context
-
-        if allow_fallback:
-            try:
-                asof_date = resolve_weekly_asof_date(include_current_week=False)
-            except Exception as exc:  # noqa: BLE001
-                self.logger.debug("解析周线 asof_date 失败：%s", exc)
-                return None
-
-            if not asof_date:
-                return None
-
-            self.logger.info(
-                "最近已收盘周 asof_date=%s",
-                asof_date,
-            )
-
-            env_context = self._load_env_snapshot_context(
-                asof_date, f"WEEKLY_{asof_date}"
-            )
-            if env_context:
-                self.weekly_env_fallback_asof_date = asof_date
-                return env_context
-
-            env_context = self._load_env_snapshot_context(asof_date, None)
-            if env_context:
-                self.weekly_env_fallback_asof_date = asof_date
-                return env_context
-
-        return None
+        return self._load_env_snapshot_context(monitor_date, run_id)
 
     def _resolve_env_weekly_gate_policy(
         self, env_context: dict[str, Any] | None
@@ -1539,7 +1516,7 @@ class MA5MA20OpenMonitorRunner:
         return {d: i for i, d in enumerate(dates)}
 
     def _load_recent_buy_signals(self) -> Tuple[str | None, List[str], pd.DataFrame]:
-        events_table = self.params.signal_events_table
+        events_table = self.params.ready_signals_view or self.params.signal_events_table
         indicator_table = self.params.indicator_table
         monitor_date = dt.date.today().isoformat()
         # 严格最近 N 个交易日窗口：只由 signal_lookback_days 决定
@@ -2593,6 +2570,39 @@ class MA5MA20OpenMonitorRunner:
         if signals.empty:
             return pd.DataFrame()
 
+        checked_at_ts = checked_at or dt.datetime.now()
+        run_id = self._calc_run_id(checked_at_ts)
+        monitor_date = checked_at_ts.date().isoformat()
+        run_id_norm = str(run_id or "").strip().upper()
+
+        env_final_gate_action = None
+        env_final_cap_pct = None
+        env_final_reason_json = None
+        env_index_snapshot_hash = None
+        env_regime = None
+        env_position_hint = None
+        env_weekly_asof_trade_date = None
+        env_weekly_risk_level = None
+        env_weekly_scene = None
+        if isinstance(env_context, dict):
+            env_final_gate_action = env_context.get("env_final_gate_action")
+            env_final_cap_pct = _to_float(env_context.get("env_final_cap_pct"))
+            env_final_reason_json = env_context.get("env_final_reason_json")
+            env_index_snapshot_hash = env_context.get("env_index_snapshot_hash")
+            env_regime = env_context.get("regime")
+            env_position_hint = _to_float(env_context.get("position_hint"))
+            env_weekly_asof_trade_date = env_context.get("weekly_asof_trade_date")
+            env_weekly_risk_level = env_context.get("weekly_risk_level")
+            env_weekly_scene = env_context.get("weekly_scene_code")
+
+        if env_final_gate_action is None:
+            self.logger.error(
+                "环境快照缺少 env_final_gate_action，已终止评估（monitor_date=%s, run_id=%s）。",
+                monitor_date,
+                run_id,
+            )
+            return pd.DataFrame()
+
         q = quotes.copy()
         live_rename_map = {
             "open": "live_open",
@@ -2607,85 +2617,12 @@ class MA5MA20OpenMonitorRunner:
             "prev_close": "prev_close",
         }
         q = q.rename(columns={k: v for k, v in live_rename_map.items() if k in q.columns})
-        checked_at_ts = checked_at or dt.datetime.now()
-        run_id = self._calc_run_id(checked_at_ts)
-        avg_volume_map = self._load_avg_volume(
-            latest_trade_date, signals["code"].dropna().astype(str).unique().tolist()
-        )
-        minutes_elapsed = self._calc_minutes_elapsed(checked_at_ts)
-        total_minutes = 240
-        if q.empty:
-            out = signals.copy()
-            out["monitor_date"] = checked_at_ts.date().isoformat()
-            out["live_trade_date"] = out["monitor_date"]
-            out["live_open"] = None
-            out["live_latest"] = None
-            out["live_high"] = None
-            out["live_low"] = None
-            out["live_pct_change"] = None
-            out["live_gap_pct"] = None
-            out["live_volume"] = None
-            out["live_amount"] = None
-            out["live_intraday_vol_ratio"] = None
-            out["asof_close"] = out.get("sig_close")
-            out["asof_ma5"] = out.get("sig_ma5")
-            out["asof_ma20"] = out.get("sig_ma20")
-            out["asof_ma60"] = out.get("sig_ma60")
-            out["asof_ma250"] = out.get("sig_ma250")
-            out["asof_vol_ratio"] = out.get("sig_vol_ratio")
-            out["asof_macd_hist"] = out.get("sig_macd_hist")
-            out["asof_atr14"] = out.get("sig_atr14")
-            out["asof_stop_ref"] = out.get("sig_stop_ref")
-            out["asof_trade_date"] = out.get("sig_date")
-            out["avg_volume_20"] = None
-            out["dev_ma5"] = None
-            out["dev_ma20"] = None
-            out["dev_ma5_atr"] = None
-            out["dev_ma20_atr"] = None
-            out["runup_from_sigclose"] = None
-            out["runup_from_sigclose_atr"] = None
-            out["runup_ref_price"] = None
-            out["runup_ref_source"] = None
-            out["rule_hits_json"] = None
-            out["state"] = "UNKNOWN"
-            out["env_index_snapshot_hash"] = None
-            out["env_final_gate_action"] = None
-            out["summary_line"] = "UNKNOWN UNKNOWN | 行情数据不可用"
-            out["action"] = "UNKNOWN"
-            out["action_reason"] = "行情数据不可用"
-            out["status_reason"] = "行情数据不可用"
-            out["checked_at"] = checked_at_ts
-            out["run_id"] = run_id
-            return out
+        q["code"] = q["code"].astype(str) if not q.empty and "code" in q.columns else q.get("code")
 
-        q["code"] = q["code"].astype(str)
-        merged = signals.merge(q, on="code", how="left", suffixes=("", "_q"))
+        merged = signals.copy()
+        merged["code"] = merged["code"].astype(str)
+        merged = merged.merge(q, on="code", how="left", suffixes=("", "_q"))
 
-        env_context = env_context or {}
-        if not env_context.get("index"):
-            env_context["index"] = self._load_index_trend(latest_trade_date)
-        if not env_context.get("boards"):
-            board_df = self._load_board_spot_strength(latest_trade_date, checked_at)
-            board_map: dict[str, Any] = {}
-            if not board_df.empty and "board_name" in board_df.columns:
-                total = len(board_df)
-                for _, row in board_df.iterrows():
-                    name = str(row.get("board_name") or "").strip()
-                    code = str(row.get("board_code") or "").strip()
-                    rank = _to_float(row.get("rank"))
-                    pct = _to_float(row.get("chg_pct"))
-                    status = "neutral"
-                    if total > 0 and rank:
-                        if rank <= max(1, int(total * 0.2)):
-                            status = "strong"
-                        elif rank >= max(1, int(total * 0.8)):
-                            status = "weak"
-                    payload = {"rank": rank, "chg_pct": pct, "status": status}
-                    for key in [name, code]:
-                        key_norm = str(key).strip()
-                        if key_norm:
-                            board_map[key_norm] = payload
-            env_context["boards"] = board_map
         industry_dim = self._load_stock_industry_dim()
         if not industry_dim.empty:
             rename_map = {}
@@ -2699,101 +2636,13 @@ class MA5MA20OpenMonitorRunner:
                 on="code",
                 how="left",
             )
+
         board_dim = self._load_board_constituent_dim()
         if not board_dim.empty:
             cols = [c for c in ["code", "board_name", "board_code"] if c in board_dim.columns]
             if cols:
                 deduped = board_dim.drop_duplicates(subset=["code"], keep="first")
                 merged = merged.merge(deduped[cols], on="code", how="left")
-
-        board_map: dict[str, Any] = env_context.get("boards", {}) if isinstance(env_context, dict) else {}
-        env_regime = env_context.get("regime") if isinstance(env_context, dict) else None
-        env_position_hint_raw = None
-        env_position_hint = None
-        if isinstance(env_context, dict):
-            env_position_hint_raw = _to_float(env_context.get("position_hint_raw"))
-            env_position_hint = _to_float(
-                env_context.get("effective_position_hint")
-            )
-            if env_position_hint is None:
-                env_position_hint = _to_float(env_context.get("position_hint"))
-
-        index_intraday: dict[str, Any] = {}
-        if isinstance(env_context, dict):
-            raw_index = env_context.get("index_intraday") or env_context.get("env_index")
-            if isinstance(raw_index, dict):
-                index_intraday = raw_index
-
-        env_weekly_asof_trade_date = None
-        env_weekly_risk_level = None
-        env_weekly_gating_enabled = False
-        env_weekly_plan_a = None
-        env_weekly_plan_b = None
-        env_weekly_scene = None
-        env_weekly_plan_a_exposure_cap = None
-        env_weekly_bias = None
-        env_weekly_status = None
-        env_weekly_structure_status = None
-        env_weekly_pattern_status = None
-        if isinstance(env_context, dict):
-            env_weekly_asof_trade_date = env_context.get("weekly_asof_trade_date")
-            env_weekly_risk_level = env_context.get("weekly_risk_level")
-            env_weekly_gating_enabled = bool(env_context.get("weekly_gating_enabled", False))
-            env_weekly_plan_a = env_context.get("weekly_plan_a")
-            env_weekly_plan_b = env_context.get("weekly_plan_b")
-            env_weekly_scene = env_context.get("weekly_scene_code")
-            env_weekly_plan_a_exposure_cap = _to_float(
-                env_context.get("weekly_plan_a_exposure_cap")
-            )
-            env_weekly_bias = env_context.get("weekly_bias")
-            env_weekly_structure_status = env_context.get("weekly_structure_status")
-            env_weekly_pattern_status = env_context.get("weekly_pattern_status")
-            env_weekly_status = env_weekly_structure_status or env_context.get("weekly_status")
-        if env_weekly_pattern_status is None:
-            env_weekly_pattern_status = env_weekly_status
-        env_index_code = index_intraday.get("env_index_code")
-        env_index_asof_trade_date = index_intraday.get("env_index_asof_trade_date")
-        env_index_asof_close = _to_float(index_intraday.get("env_index_asof_close"))
-        env_index_asof_ma20 = _to_float(index_intraday.get("env_index_asof_ma20"))
-        env_index_asof_ma60 = _to_float(index_intraday.get("env_index_asof_ma60"))
-        env_index_asof_macd_hist = _to_float(
-            index_intraday.get("env_index_asof_macd_hist")
-        )
-        env_index_asof_atr14 = _to_float(index_intraday.get("env_index_asof_atr14"))
-        env_index_live_trade_date = index_intraday.get("env_index_live_trade_date")
-        env_index_live_open = _to_float(index_intraday.get("env_index_live_open"))
-        env_index_live_high = _to_float(index_intraday.get("env_index_live_high"))
-        env_index_live_low = _to_float(index_intraday.get("env_index_live_low"))
-        env_index_live_latest = _to_float(index_intraday.get("env_index_live_latest"))
-        env_index_live_pct_change = _to_float(
-            index_intraday.get("env_index_live_pct_change")
-        )
-        env_index_live_volume = _to_float(index_intraday.get("env_index_live_volume"))
-        env_index_live_amount = _to_float(index_intraday.get("env_index_live_amount"))
-        env_index_dev_ma20_atr = _to_float(index_intraday.get("env_index_dev_ma20_atr"))
-        env_index_gate_action = (
-            str(index_intraday.get("env_index_gate_action")).strip().upper()
-            if index_intraday.get("env_index_gate_action") is not None
-            else None
-        )
-        if env_index_gate_action == "GO":
-            env_index_gate_action = "ALLOW"
-        env_index_gate_reason = index_intraday.get("env_index_gate_reason")
-        env_index_position_cap = _to_float(index_intraday.get("env_index_position_cap"))
-
-        if env_position_hint is None:
-            env_position_hint = env_position_hint_raw
-
-        if env_weekly_gating_enabled and env_weekly_plan_a_exposure_cap is not None:
-            if env_position_hint is None:
-                env_position_hint = env_weekly_plan_a_exposure_cap
-            else:
-                env_position_hint = min(env_position_hint, env_weekly_plan_a_exposure_cap)
-        index_score = None
-        if isinstance(env_context, dict):
-            index_section = env_context.get("index", {}) if isinstance(env_context.get("index"), dict) else {}
-            index_score = index_section.get("score")
-        idx_score_float = _to_float(index_score)
 
         if not latest_snapshots.empty:
             snap = latest_snapshots.copy()
@@ -2811,13 +2660,14 @@ class MA5MA20OpenMonitorRunner:
         else:
             merged["_has_latest_snapshot"] = merged["_has_latest_snapshot"].eq(True)
 
-        if "asof_close" in merged.columns and "sig_close" in merged.columns:
-            merged["asof_close"] = merged["asof_close"].fillna(merged.get("sig_close"))
-
-        if avg_volume_map:
-            merged["avg_volume_20"] = merged["code"].map(avg_volume_map)
-        else:
-            merged["avg_volume_20"] = None
+        avg_volume_map = self._load_avg_volume(
+            latest_trade_date, merged["code"].dropna().astype(str).unique().tolist()
+        )
+        minutes_elapsed = self._calc_minutes_elapsed(checked_at_ts)
+        total_minutes = 240
+        merged["avg_volume_20"] = (
+            merged["code"].map(avg_volume_map) if avg_volume_map else None
+        )
 
         float_cols = [
             "sig_close",
@@ -2831,15 +2681,6 @@ class MA5MA20OpenMonitorRunner:
             "sig_kdj_d",
             "sig_atr14",
             "sig_stop_ref",
-            "asof_close",
-            "asof_ma5",
-            "asof_ma20",
-            "asof_ma60",
-            "asof_ma250",
-            "asof_vol_ratio",
-            "asof_macd_hist",
-            "asof_atr14",
-            "asof_stop_ref",
             "live_open",
             "live_latest",
             "live_high",
@@ -2848,45 +2689,10 @@ class MA5MA20OpenMonitorRunner:
             "live_volume",
             "live_amount",
             "prev_close",
-            "avg_volume_20",
-            "_signal_day_pct_change",
-            "signal_strength",
-            "strength_delta",
         ]
         for col in float_cols:
             if col in merged.columns:
                 merged[col] = merged.get(col).apply(_to_float)
-
-        def _resolve_ref_close(row: pd.Series) -> tuple[str, float] | tuple[None, None]:
-            for key in ("prev_close", "asof_close", "sig_close"):
-                val = row.get(key)
-                if val is not None and val > 0:
-                    return key, float(val)
-            return None, None
-
-        def _resolve_live_pct_change(row: pd.Series) -> float | None:
-            latest_px = row.get("live_latest")
-            base_key, base_close = _resolve_ref_close(row)
-
-            reported_pct = row.get("live_pct_change")
-            if base_close is None or latest_px is None or latest_px <= 0:
-                return reported_pct
-
-            computed_pct = (latest_px / base_close - 1.0) * 100.0
-            if reported_pct is not None and abs(computed_pct - reported_pct) > 0.5:
-                base_label = base_key or "unknown"
-                self.logger.debug(
-                    "live_pct_change 偏差超过 0.5%%，按计算值覆盖：code=%s latest=%.4f %s=%.4f reported=%.4f computed=%.4f",
-                    row.get("code"),
-                    latest_px,
-                    base_label,
-                    base_close,
-                    reported_pct,
-                    computed_pct,
-                )
-            return computed_pct
-
-        merged["live_pct_change"] = merged.apply(_resolve_live_pct_change, axis=1)
 
         def _infer_volume_scale_factor(df: pd.DataFrame) -> float:
             if "live_volume" not in df.columns or "avg_volume_20" not in df.columns:
@@ -2909,107 +2715,20 @@ class MA5MA20OpenMonitorRunner:
 
         live_vol_scale = _infer_volume_scale_factor(merged)
         if live_vol_scale != 1.0 and "live_volume" in merged.columns:
-            self.logger.debug(
-                "统一成交量口径：live_volume *= %.2f（用于匹配 avg_volume_20）。",
-                live_vol_scale,
-            )
             merged["live_volume"] = merged["live_volume"].apply(
                 lambda x: None if x is None else x * live_vol_scale
             )
 
-        def _calc_intraday_vol_ratio(row: pd.Series) -> float | None:
-            vol = row.get("live_volume")
-            avg_vol = row.get("avg_volume_20")
-            effective_minutes = max(minutes_elapsed, 5)
-            if (
-                vol is None
-                or avg_vol is None
-                or avg_vol <= 0
-                or minutes_elapsed <= 0
-                or total_minutes <= 0
-            ):
-                return None
+        def _resolve_ref_close(row: pd.Series) -> float | None:
+            for key in ("prev_close", "sig_close"):
+                val = _to_float(row.get(key))
+                if val is not None and val > 0:
+                    return val
+            return None
 
-            scaled = (vol / effective_minutes) * total_minutes
-            if scaled <= 0:
-                return None
-            return scaled / avg_vol
-
-        merged["live_intraday_vol_ratio"] = merged.apply(
-            _calc_intraday_vol_ratio, axis=1
-        )
-        if "asof_vol_ratio" not in merged.columns:
-            merged["asof_vol_ratio"] = None
-
-        def _calc_gap(row: pd.Series) -> float | None:
-            _, ref_close = _resolve_ref_close(row)
-
-            px = row.get("live_open")
-            if px is None or px <= 0:
-                px = row.get("live_latest")
-
-            if ref_close is None or px is None:
-                return None
-            if ref_close <= 0 or px <= 0:
-                return None
-            return (px - ref_close) / ref_close
-
-        merged["live_gap_pct"] = merged.apply(_calc_gap, axis=1)
-
-        max_up = self.params.max_gap_up_pct
-        max_up_atr_mult = self.params.max_gap_up_atr_mult
-        max_down = self.params.max_gap_down_pct
-        min_vs_ma20 = self.params.min_open_vs_ma20_pct
-        pullback_min_vs_ma20 = self.params.pullback_min_open_vs_ma20_pct
-        limit_up_trigger = self.params.limit_up_trigger_pct
-
-        max_entry_vs_ma5 = self.params.max_entry_vs_ma5_pct
-        stop_atr_mult = self.params.stop_atr_mult
-        signal_day_limit_up = self.params.signal_day_limit_up_pct
-        runup_atr_max = self.params.runup_atr_max
-        dev_ma5_atr_max = self.params.dev_ma5_atr_max
-        dev_ma20_atr_max = self.params.dev_ma20_atr_max
-        cross_valid_days = self.params.cross_valid_days
-        pullback_valid_days = self.params.pullback_valid_days
-        vol_threshold = self.volume_ratio_threshold
-        weekly_gate_policy = self._resolve_env_weekly_gate_policy(env_context)
-        rule_engine = RuleEngine(self._merge_gate_actions)
-
-        actions: List[str] = []
-        action_reasons: List[str] = []
-        states: List[str] = []
-        status_reasons: List[str] = []
-        signal_kinds: List[str] = []
-        trade_stop_refs: List[float | None] = []
-        sig_stop_refs: List[float | None] = []
-        effective_stop_refs: List[float | None] = []
-        valid_days_list: List[int | None] = []
-        entry_exposure_caps: List[float | None] = []
-        env_index_scores: List[float | None] = []
-        env_regimes: List[str | None] = []
-        env_position_hints: List[float | None] = []
-        env_weekly_asof_trade_dates: List[str | None] = []
-        env_weekly_risk_levels: List[str | None] = []
-        env_weekly_scene_list: List[str | None] = []
-        env_weekly_structure_statuses: List[str | None] = []
-        env_weekly_pattern_statuses: List[str | None] = []
-        env_weekly_gate_action_list: List[str | None] = []
-        env_final_gate_action_list: List[str | None] = []
-        board_statuses: List[str | None] = []
-        board_ranks: List[float | None] = []
-        board_chg_pcts: List[float | None] = []
-        strength_scores: List[float | None] = []
-        strength_deltas: List[float | None] = []
-        strength_trends: List[str | None] = []
-        strength_notes: List[str | None] = []
-        asof_ma5_list: List[float | None] = []
-        asof_ma20_list: List[float | None] = []
-        asof_ma60_list: List[float | None] = []
-        asof_ma250_list: List[float | None] = []
-        asof_vol_ratio_list: List[float | None] = []
-        asof_macd_hist_list: List[float | None] = []
-        asof_atr14_list: List[float | None] = []
-        asof_stop_ref_list: List[float | None] = []
+        live_gap_list: List[float | None] = []
+        live_pct_change_list: List[float | None] = []
+        live_intraday_vol_list: List[float | None] = []
         dev_ma5_list: List[float | None] = []
         dev_ma20_list: List[float | None] = []
         dev_ma5_atr_list: List[float | None] = []
@@ -3018,1135 +2737,244 @@ class MA5MA20OpenMonitorRunner:
         runup_from_sigclose_atr_list: List[float | None] = []
         runup_ref_price_list: List[float | None] = []
         runup_ref_source_list: List[str | None] = []
+        actions: List[str] = []
+        action_reasons: List[str] = []
+        states: List[str] = []
+        status_reasons: List[str] = []
+        signal_kinds: List[str] = []
+        valid_days_list: List[int | None] = []
+        entry_exposure_caps: List[float | None] = []
+        trade_stop_refs: List[float | None] = []
+        sig_stop_refs: List[float | None] = []
+        effective_stop_refs: List[float | None] = []
         rule_hits_json_list: List[str | None] = []
         summary_lines: List[str | None] = []
         env_index_snapshot_hashes: List[str | None] = []
+        env_final_gate_action_list: List[str | None] = []
+        env_regimes: List[str | None] = []
+        env_position_hints: List[float | None] = []
+        env_weekly_asof_trade_dates: List[str | None] = []
+        env_weekly_risk_levels: List[str | None] = []
+        env_weekly_scene_list: List[str | None] = []
 
-        def _coalesce(row: pd.Series, *cols: str) -> float | None:
-            for col in cols:
-                val = row.get(col)
-                if val is not None and not pd.isna(val):
-                    return val
-            return None
+        max_up = self.params.max_gap_up_pct
+        max_up_atr_mult = self.params.max_gap_up_atr_mult
+        max_down = self.params.max_gap_down_pct
+        min_vs_ma20 = self.params.min_open_vs_ma20_pct
+        pullback_min_vs_ma20 = self.params.pullback_min_open_vs_ma20_pct
+        limit_up_trigger = self.params.limit_up_trigger_pct
+        stop_atr_mult = self.params.stop_atr_mult
+        runup_atr_max = self.params.runup_atr_max
+        pullback_runup_atr_max = self.params.pullback_runup_atr_max
+        pullback_runup_dev_ma20_atr_min = self.params.pullback_runup_dev_ma20_atr_min
+        cross_valid_days = self.params.cross_valid_days
+        pullback_valid_days = self.params.pullback_valid_days
 
-        def _dec(row: pd.Series, key: str) -> float | None:
-            return _coalesce(row, f"asof_{key}", f"sig_{key}")
-
-        def _px_now(row: pd.Series) -> float | None:
-            return _coalesce(
-                row,
-                "live_latest",
-                "live_open",
-                "asof_close",
-                "sig_close",
-            )
-
-        def _vol_ratio_dec(row: pd.Series) -> float | None:
-            return _coalesce(
-                row,
-                "live_intraday_vol_ratio",
-                "asof_vol_ratio",
-                "sig_vol_ratio",
-            )
-
-        def _calc_signal_strength(
-            row: pd.Series,
-            price_now: float | None,
-            vol_ratio_val: float | None = None,
-            board_status: str | None = None,
-            idx_score: float | None = None,
-        ) -> tuple[float | None, str]:
-            score = 0.0
-            notes: list[str] = []
-
-            ma5 = _dec(row, "ma5")
-            ma20 = _dec(row, "ma20")
-            ma60 = _dec(row, "ma60")
-            if vol_ratio_val is None:
-                vol_ratio_val = _vol_ratio_dec(row)
-            atr14_val = _dec(row, "atr14")
-            macd_hist_signal = _to_float(row.get("sig_macd_hist"))
-            macd_hist_now = _to_float(row.get("live_macd_hist"))
-            if macd_hist_now is None:
-                macd_hist_now = _to_float(row.get("asof_macd_hist"))
-            if macd_hist_now is None:
-                macd_hist_now = macd_hist_signal
-
-            if ma5 is not None and ma20 is not None:
-                if ma5 > ma20:
-                    score += 1.0
-                    notes.append("MA5>MA20")
-                else:
-                    score -= 1.0
-                    notes.append("MA5<MA20")
-
-            if ma20 is not None and ma60 is not None:
-                if ma20 > ma60:
-                    score += 1.0
-                    notes.append("MA20>MA60")
-                else:
-                    score -= 0.5
-                    notes.append("MA20<=MA60")
-
-            if price_now is not None and ma20 is not None:
-                deviation = (price_now - ma20) / ma20
-                if deviation >= 0:
-                    score += 0.5
-                    notes.append("价格站上MA20")
-                else:
-                    score -= 0.5
-                    notes.append("价格跌破MA20")
-
-                if atr14_val is not None and atr14_val > 0:
-                    z_score = (price_now - ma20) / atr14_val
-                    if -0.5 <= z_score <= 1.0:
-                        score += 0.5
-                        notes.append("乖离在ATR舒适区间")
-                    elif z_score > 1.2:
-                        score -= 0.5
-                        notes.append("价格偏热")
-                    elif z_score < -0.8:
-                        score -= 0.5
-                        notes.append("跌破回踩区间")
-
-            if macd_hist_now is not None:
-                if macd_hist_now > 0:
-                    score += 0.5
-                else:
-                    score -= 0.5
-
-            macd_delta = None
-            if macd_hist_now is not None and macd_hist_signal is not None:
-                macd_delta = macd_hist_now - macd_hist_signal
-
-            if macd_delta is not None:
-                if macd_delta > 0:
-                    score += 0.5
-                    notes.append("MACD扩张")
-                elif macd_delta < 0:
-                    score -= 0.5
-                    notes.append("MACD收敛")
-
-            if vol_ratio_val is not None:
-                if vol_ratio_val >= vol_threshold:
-                    score += 0.5
-                    notes.append("量能放大")
-                elif vol_ratio_val < 1:
-                    if price_now is not None and ma20 is not None and price_now <= ma20:
-                        score += 0.2
-                        notes.append("回踩缩量")
-                    else:
-                        score -= 0.1
-                        notes.append("量能偏弱")
-                else:
-                    score -= 0.1
-                    notes.append("量能不足")
-
-            if isinstance(board_status, str):
-                status_norm = board_status.strip().lower()
-                if status_norm == "strong":
-                    score += 0.5
-                    notes.append("板块强")
-                elif status_norm == "weak":
-                    score -= 0.5
-                    notes.append("板块弱")
-
-            if idx_score is not None:
-                if idx_score >= self.env_index_score_threshold:
-                    score += 0.5
-                    notes.append("大盘顺风")
-                else:
-                    score -= 0.5
-                    notes.append("大盘逆风")
-
-            return round(score, 3), "；".join(notes)
-
-        def _classify_strength_trend(curr: float | None, prev: float | None) -> str | None:
-            if curr is None or prev is None:
-                return None
-            delta = curr - prev
-            if delta >= 0.5:
-                return "ENHANCING"
-            if delta <= -0.5:
-                return "WEAKENING"
-            return "FLAT"
-
-        codes_all = merged["code"].dropna().astype(str).unique().tolist()
-        if not self.params.incremental_write:
-            self.logger.warning(
-                "incremental_write=False 会覆盖当日历史，strength_delta/strength_trend 可能缺乏对比基础"
-            )
-        prev_strength_map = self._load_previous_strength(codes_all, as_of=checked_at_ts)
-        eps = 1e-6
-
-        status_priority = ["STOP_LOSS", "INVALID", "RUNUP_TOO_LARGE", "OVEREXTENDED", "STALE"]
-        status_severity_map = {name: (len(status_priority) - idx) * 10 for idx, name in enumerate(status_priority)}
-        for idx, row in merged.iterrows():
-            weekly_gate_action = weekly_gate_policy or "NOT_APPLIED"
-            ctx = DecisionContext()
-            ctx.action_rank = _action_rank(ctx.action)
-            risk_tag_raw = str(row.get("risk_tag") or "").strip()
-            risk_note = str(row.get("risk_note") or "").strip()
-            risk_tags_split = [t.strip() for t in risk_tag_raw.split("|") if t.strip()]
-
-            pct = row.get("live_pct_change")
-            live_intraday_vol_ratio = row.get("live_intraday_vol_ratio")
-
-            if (
-                pct is not None
-                and pct <= -4.0
-                and live_intraday_vol_ratio is not None
-                and live_intraday_vol_ratio >= 1.2
-            ):
-                if "BIG_DROP" not in risk_tags_split:
-                    risk_tags_split.append("BIG_DROP")
-                detail = (
-                    f"暴跌放量风险：跌幅 {pct:.2f}%"
-                    f"（阈值≤-4.00%），盘中量比 {live_intraday_vol_ratio:.2f}"
-                    "（阈值≥1.20）"
-                )
-                risk_note = f"{risk_note}|{detail}" if risk_note else detail
-
-            run_id_norm = str(row.get("run_id") or "").strip().upper()
-            open_px = _to_float(row.get("live_open"))
-            latest_px = _to_float(row.get("live_latest"))
-            entry_px = open_px
-            entry_px_label = "入场价"
-            ma20 = _dec(row, "ma20")
-            ma5 = _dec(row, "ma5")
-            ma60 = _dec(row, "ma60")
-            ma250 = _dec(row, "ma250")
-            vol_used = _vol_ratio_dec(row)
-            macd_hist = _dec(row, "macd_hist")
-            atr14 = _dec(row, "atr14")
-
-            signal_stop_ref = _dec(row, "stop_ref")
-            signal_close = row.get("sig_close")
-            current_close = _coalesce(row, "asof_close", "sig_close")
-            _, ref_close = _resolve_ref_close(row)
-
-            gap = row.get("live_gap_pct")
-            signal_day_pct = row.get("_signal_day_pct_change")
-            signal_reason = str(row.get("sig_reason") or "")
-            signal_age = row.get("signal_age")
-            is_pullback = self._is_pullback_signal(signal_reason)
-
-            asof_close_px = _to_float(row.get("asof_close"))
-            if run_id_norm == "POSTCLOSE" and latest_px is not None and latest_px > 0:
-                # POSTCLOSE：用收盘价（最新价）做为入场评估基准，避免“今开价”导致误判
-                entry_px = latest_px
-                entry_px_label = "入场价(收盘)"
-            elif run_id_norm == "PREOPEN" and asof_close_px is not None and asof_close_px > 0:
-                # PREOPEN：无今开价，使用昨收价做为入场评估基准
-                entry_px = asof_close_px
-                entry_px_label = "入场价(昨收)"
-
-            if entry_px is None or entry_px <= 0:
-                entry_px = latest_px
-                entry_px_label = "入场价(最新)"
-            if entry_px is None or entry_px <= 0:
-                ctx.action = "UNKNOWN"
-                ctx.state = "UNKNOWN"
-                ctx.action_reason = "无今开/最新价"
-                ctx.state_reason = "无今开/最新价"
-                ctx.action_rank = _action_rank(ctx.action)
-
-            trade_stop_ref = signal_stop_ref
-            if entry_px is not None and atr14 is not None and atr14 > 0 and stop_atr_mult > 0:
-                trade_stop_ref = entry_px - stop_atr_mult * atr14
-
-            price_now = _px_now(row)
-
-            board_candidates: list[str] = []
-            for key in [
-                row.get("board_code"),
-                row.get("board_name"),
-                row.get("industry"),
-                row.get("industry_classification"),
-            ]:
-                if pd.notna(key):
-                    key_norm = str(key).strip()
-                    if key_norm and key_norm.lower() != "nan":
-                        board_candidates.append(key_norm)
-            board_info = None
-            board_status = None
-            board_rank = None
-            board_chg = None
-            for key in board_candidates:
-                board_info = board_map.get(key)
-                if board_info:
-                    break
-            if isinstance(board_info, dict):
-                board_status = board_info.get("status")
-                board_rank = _to_float(board_info.get("rank"))
-                board_chg = _to_float(board_info.get("chg_pct"))
-
-            rank_label = f"{board_rank:.0f}" if board_rank is not None else "-"
-            if isinstance(board_status, str):
-                board_status = board_status.strip().lower()
-
-            strength_score, strength_note = _calc_signal_strength(
-                row,
-                price_now,
-                vol_used,
-                board_status=board_status,
-                idx_score=idx_score_float,
-            )
-            prev_strength = prev_strength_map.get(str(row.get("code")))
-            strength_delta = None
-            if strength_score is not None and prev_strength is not None:
-                strength_delta = strength_score - prev_strength
-            strength_trend = _classify_strength_trend(strength_score, prev_strength)
-
+        for _, row in merged.iterrows():
+            sig_reason_text = str(row.get("sig_reason") or row.get("reason") or "")
+            is_pullback = self._is_pullback_signal(sig_reason_text)
             valid_days = pullback_valid_days if is_pullback else cross_valid_days
-            sig_atr14_val = _to_float(row.get("sig_atr14"))
+            valid_days_list.append(valid_days)
+            sig_stop_refs.append(_to_float(row.get("sig_stop_ref")))
 
-            trade_stop_ref_val = _to_float(trade_stop_ref)
-            asof_stop_ref_val = _to_float(row.get("asof_stop_ref"))
-            signal_stop_ref_val = _to_float(signal_stop_ref)
+            price_now = _to_float(row.get("live_open")) or _to_float(row.get("live_latest"))
+            ref_close = _resolve_ref_close(row)
+            if price_now is None:
+                if run_id_norm == "PREOPEN" and ref_close is not None:
+                    price_now = ref_close
+                elif run_id_norm == "POSTCLOSE":
+                    price_now = _to_float(row.get("live_latest")) or ref_close or _to_float(
+                        row.get("sig_close")
+                    )
 
-            effective_stop_ref = next(
-                (
-                    val
-                    for val in [
-                        trade_stop_ref_val,
-                        asof_stop_ref_val,
-                        signal_stop_ref_val,
-                    ]
-                    if val is not None
-                ),
-                None,
-            )
-            live_price_for_dev = _to_float(latest_px) if latest_px is not None else _to_float(price_now)
+            live_gap = None
+            live_pct = None
+            if ref_close and price_now:
+                live_gap = (price_now - ref_close) / ref_close
+                live_pct = (price_now / ref_close - 1.0) * 100.0
+            live_gap_list.append(live_gap)
+            live_pct_change_list.append(live_pct)
+
+            avg_vol_20 = avg_volume_map.get(str(row.get("code"))) if avg_volume_map else None
+            live_vol = _to_float(row.get("live_volume"))
+            live_intraday = None
+            if (
+                avg_vol_20 is not None
+                and avg_vol_20 > 0
+                and live_vol is not None
+                and live_vol > 0
+                and minutes_elapsed > 0
+            ):
+                scaled = (live_vol / max(minutes_elapsed, 1)) * total_minutes
+                live_intraday = scaled / avg_vol_20
+            live_intraday_vol_list.append(live_intraday)
+
+            sig_ma5 = _to_float(row.get("sig_ma5"))
+            sig_ma20 = _to_float(row.get("sig_ma20"))
+            sig_atr14 = _to_float(row.get("sig_atr14"))
+
             dev_ma5 = None
             dev_ma20 = None
             dev_ma5_atr = None
             dev_ma20_atr = None
-            if live_price_for_dev is not None and ma5 is not None:
-                dev_ma5 = live_price_for_dev - ma5
-                if atr14 is not None:
-                    dev_ma5_atr = dev_ma5 / max(atr14, eps)
-            if live_price_for_dev is not None and ma20 is not None:
-                dev_ma20 = live_price_for_dev - ma20
-                if atr14 is not None:
-                    dev_ma20_atr = dev_ma20 / max(atr14, eps)
+            if price_now is not None:
+                if sig_ma5:
+                    dev_ma5 = price_now - sig_ma5
+                if sig_ma20:
+                    dev_ma20 = price_now - sig_ma20
+                if sig_atr14 and sig_atr14 != 0:
+                    if sig_ma5 is not None:
+                        dev_ma5_atr = (price_now - sig_ma5) / sig_atr14
+                    if sig_ma20 is not None:
+                        dev_ma20_atr = (price_now - sig_ma20) / sig_atr14
+            dev_ma5_list.append(dev_ma5)
+            dev_ma20_list.append(dev_ma20)
+            dev_ma5_atr_list.append(dev_ma5_atr)
+            dev_ma20_atr_list.append(dev_ma20_atr)
 
-            sig_close_val = _to_float(signal_close)
-            runup_live_ref = row.get("live_high")
-            runup_live_ref_label = "live_high"
-            if run_id_norm == "POSTCLOSE" and latest_px is not None and latest_px > 0:
-                # POSTCLOSE：用收盘价替代盘中 high，避免盘中尖峰导致 runup 误杀
-                runup_live_ref = latest_px
-                runup_live_ref_label = "live_latest"
             runup_metrics = compute_runup_metrics(
-                sig_close_val,
-                asof_close=_coalesce(row, "asof_close", "sig_close"),
-                live_high=runup_live_ref,
-                sig_atr14=sig_atr14_val if sig_atr14_val is not None else atr14,
-                eps=eps,
+                _to_float(row.get("sig_close")),
+                asof_close=_to_float(row.get("sig_close")),
+                live_high=_to_float(row.get("live_high")) or price_now,
+                sig_atr14=sig_atr14,
             )
-            runup_from_sigclose = runup_metrics.runup_from_sigclose
-            runup_from_sigclose_atr = runup_metrics.runup_from_sigclose_atr
-            runup_ref_price_val = runup_metrics.runup_ref_price
-            runup_ref_source_val = runup_metrics.runup_ref_source
-            if run_id_norm == "POSTCLOSE" and runup_live_ref_label == "live_latest":
-                # 纠正 ref_source 文案（compute_runup_metrics 的参数名为 live_high）
-                if runup_ref_source_val == "max(asof_close, live_high)":
-                    runup_ref_source_val = "max(asof_close, live_latest)"
-                elif runup_ref_source_val == "live_high":
-                    runup_ref_source_val = "live_latest"
+            runup_from_sigclose_list.append(runup_metrics.runup_from_sigclose)
+            runup_from_sigclose_atr_list.append(runup_metrics.runup_from_sigclose_atr)
+            runup_ref_price_list.append(runup_metrics.runup_ref_price)
+            runup_ref_source_list.append(runup_metrics.runup_ref_source)
 
-            runup_atr_cap = runup_atr_max
-            dev_ma20_gate = None
-            if is_pullback:
-                runup_atr_cap = (
-                    self.params.pullback_runup_atr_max
-                    if self.params.pullback_runup_atr_max is not None
-                    else runup_atr_max
-                )
-                dev_ma20_gate = self.params.pullback_runup_dev_ma20_atr_min
-            runup_triggered, runup_detail = evaluate_runup_breach(
-                runup_metrics,
-                runup_atr_max=runup_atr_cap,
-                runup_atr_tol=self.params.runup_atr_tol,
-                dev_ma20_atr=dev_ma20_atr,
-                dev_ma20_atr_min=dev_ma20_gate,
-            )
-            runup_take_profit = None
-            if runup_from_sigclose is not None and sig_close_val is not None and sig_close_val > 0:
-                runup_take_profit = runup_from_sigclose / sig_close_val
+            threshold_gap_up = max_up
+            if sig_atr14 and sig_atr14 > 0 and ref_close:
+                atr_gap = max_up_atr_mult * sig_atr14 / ref_close
+                threshold_gap_up = min(max_up, atr_gap)
 
-            hard_stop = False
-            latest_px_float = _to_float(latest_px)
-            if (
-                latest_px_float is not None
-                and sig_close_val is not None
-                and sig_close_val > 0
-                and latest_px_float <= sig_close_val * 0.75
-            ):
-                hard_stop = True
+            action = "EXECUTE"
+            action_reason = "OK"
 
-            overextend_reasons: list[str] = []
-            if dev_ma5_atr is not None and dev_ma5_atr > dev_ma5_atr_max:
-                overextend_reasons.append(
-                    f"dev_ma5_atr={dev_ma5_atr:.2f} > {dev_ma5_atr_max:.2f}"
-                )
-            if dev_ma20_atr is not None and dev_ma20_atr > dev_ma20_atr_max:
-                overextend_reasons.append(
-                    f"dev_ma20_atr={dev_ma20_atr:.2f} > {dev_ma20_atr_max:.2f}"
-                )
+            def apply_action(candidate: str, reason: str) -> None:
+                nonlocal action, action_reason
+                if _action_rank(candidate) < _action_rank(action):
+                    action = candidate
+                    action_reason = reason
 
-            if "MANIA" in risk_tags_split:
-                mania_reason = risk_note or "风险标签=MANIA：短期过热，默认不追"
+            if env_final_gate_action == "STOP":
+                apply_action("SKIP", "环境阻断")
+            elif env_final_gate_action == "WAIT":
+                apply_action("WAIT", "环境等待")
+
+            chip_score = _to_float(row.get("sig_chip_score") or row.get("chip_score"))
+            if chip_score is not None and chip_score < 0:
+                apply_action("WAIT", "筹码评分<0")
+
+            if price_now is None:
+                apply_action("UNKNOWN", "行情数据不可用")
             else:
-                mania_reason = None
+                if live_gap is not None and threshold_gap_up is not None and live_gap > threshold_gap_up:
+                    apply_action("SKIP", "高开过阈值")
+                if live_gap is not None and max_down is not None and live_gap < max_down:
+                    apply_action("SKIP", "低开破位")
+                ma20_thresh = pullback_min_vs_ma20 if is_pullback else min_vs_ma20
+                if sig_ma20 is not None and ma20_thresh is not None:
+                    if price_now < sig_ma20 * (1 + ma20_thresh):
+                        apply_action("SKIP", "未站上MA20要求")
+                if live_pct is not None and limit_up_trigger is not None and live_pct >= limit_up_trigger:
+                    apply_action("SKIP", "涨停不可成交")
 
-            risk_tag_value = "|".join(risk_tags_split) if risk_tags_split else None
-            merged.at[idx, "risk_tag"] = risk_tag_value
-            merged.at[idx, "risk_note"] = risk_note or None
+                dev_ma20_atr_val = dev_ma20_atr
+                runup_limit = pullback_runup_atr_max if is_pullback else runup_atr_max
+                breach, reason = evaluate_runup_breach(
+                    runup_metrics,
+                    runup_atr_max=runup_limit,
+                    runup_atr_tol=self.params.runup_atr_tol,
+                    dev_ma20_atr=dev_ma20_atr_val,
+                    dev_ma20_atr_min=pullback_runup_dev_ma20_atr_min if is_pullback else None,
+                )
+                if breach:
+                    apply_action("WAIT", reason or "拉升过快")
 
-            cap_candidates: list[tuple[str, float]] = []
-            sig_final_cap = _to_float(row.get("sig_final_cap"))
+            trade_stop_ref = None
+            if price_now is not None and sig_atr14 is not None:
+                trade_stop_ref = price_now - stop_atr_mult * sig_atr14
+
+            entry_cap = env_final_cap_pct
+            sig_final_cap = _to_float(row.get("final_cap"))
             if sig_final_cap is not None:
-                cap_candidates.append(("signal_final_cap", sig_final_cap))
-            if env_position_hint is not None:
-                cap_candidates.append(("env_position_hint", env_position_hint))
-            if env_weekly_plan_a_exposure_cap is not None:
-                cap_candidates.append(("weekly_plan_a_cap", env_weekly_plan_a_exposure_cap))
-            if env_index_position_cap is not None:
-                cap_candidates.append(("env_index_position_cap", env_index_position_cap))
-            entry_exposure_cap = None
-            if cap_candidates:
-                entry_exposure_cap = min(val for _, val in cap_candidates)
-            ctx.entry_exposure_cap = entry_exposure_cap
+                entry_cap = sig_final_cap if entry_cap is None else min(entry_cap, sig_final_cap)
+            entry_exposure_caps.append(entry_cap)
+            trade_stop_refs.append(trade_stop_ref)
+            effective_stop_refs.append(trade_stop_ref)
 
-            rules: list[Rule] = []
+            state = "OK"
+            status_reason = action_reason
+            if action == "SKIP":
+                state = "INVALID"
+            elif action == "WAIT":
+                state = "PENDING"
+            elif action == "UNKNOWN":
+                state = "UNKNOWN"
 
-            stale_reason = (
-                f"signal_age={int(signal_age)} > valid_days={valid_days}"
-                if valid_days > 0 and signal_age is not None
-                else ""
-            )
-            rules.append(
-                Rule(
-                    id="STALE",
-                    category="STRUCTURE",
-                    severity=status_severity_map.get("STALE", 10),
-                    predicate=lambda ctx, cond=(
-                        valid_days > 0 and signal_age is not None and signal_age > valid_days
-                    ): cond,
-                    effect=lambda ctx, reason=stale_reason: RuleResult(
-                        reason=reason or "结构/时效通过",
-                        state_override="STALE",
-                    ),
-                )
-            )
-
-            if macd_hist is not None:
-                rules.append(
-                    Rule(
-                        id="INVALID_MACD",
-                        category="STRUCTURE",
-                        severity=status_severity_map.get("INVALID", 50),
-                        predicate=lambda ctx, cond=macd_hist <= 0: cond,
-                        effect=lambda ctx, m=macd_hist: RuleResult(
-                            reason=f"MACD 柱子转负：asof_macd_hist={m:.4f} ≤ 0",
-                            state_override="INVALID",
-                        ),
-                    )
-                )
-            rules.append(
-                Rule(
-                    id="INVALID_MA20",
-                    category="STRUCTURE",
-                    severity=status_severity_map.get("INVALID", 50),
-                    predicate=lambda ctx, cond=(
-                        price_now is not None and ma20 is not None and price_now < ma20
-                    ): cond,
-                    effect=lambda ctx, p=price_now, m=ma20: RuleResult(
-                        reason=f"跌破MA20：price_now={p:.2f} < asof_ma20={m:.2f}",
-                        state_override="INVALID",
-                    ),
-                )
-            )
-            rules.append(
-                Rule(
-                    id="INVALID_MA5_CROSS",
-                    category="STRUCTURE",
-                    severity=status_severity_map.get("INVALID", 50),
-                    predicate=lambda ctx, cond=(
-                        ma5 is not None and ma20 is not None and ma5 < ma20
-                    ): cond,
-                    effect=lambda ctx, m5=ma5, m20=ma20: RuleResult(
-                        reason=f"盘中结构失效：MA5({m5:.2f}) < MA20({m20:.2f})",
-                        state_override="INVALID",
-                    ),
-                )
-            )
-            stop_detail_parts: list[str] = []
-            if trade_stop_ref_val is not None:
-                stop_detail_parts.append(f"entry止损={trade_stop_ref_val:.2f}")
-            if asof_stop_ref_val is not None:
-                stop_detail_parts.append(f"昨收止损={asof_stop_ref_val:.2f}")
-            if signal_stop_ref_val is not None:
-                stop_detail_parts.append(f"信号日止损={signal_stop_ref_val:.2f}")
-            stop_detail = "，".join(stop_detail_parts)
-            rules.append(
-                Rule(
-                    id="STOP_TRIGGER",
-                    category="STRUCTURE",
-                    severity=status_severity_map.get("STOP_LOSS", 100),
-                    predicate=lambda ctx, cond=(
-                        price_now is not None
-                        and effective_stop_ref is not None
-                        and price_now <= effective_stop_ref
-                    ): cond,
-                    effect=lambda ctx, ref=effective_stop_ref, p=price_now, detail=stop_detail: RuleResult(
-                        reason=(
-                            f"触发止损：price_now={p:.2f} <= effective_stop_ref={ref:.2f}"
-                            + (f"（参考：{detail}）" if detail else "")
-                        ),
-                        state_override="STOP_LOSS",
-                    ),
-                )
-            )
-            rules.append(
-                Rule(
-                    id="TREND_BREAK",
-                    category="STRUCTURE",
-                    severity=status_severity_map.get("INVALID", 50),
-                    predicate=lambda ctx, cond=(
-                        current_close is not None
-                        and ma60 is not None
-                        and ma250 is not None
-                        and ma20 is not None
-                        and (current_close <= ma60 or current_close <= ma250 or ma20 <= ma60)
-                    ): cond,
-                    effect=lambda ctx: RuleResult(
-                        reason="多头排列/趋势破坏",
-                        state_override="INVALID",
-                    ),
-                )
-            )
-            if hard_stop and latest_px_float is not None and sig_close_val is not None:
-                rules.append(
-                    Rule(
-                        id="STOP_LOSS",
-                        category="STRUCTURE",
-                        severity=status_severity_map.get("STOP_LOSS", 100),
-                        predicate=lambda ctx, cond=hard_stop: cond,
-                        effect=lambda ctx, lp=latest_px_float, sc=sig_close_val: RuleResult(
-                            reason=(
-                                f"最新价 {lp:.2f} 触发硬止损阈值 ≤ 信号收盘*0.75={sc*0.75:.2f}"
-                            ),
-                        ),
-                    )
-                )
-                rules.append(
-                    Rule(
-                        id="HARD_STOP",
-                        category="ACTION",
-                        severity=90,
-                        predicate=lambda ctx, cond=hard_stop: cond,
-                        effect=lambda ctx, lp=latest_px_float, sc=sig_close_val: RuleResult(
-                            reason=f"硬止损：最新价≤信号收盘*0.75（{lp:.2f}/{sc*0.75:.2f}）",
-                            action_override="STOP",
-                            cap_override=0.0,
-                        ),
-                    )
-                )
-
-            if runup_triggered and runup_detail:
-                rules.append(
-                    Rule(
-                        id="RUNUP_TOO_LARGE",
-                        category="STRUCTURE",
-                        severity=status_severity_map.get("RUNUP_TOO_LARGE", 80),
-                        predicate=lambda ctx, cond=True: cond,
-                        effect=lambda ctx, detail=runup_detail: RuleResult(
-                            reason=detail,
-                            state_override="RUNUP_TOO_LARGE",
-                        ),
-                    )
-                )
-            if overextend_reasons:
-                rules.append(
-                    Rule(
-                        id="OVEREXTENDED",
-                        category="STRUCTURE",
-                        severity=status_severity_map.get("OVEREXTENDED", 70),
-                        predicate=lambda ctx, cond=True: cond,
-                        effect=lambda ctx, reasons="；".join(overextend_reasons): RuleResult(
-                            reason=reasons,
-                            state_override="OVEREXTENDED",
-                        ),
-                    )
-                )
-            if mania_reason:
-                rules.append(
-                    Rule(
-                        id="MANIA",
-                        category="STRUCTURE",
-                        severity=status_severity_map.get("INVALID", 50),
-                        predicate=lambda ctx, cond=True: cond,
-                        effect=lambda ctx, reason=mania_reason: RuleResult(
-                            reason=reason,
-                            state_override="INVALID",
-                        ),
-                    )
-                )
-
-            if runup_take_profit is not None and runup_take_profit >= 0.15:
-                rules.append(
-                    Rule(
-                        id="TAKE_PROFIT",
-                        category="ACTION",
-                        severity=60,
-                        predicate=lambda ctx, cond=True: cond,
-                        effect=lambda ctx, ratio=runup_take_profit: RuleResult(
-                            reason=f"信号后涨幅 {ratio*100:.2f}% ≥ 15%",
-                            action_override="REDUCE_50%",
-                        ),
-                    )
-                )
-
-            rules.append(
-                Rule(
-                    id="SIGNAL_DAY_LIMIT_UP",
-                    category="ACTION",
-                    severity=40,
-                    predicate=lambda ctx, cond=(
-                        ctx.action == "EXECUTE"
-                        and signal_day_pct is not None
-                        and signal_day_pct >= signal_day_limit_up
-                    ): cond,
-                    effect=lambda ctx, pct_val=signal_day_pct: RuleResult(
-                        reason=f"信号日涨幅 {pct_val*100:.2f}% 接近涨停，次日不追",
-                        action_override="SKIP",
-                    ),
-                )
-            )
-            rules.append(
-                Rule(
-                    id="LIMIT_UP",
-                    category="ACTION",
-                    severity=50,
-                    predicate=lambda ctx, cond=(
-                        ctx.action == "EXECUTE" and pct is not None and pct >= limit_up_trigger
-                    ): cond,
-                    effect=lambda ctx, pct_val=pct: RuleResult(
-                        reason=f"涨幅 {pct_val:.2f}% 接近/达到涨停",
-                        action_override="SKIP",
-                    ),
-                )
-            )
-            gap_up_threshold = max_up
-            atr_based = None
-            if ref_close is not None and ref_close > 0 and atr14 is not None and atr14 > 0 and max_up_atr_mult > 0:
-                atr_based = max_up_atr_mult * atr14 / ref_close
-                if atr_based > 0:
-                    gap_up_threshold = min(max_up, atr_based)
-            gap_up_reason = ""
-            if gap is not None:
-                if atr_based is None:
-                    gap_up_reason = (
-                        f"高开 {gap*100:.2f}% 超过阈值 {gap_up_threshold*100:.2f}%"
-                    )
-                else:
-                    gap_up_reason = (
-                        f"高开 {gap*100:.2f}% 超过阈值 {gap_up_threshold*100:.2f}%"
-                        f"（min(固定{max_up*100:.2f}%, ATR×{max_up_atr_mult:.1f}={atr_based*100:.2f}% )）"
-                    )
-            rules.append(
-                Rule(
-                    id="GAP_UP",
-                    category="ACTION",
-                    severity=45,
-                    predicate=lambda ctx, cond=(
-                        ctx.action == "EXECUTE" and gap is not None and gap > gap_up_threshold
-                    ): cond,
-                    effect=lambda ctx, reason_text=gap_up_reason: RuleResult(
-                        reason=reason_text,
-                        action_override="SKIP",
-                    ),
-                )
-            )
-            rules.append(
-                Rule(
-                    id="GAP_DOWN",
-                    category="ACTION",
-                    severity=45,
-                    predicate=lambda ctx, cond=(
-                        ctx.action == "EXECUTE" and gap is not None and gap < max_down
-                    ): cond,
-                    effect=lambda ctx, g=gap: RuleResult(
-                        reason=f"低开 {g*100:.2f}% 低于阈值 {max_down*100:.2f}%",
-                        action_override="SKIP",
-                    ),
-                )
-            )
-            if ma20 is not None and entry_px is not None:
-                threshold_ma20 = ma20 * (1.0 + (pullback_min_vs_ma20 if is_pullback else min_vs_ma20))
-                rules.append(
-                    Rule(
-                        id="BELOW_MA20",
-                        category="ACTION",
-                        severity=40,
-                        predicate=lambda ctx, cond=(
-                            ctx.action == "EXECUTE" and entry_px < threshold_ma20
-                        ): cond,
-                        effect=lambda ctx, px=entry_px, th=threshold_ma20, label=entry_px_label: RuleResult(
-                            reason=f"{label} {px:.2f} 跌破 MA20 阈值 {th:.2f}",
-                            action_override="SKIP",
-                        ),
-                    )
-                )
-            if ma5 is not None and entry_px is not None and max_entry_vs_ma5 > 0:
-                threshold_ma5 = ma5 * (1.0 + max_entry_vs_ma5)
-                rules.append(
-                    Rule(
-                        id="ABOVE_MA5",
-                        category="ACTION",
-                        severity=35,
-                        predicate=lambda ctx, cond=(
-                            ctx.action == "EXECUTE" and entry_px > threshold_ma5
-                        ): cond,
-                        effect=lambda ctx, px=entry_px, th=threshold_ma5: RuleResult(
-                            reason=(f"{entry_px_label} {px:.2f} 高于 MA5 阈值 {th:.2f}"),
-                            action_override="SKIP",
-                        ),
-                    )
-                )
-
-            if strength_score is not None:
-                rules.append(
-                    Rule(
-                        id="STRENGTH_NEGATIVE",
-                        category="ACTION",
-                        severity=30,
-                        predicate=lambda ctx, cond=(
-                            ctx.action == "EXECUTE" and strength_score < 0
-                        ): cond,
-                        effect=lambda ctx: RuleResult(
-                            reason="信号强度<0，等待修复",
-                            action_override="WAIT",
-                        ),
-                    )
-                )
-            if strength_trend == "WEAKENING":
-                rules.append(
-                    Rule(
-                        id="STRENGTH_WEAKENING",
-                        category="ACTION",
-                        severity=25,
-                        predicate=lambda ctx, cond=(ctx.action == "EXECUTE"): cond,
-                        effect=lambda ctx: RuleResult(
-                            reason="信号强度走弱，等待确认",
-                            action_override="WAIT",
-                        ),
-                    )
-                )
-            if vol_used is not None:
-                rules.append(
-                    Rule(
-                        id="LOW_VOLUME",
-                        category="ACTION",
-                        severity=20,
-                        predicate=lambda ctx, cond=(
-                            ctx.action == "EXECUTE" and vol_used < vol_threshold
-                        ): cond,
-                        effect=lambda ctx, v=vol_used: RuleResult(
-                            reason=f"量能不足：{v:.2f} < 量比阈值 {vol_threshold:.2f}",
-                            action_override="WAIT",
-                        ),
-                    )
-                )
-
-            if (
-                idx_score_float is not None
-                and idx_score_float < self.env_index_score_threshold
-            ):
-                rules.append(
-                    Rule(
-                        id="INDEX_WEAK",
-                        category="ACTION",
-                        severity=25,
-                        predicate=lambda ctx, cond=(ctx.action == "EXECUTE"): cond,
-                        effect=lambda ctx, score=idx_score_float: RuleResult(
-                            reason=(
-                                f"大盘趋势分数 {score:.1f} 低于阈值 {self.env_index_score_threshold:.1f}，观望"
-                            ),
-                            action_override="WAIT",
-                        ),
-                    )
-                )
-            if board_status == "weak":
-                rules.append(
-                    Rule(
-                        id="BOARD_WEAK",
-                        category="ACTION",
-                        severity=20,
-                        predicate=lambda ctx, cond=(ctx.action == "EXECUTE"): cond,
-                        effect=lambda ctx: RuleResult(
-                            reason="所属板块走势偏弱，建议降低优先级",
-                            action_override="WAIT",
-                        ),
-                    )
-                )
-            elif board_status == "strong":
-                rules.append(
-                    Rule(
-                        id="BOARD_STRONG",
-                        category="ACTION",
-                        severity=15,
-                        predicate=lambda ctx, cond=(ctx.action == "WAIT"): cond,
-                        effect=lambda ctx, rank_display=rank_label: RuleResult(
-                            reason=f"板块强势(rank={rank_display})，等待入场条件",
-                            action_override="WAIT",
-                        ),
-                    )
-                )
-
-            fear_score_val = _to_float(row.get("sig_fear_score"))
-            if fear_score_val is not None and gap is not None and gap >= 0.05:
-                rules.append(
-                    Rule(
-                        id="FEAR_SKIP",
-                        category="ACTION",
-                        severity=40,
-                        predicate=lambda ctx, cond=(
-                            ctx.action == "EXECUTE" and fear_score_val < -0.5
-                        ): cond,
-                        effect=lambda ctx, fear=fear_score_val: RuleResult(
-                            reason=f"FEAR_SKIP fear={fear:.2f} gap={gap*100:.2f}%",
-                            action_override="WAIT",
-                            cap_override=0.0,
-                        ),
-                    )
-                )
-            if risk_tags_split:
-                rules.append(
-                    Rule(
-                        id="RISK_TAG",
-                        category="ACTION",
-                        severity=15,
-                        predicate=lambda ctx, cond=(ctx.action == "EXECUTE"): cond,
-                        effect=lambda ctx, note_text=(risk_note or "存在风险标签，建议谨慎"): RuleResult(
-                            reason=note_text,
-                            action_override="WAIT",
-                        ),
-                    )
-                )
-
-            weekly_soft_note = "周线MEDIUM+FORMING → 软门控限仓"
-            weekly_reason = None
-            if env_weekly_gating_enabled:
-                if env_weekly_risk_level == "HIGH":
-                    weekly_gate_action = "WAIT"
-                    weekly_reason = "周线风险高：观望/防守"
-                elif env_weekly_risk_level == "MEDIUM" and (
-                    env_weekly_structure_status or env_weekly_status
-                ) == "FORMING":
-                    strong_enough = (
-                        strength_score is not None
-                        and strength_score >= self.weekly_soft_gate_strength_threshold
-                    ) or board_status == "strong"
-                    if strong_enough:
-                        weekly_gate_action = "ALLOW_SMALL"
-                        weekly_reason = weekly_soft_note
-                        ctx.entry_exposure_cap = (
-                            min(ctx.entry_exposure_cap, 0.2)
-                            if ctx.entry_exposure_cap is not None
-                            else 0.2
-                        )
-                    else:
-                        weekly_gate_action = "WAIT"
-                        weekly_reason = weekly_soft_note
-                elif env_weekly_risk_level == "MEDIUM" and env_weekly_bias == "BEARISH" and env_weekly_pattern_status in {
-                    "BREAKOUT_DOWN",
-                    "CONFIRMED",
-                    "FORMING",
-                }:
-                    weekly_gate_action = "WAIT"
-                    weekly_reason = "周线偏空/未修复，等待"
-                elif env_weekly_risk_level == "LOW":
-                    weekly_gate_action = "ALLOW"
-                    weekly_reason = None
-                else:
-                    weekly_reason = None
-                rules.append(
-                    Rule(
-                        id="WEEKLY_GATE",
-                        category="ENV_OVERLAY",
-                        severity=65,
-                        predicate=lambda ctx, cond=env_weekly_gating_enabled: cond,
-                        effect=lambda ctx, gate=weekly_gate_action, reason=(
-                            weekly_reason or weekly_gate_action
-                        ): RuleResult(
-                            reason=reason,
-                            env_gate_action=gate,
-                            env_position_cap=ctx.entry_exposure_cap,
-                        ),
-                    )
-                )
-
-            if env_regime:
-                pos_hint_text = (
-                    f"（仓位建议 ≤{env_position_hint*100:.0f}%）"
-                    if env_position_hint is not None
-                    else ""
-                )
-                rules.append(
-                    Rule(
-                        id="ENV_REGIME",
-                        category="ENV_OVERLAY",
-                        severity=70,
-                        predicate=lambda ctx, cond=True: cond,
-                        effect=lambda ctx, regime=env_regime: RuleResult(
-                            reason=(
-                                f"大盘结构破位，执行跳过{pos_hint_text}"
-                                if regime == "BREAKDOWN"
-                                else f"市场环境 {regime}{pos_hint_text}"
-                            ),
-                            env_gate_action="STOP" if regime == "BREAKDOWN" else "WAIT" if regime == "RISK_OFF" else None,
-                            cap_override=0.0 if regime in {"BREAKDOWN", "RISK_OFF"} else None,
-                            env_position_cap=env_position_hint,
-                        ),
-                    )
-                )
-
-            if env_index_gate_action:
-                gate_reason = env_index_gate_reason or f"指数门控={env_index_gate_action}"
-                rules.append(
-                    Rule(
-                        id="INDEX_GATE",
-                        category="ENV_OVERLAY",
-                        severity=85 if env_index_gate_action == "STOP" else 60,
-                        predicate=lambda ctx, cond=True: cond,
-                        effect=lambda ctx, gate=env_index_gate_action, reason=gate_reason: RuleResult(
-                            reason=reason,
-                            env_gate_action=gate,
-                            env_position_cap=env_index_position_cap,
-                            cap_override=0.0 if gate in {"STOP", "WAIT"} else None,
-                        ),
-                    )
-                )
-
-            rule_engine.apply(ctx, rules)
-
-            if ctx.entry_exposure_cap is None and entry_exposure_cap is not None:
-                ctx.entry_exposure_cap = entry_exposure_cap
-            elif ctx.entry_exposure_cap is not None and entry_exposure_cap is not None:
-                ctx.entry_exposure_cap = min(ctx.entry_exposure_cap, entry_exposure_cap)
-
-            if ctx.state != "OK" and _action_rank(ctx.action) > _action_rank("SKIP"):
-                ctx.action = "SKIP"
-                ctx.action_rank = _action_rank("SKIP")
-                ctx.action_reason = ctx.state_reason
-
-            status_reason = ctx.state_reason or "结构/时效通过"
-            if ctx.action in {"SKIP", "WAIT"} and ctx.action_reason:
-                status_reason = ctx.action_reason
-
-            exposure_chain = None
-            chain_parts = [f"{name}={val*100:.0f}%" for name, val in cap_candidates]
-            if ctx.entry_exposure_cap is not None:
-                chain_tail = f"{ctx.entry_exposure_cap*100:.0f}%"
-                exposure_chain = (
-                    f"entry_exposure_cap=min({', '.join(chain_parts)}) => {chain_tail}"
-                    if chain_parts
-                    else f"entry_exposure_cap={chain_tail}"
-                )
-            elif chain_parts:
-                exposure_chain = f"entry_exposure_cap=min({', '.join(chain_parts)})"
-
-            if exposure_chain:
-                if ctx.action_reason and ctx.action_reason != "OK":
-                    ctx.action_reason = f"{ctx.action_reason}；{exposure_chain}"
-                else:
-                    ctx.action_reason = exposure_chain
-                status_reason = ctx.action_reason
-
-            action_reason_final = ctx.action_reason or status_reason
-
-            vol_ratio_val = _to_float(live_intraday_vol_ratio)
-            dev_ma20_atr_val = _to_float(dev_ma20_atr)
-            runup_atr_val = _to_float(runup_from_sigclose_atr)
-            vol_ratio_txt = f"{vol_ratio_val:.2f}" if vol_ratio_val is not None else "-"
-            dev_ma20_atr_txt = f"{dev_ma20_atr_val:.2f}" if dev_ma20_atr_val is not None else "-"
-            runup_atr_txt = f"{runup_atr_val:.2f}" if runup_atr_val is not None else "-"
-            board_txt = board_status or "-"
-            final_gate_action = self._merge_gate_actions(
-                weekly_gate_action,
-                env_index_gate_action,
-                ctx.env_gate_action,
-            )
-            gate_txt = final_gate_action or weekly_gate_action or "NOT_APPLIED"
-            index_pct_txt = (
-                f"{env_index_live_pct_change:.2f}%"
-                if env_index_live_pct_change is not None
-                else "-"
-            )
-            index_gate_txt = env_index_gate_action or "-"
-            index_dev_txt = (
-                f"{env_index_dev_ma20_atr:.2f}"
-                if env_index_dev_ma20_atr is not None
-                else "-"
-            )
-            summary_line = (
-                f"{ctx.state} {ctx.action} | {action_reason_final}"
-                f" | 量比={vol_ratio_txt}"
-                f" | 偏离20ATR={dev_ma20_atr_txt}"
-                f" | runupATR={runup_atr_txt}"
-                f" | 板块={board_txt}"
-                f" | 门控={gate_txt}"
-                f" | 指数={index_pct_txt}/{index_gate_txt}/{index_dev_txt}"
-            )
-            summary_lines.append(summary_line[:512])
-
+            states.append(state)
+            status_reasons.append(status_reason)
+            actions.append(action)
+            action_reasons.append(action_reason)
+            signal_kinds.append("PULLBACK" if is_pullback else "CROSS")
+            rule_hits_json_list.append(None)
+            summary_lines.append(f"{state} {action} | {action_reason}")
+            env_index_snapshot_hashes.append(env_index_snapshot_hash)
+            env_final_gate_action_list.append(env_final_gate_action)
             env_regimes.append(env_regime)
             env_position_hints.append(env_position_hint)
-            env_index_scores.append(idx_score_float)
-            board_statuses.append(board_status)
-            board_ranks.append(board_rank)
-            board_chg_pcts.append(board_chg)
-
-            strength_scores.append(_to_float(strength_score))
-            strength_deltas.append(_to_float(strength_delta))
-            strength_trends.append(strength_trend)
-            strength_notes.append(strength_note or None)
-            entry_exposure_caps.append(ctx.entry_exposure_cap)
-            asof_ma5_list.append(_to_float(ma5))
-            asof_ma20_list.append(_to_float(ma20))
-            asof_ma60_list.append(_to_float(ma60))
-            asof_ma250_list.append(_to_float(ma250))
-            asof_vol_ratio_list.append(
-                _to_float(_coalesce(row, "asof_vol_ratio", "sig_vol_ratio"))
-            )
-            asof_macd_hist_list.append(_to_float(macd_hist))
-            asof_atr14_list.append(_to_float(atr14))
-            asof_stop_ref_list.append(_to_float(_coalesce(row, "asof_stop_ref", "sig_stop_ref")))
-            dev_ma5_list.append(_to_float(dev_ma5))
-            dev_ma20_list.append(_to_float(dev_ma20))
-            dev_ma5_atr_list.append(_to_float(dev_ma5_atr))
-            dev_ma20_atr_list.append(_to_float(dev_ma20_atr))
-            runup_from_sigclose_list.append(_to_float(runup_from_sigclose))
-            runup_from_sigclose_atr_list.append(_to_float(runup_from_sigclose_atr))
-            runup_ref_price_list.append(_to_float(runup_ref_price_val))
-            runup_ref_source_list.append(runup_ref_source_val)
-            rule_hits_json_list.append(
-                json.dumps(
-                    [hit.to_dict() for hit in ctx.rule_hits],
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                )
-            )
-            env_index_snapshot_hashes.append(index_intraday.get("env_index_snapshot_hash"))
-            env_final_gate_action_list.append(final_gate_action)
-
             env_weekly_asof_trade_dates.append(env_weekly_asof_trade_date)
             env_weekly_risk_levels.append(env_weekly_risk_level)
-            env_weekly_scene_list.append(
-                str(env_weekly_scene)[:32] if env_weekly_scene is not None else None
-            )
-            env_weekly_structure_statuses.append(
-                env_weekly_structure_status or env_weekly_status
-            )
-            env_weekly_pattern_statuses.append(env_weekly_pattern_status)
-            env_weekly_gate_action_list.append(weekly_gate_action)
+            env_weekly_scene_list.append(env_weekly_scene)
 
-            actions.append(ctx.action)
-            action_reasons.append(action_reason_final)
-            states.append(ctx.state)
-            status_reasons.append(status_reason)
-            signal_kinds.append("PULLBACK" if is_pullback else "CROSS")
-            trade_stop_refs.append(trade_stop_ref_val)
-            sig_stop_refs.append(_to_float(signal_stop_ref_val))
-            effective_stop_refs.append(_to_float(effective_stop_ref))
-            valid_days_list.append(valid_days)
-
-        merged["monitor_date"] = checked_at_ts.date().isoformat()
-        merged["live_trade_date"] = merged["monitor_date"]
+        merged["monitor_date"] = monitor_date
+        merged["live_trade_date"] = monitor_date
+        merged["live_gap_pct"] = live_gap_list
+        merged["live_pct_change"] = live_pct_change_list
+        merged["live_intraday_vol_ratio"] = live_intraday_vol_list
         merged["action"] = actions
         merged["action_reason"] = action_reasons
         merged["state"] = states
         merged["status_reason"] = status_reasons
-        merged["trade_stop_ref"] = trade_stop_refs
-        merged["sig_stop_ref"] = sig_stop_refs
-        merged["effective_stop_ref"] = effective_stop_refs
+        merged["signal_age"] = merged.get("signal_age")
         merged["valid_days"] = valid_days_list
+        merged["trade_stop_ref"] = trade_stop_refs
+        merged["effective_stop_ref"] = effective_stop_refs
         merged["entry_exposure_cap"] = entry_exposure_caps
         merged["checked_at"] = checked_at_ts
         merged["run_id"] = run_id
-        merged["env_index_score"] = env_index_scores
         merged["env_regime"] = env_regimes
         merged["env_position_hint"] = env_position_hints
         merged["env_weekly_asof_trade_date"] = env_weekly_asof_trade_dates
         merged["env_weekly_risk_level"] = env_weekly_risk_levels
         merged["env_weekly_scene"] = env_weekly_scene_list
-        merged["env_weekly_structure_status"] = env_weekly_structure_statuses
-        merged["env_weekly_pattern_status"] = env_weekly_pattern_statuses
-        merged["env_weekly_gate_action"] = env_weekly_gate_action_list
+        merged["env_weekly_structure_status"] = None
+        merged["env_weekly_pattern_status"] = None
+        merged["env_weekly_gate_action"] = None
         merged["env_final_gate_action"] = env_final_gate_action_list
         merged["env_index_snapshot_hash"] = env_index_snapshot_hashes
-        merged["board_status"] = board_statuses
-        merged["board_rank"] = board_ranks
-        merged["board_chg_pct"] = board_chg_pcts
-        merged["signal_strength"] = strength_scores
-        merged["strength_delta"] = strength_deltas
-        merged["strength_trend"] = strength_trends
-        merged["strength_note"] = strength_notes
-        merged["signal_kind"] = signal_kinds
-
-        def _resolve_asof_trade_date(row: pd.Series) -> str | None:
-            has_latest = bool(row.get("_has_latest_snapshot"))
-            sig_date_val = str(row.get("sig_date") or "").strip() or None
-            return latest_trade_date if has_latest else sig_date_val
-
-        merged["asof_trade_date"] = merged.apply(_resolve_asof_trade_date, axis=1)
-        merged["asof_ma5"] = asof_ma5_list
-        merged["asof_ma20"] = asof_ma20_list
-        merged["asof_ma60"] = asof_ma60_list
-        merged["asof_ma250"] = asof_ma250_list
-        merged["asof_macd_hist"] = asof_macd_hist_list
-        merged["asof_vol_ratio"] = asof_vol_ratio_list
-        merged["asof_atr14"] = asof_atr14_list
-        merged["asof_stop_ref"] = asof_stop_ref_list
-        merged["dev_ma5"] = dev_ma5_list
-        merged["dev_ma20"] = dev_ma20_list
-        merged["dev_ma5_atr"] = dev_ma5_atr_list
-        merged["dev_ma20_atr"] = dev_ma20_atr_list
         merged["runup_from_sigclose"] = runup_from_sigclose_list
         merged["runup_from_sigclose_atr"] = runup_from_sigclose_atr_list
         merged["runup_ref_price"] = runup_ref_price_list
         merged["runup_ref_source"] = runup_ref_source_list
+        merged["dev_ma5"] = dev_ma5_list
+        merged["dev_ma20"] = dev_ma20_list
+        merged["dev_ma5_atr"] = dev_ma5_atr_list
+        merged["dev_ma20_atr"] = dev_ma20_atr_list
         merged["rule_hits_json"] = rule_hits_json_list
         merged["summary_line"] = summary_lines
-        if "asof_close" not in merged.columns:
-            merged["asof_close"] = merged.get("sig_close")
 
-        if (
-            "asof_ma250" in merged.columns
-            and merged.get("asof_ma250") is not None
-            and pd.to_numeric(merged.get("asof_ma250"), errors="coerce").isna().all()
-        ):
-            latest_ma250_series = None
-            if "asof_ma250" in merged.columns:
-                latest_ma250_series = pd.to_numeric(
-                    merged.get("asof_ma250"), errors="coerce"
-                )
-            signal_ma250_series = pd.to_numeric(
-                merged.get("sig_ma250"), errors="coerce"
-            )
-            has_ma250 = False
-            if latest_ma250_series is not None:
-                has_ma250 = latest_ma250_series.notna().any()
-            if not has_ma250 and not signal_ma250_series.isna().all():
-                has_ma250 = True
-            if has_ma250:
-                self.logger.warning(
-                    "asof_ma250 计算为空：请检查 ma250 列合并/命名是否正确。"
-                )
+        merged["asof_trade_date"] = merged.get("asof_trade_date").fillna(merged.get("sig_date"))
+        merged["asof_close"] = merged.get("asof_close").fillna(merged.get("sig_close"))
+        merged["asof_ma5"] = merged.get("asof_ma5").fillna(merged.get("sig_ma5"))
+        merged["asof_ma20"] = merged.get("asof_ma20").fillna(merged.get("sig_ma20"))
+        merged["asof_ma60"] = merged.get("asof_ma60").fillna(merged.get("sig_ma60"))
+        merged["asof_ma250"] = merged.get("asof_ma250").fillna(merged.get("sig_ma250"))
+        merged["asof_vol_ratio"] = merged.get("asof_vol_ratio").fillna(merged.get("sig_vol_ratio"))
+        merged["asof_macd_hist"] = merged.get("asof_macd_hist").fillna(merged.get("sig_macd_hist"))
+        merged["asof_atr14"] = merged.get("asof_atr14").fillna(merged.get("sig_atr14"))
+        merged["asof_stop_ref"] = merged.get("asof_stop_ref").fillna(merged.get("sig_stop_ref"))
 
         full_keep_cols = [
             "monitor_date",
@@ -4302,6 +3130,7 @@ class MA5MA20OpenMonitorRunner:
             if col not in merged.columns:
                 merged[col] = None
 
+        merged["snapshot_hash"] = merged.apply(lambda row: make_snapshot_hash(row.to_dict()), axis=1)
         return merged[keep_cols].copy()
 
     # -------------------------
@@ -4585,8 +3414,6 @@ class MA5MA20OpenMonitorRunner:
         checked_at = dt.datetime.now()
         monitor_date = checked_at.date().isoformat()
         run_id = self._calc_run_id(checked_at)
-        env_snapshot_run_id = run_id
-        env_snapshot_matched_run_id = False
 
         latest_trade_date, signal_dates, signals = self._load_recent_buy_signals()
         if not latest_trade_date or signals.empty:
@@ -4602,42 +3429,22 @@ class MA5MA20OpenMonitorRunner:
             self.logger.info("实时行情已获取：%s 条", len(quotes))
 
         latest_snapshots = self._load_latest_snapshots(latest_trade_date, codes)
-        env_index_snapshot_hash_original = None
-        env_context = self.load_env_snapshot_context(
-            monitor_date, run_id, allow_fallback=True
-        )
-        if env_context:
-            if isinstance(env_context, dict):
-                env_index_snapshot_hash_original = env_context.get("env_index_snapshot_hash")
-            loaded_run_id = str(env_context.get("run_id") or "")
-            env_snapshot_run_id = loaded_run_id or env_snapshot_run_id
-            env_snapshot_matched_run_id = bool(loaded_run_id == str(run_id))
-            if self.weekly_env_fallback_asof_date:
-                self.logger.info(
-                    "已加载周线回退环境（asof_date=%s，run_id=%s）",
-                    self.weekly_env_fallback_asof_date,
-                    env_snapshot_run_id,
-                )
-            elif env_snapshot_matched_run_id:
-                self.logger.info(
-                    "已加载环境快照（monitor_date=%s, run_id=%s）",
-                    monitor_date,
-                    env_snapshot_run_id,
-                )
-            else:
-                self.logger.info(
-                    "已加载当日最新环境快照（monitor_date=%s，未匹配 run_id=%s，实际=%s）",
-                    monitor_date,
-                    run_id,
-                    env_snapshot_run_id,
-                )
+        env_context = self.load_env_snapshot_context(monitor_date, run_id)
         if not env_context:
-            self.logger.warning(
-                "未找到环境快照（monitor_date=%s, run_id=%s），请先运行 run_index_weekly_channel 产出环境。",
+            self.logger.error(
+                "未找到环境快照（monitor_date=%s, run_id=%s），本次开盘监测终止。",
                 monitor_date,
                 run_id,
             )
             return
+
+        env_final_gate_action = env_context.get("env_final_gate_action") if isinstance(env_context, dict) else None
+        self.logger.info(
+            "已加载环境快照（monitor_date=%s, run_id=%s, gate=%s）。",
+            monitor_date,
+            run_id,
+            env_final_gate_action,
+        )
         weekly_scenario = env_context.get("weekly_scenario", {}) if isinstance(env_context, dict) else {}
         if isinstance(weekly_scenario, dict):
             struct_tags = ",".join(weekly_scenario.get("weekly_structure_tags", []) or [])
@@ -4684,9 +3491,6 @@ class MA5MA20OpenMonitorRunner:
                     str(plan_b_if or "")[:120],
                     str(plan_b_recover or "")[:120],
                 )
-        env_context, index_env_snapshot, env_index_snapshot_hash = self._attach_index_snapshot(
-            latest_trade_date, monitor_date, run_id, checked_at, env_context
-        )
         result = self._evaluate(
             signals,
             quotes,
@@ -4695,38 +3499,6 @@ class MA5MA20OpenMonitorRunner:
             env_context,
             checked_at=checked_at,
         )
-
-        weekly_gate_policy = self._resolve_env_weekly_gate_policy(env_context)
-        if isinstance(env_context, dict):
-            env_context["weekly_gate_policy"] = weekly_gate_policy
-        if not result.empty and "run_id" in result.columns:
-            run_id_val = str(result.iloc[0].get("run_id") or "").strip()
-            run_id = run_id_val or run_id
-            env_snapshot_matched_run_id = bool(
-                env_context
-                and str(env_context.get("run_id") or "") == str(run_id)
-            )
-
-        env_snapshot_should_update = False
-        if isinstance(env_context, dict):
-            env_snapshot_should_update = bool(
-                self.params.persist_env_snapshot
-                and env_context
-                and (
-                    (not env_snapshot_matched_run_id)
-                    or env_context.get("env_index_snapshot_hash")
-                    != env_index_snapshot_hash_original
-                )
-            )
-
-        if env_snapshot_should_update:
-            self._persist_env_snapshot(
-                env_context,
-                monitor_date,
-                run_id or env_snapshot_run_id,
-                checked_at,
-                weekly_gate_policy,
-            )
 
         if result.empty:
             return

@@ -23,6 +23,8 @@ TABLE_STRATEGY_INDICATOR_DAILY = "strategy_indicator_daily"
 TABLE_STRATEGY_SIGNAL_EVENTS = "strategy_signal_events"
 TABLE_STRATEGY_SIGNAL_CANDIDATES = "strategy_signal_candidates"
 VIEW_STRATEGY_SIGNAL_CANDIDATES = "v_strategy_signal_candidates"
+# 策略准备就绪信号（含筹码）
+VIEW_STRATEGY_READY_SIGNALS = "v_strategy_ready_signals"
 # 兼容旧版本候选池视图（历史命名）：避免遗留 view 引用失效
 VIEW_STRATEGY_MA5_MA20_CANDIDATES = "v_strategy_ma5_ma20_candidates"
 TABLE_STRATEGY_CHIP_FILTER = "strategy_chip_filter"
@@ -48,6 +50,7 @@ class TableNames:
     candidates_table: str
     candidates_view: str
     candidates_as_view: bool
+    ready_signals_view: str
     open_monitor_eval_table: str
     env_snapshot_table: str
     env_index_snapshot_table: str
@@ -88,6 +91,12 @@ class SchemaManager:
         self._ensure_trade_metrics_table()
         self._ensure_backtest_view()
         self._ensure_chip_filter_table()
+        self._ensure_ready_signals_view(
+            tables.ready_signals_view,
+            tables.signal_events_table,
+            tables.indicator_table,
+            TABLE_STRATEGY_CHIP_FILTER,
+        )
         self._ensure_v_pnl_view()
 
         self._ensure_open_monitor_eval_table(tables.open_monitor_eval_table)
@@ -124,6 +133,10 @@ class SchemaManager:
         signal_events_table = (
             str(open_monitor_cfg.get("signal_events_table", default_events)).strip()
             or TABLE_STRATEGY_SIGNAL_EVENTS
+        )
+        ready_signals_view = (
+            str(open_monitor_cfg.get("ready_signals_view", VIEW_STRATEGY_READY_SIGNALS)).strip()
+            or VIEW_STRATEGY_READY_SIGNALS
         )
         candidates_table = (
             str(strat_cfg.get("candidates_table", TABLE_STRATEGY_SIGNAL_CANDIDATES)).strip()
@@ -206,6 +219,7 @@ class SchemaManager:
             candidates_table=candidates_table,
             candidates_view=candidates_view,
             candidates_as_view=candidates_as_view,
+            ready_signals_view=ready_signals_view,
             open_monitor_eval_table=open_monitor_eval_table,
             env_snapshot_table=env_snapshot_table,
             env_index_snapshot_table=env_index_snapshot_table,
@@ -853,6 +867,111 @@ class SchemaManager:
             conn.execute(stmt)
         self.logger.info("已创建/更新候选视图 %s。", view)
 
+    def _ensure_ready_signals_view(
+        self,
+        view: str,
+        events_table: str,
+        indicator_table: str,
+        chip_table: str,
+    ) -> None:
+        if not view or not events_table:
+            return
+
+        ind_join = ""
+        ind_fields = ""
+        if indicator_table and self._table_exists(indicator_table):
+            ind_join = (
+                f"""
+                LEFT JOIN `{indicator_table}` ind
+                  ON e.`sig_date` = ind.`trade_date`
+                 AND e.`code` = ind.`code`
+                """
+            )
+            ind_fields = """
+              ind.`close`,
+              ind.`ma5`,
+              ind.`ma20`,
+              ind.`ma60`,
+              ind.`ma250`,
+              ind.`vol_ratio`,
+              ind.`macd_hist`,
+              ind.`kdj_k`,
+              ind.`kdj_d`,
+              ind.`atr14`,
+              ind.`yearline_state`
+            """
+
+        chip_join = ""
+        chip_fields = ""
+        if chip_table and self._table_exists(chip_table):
+            chip_join = (
+                f"""
+                LEFT JOIN `{chip_table}` cf
+                  ON e.`sig_date` = cf.`sig_date`
+                 AND e.`code` = cf.`code`
+                """
+            )
+            chip_fields = """
+              cf.`chip_score`,
+              cf.`chip_reason`,
+              cf.`chip_penalty`,
+              cf.`chip_note`
+            """
+
+        meta = self._column_meta(events_table)
+
+        def _col(name: str) -> str | None:
+            return name if name in meta else None
+
+        field_exprs = [
+            "e.`sig_date`",
+            "e.`code`",
+            "e.`strategy_code`",
+            "COALESCE(e.`final_action`, e.`signal`) AS `signal`",
+            "COALESCE(e.`final_action`, e.`signal`) AS `final_action`",
+            "COALESCE(e.`final_reason`, e.`reason`) AS `final_reason`",
+            "e.`final_cap`",
+            "e.`reason`",
+            "e.`risk_tag`",
+            "e.`risk_note`",
+        ]
+        optional_cols = [
+            "stop_ref",
+            "macd_event",
+            "gdhs_delta_pct",
+            "gdhs_announce_date",
+            "age_days",
+            "deadzone_hit",
+            "stale_hit",
+            "fear_score",
+            "wave_type",
+        ]
+        for col in optional_cols:
+            expr = _col(col)
+            if expr:
+                field_exprs.append(f"e.`{expr}`")
+
+        if ind_fields:
+            field_exprs.append(ind_fields.strip())
+        if chip_fields:
+            field_exprs.append(chip_fields.strip())
+
+        select_clause = ",\n              ".join(field_exprs)
+        stmt = text(
+            f"""
+            CREATE OR REPLACE VIEW `{view}` AS
+            SELECT
+              {select_clause}
+            FROM `{events_table}` e
+            {ind_join}
+            {chip_join}
+            WHERE COALESCE(e.`final_action`, e.`signal`) IN ('BUY','BUY_CONFIRM')
+            """
+        )
+        with self.engine.begin() as conn:
+            conn.execute(stmt)
+        self.logger.info("已创建/更新视图 %s（含筹码预计算）。", view)
+
     def _ensure_candidates_compat_view(self, compat_view: str, base_view: str) -> None:
         """兼容旧命名的候选池视图，防止遗留依赖报错。
 
@@ -1194,6 +1313,8 @@ class SchemaManager:
             "env_weekly_gate_action": "VARCHAR(16) NULL",
             "env_weekly_gate_policy": "VARCHAR(16) NULL",
             "env_final_gate_action": "VARCHAR(16) NULL",
+            "env_final_cap_pct": "DOUBLE NULL",
+            "env_final_reason_json": "VARCHAR(2000) NULL",
             "env_index_snapshot_hash": "VARCHAR(32) NULL",
         }
         if not self._table_exists(table):
@@ -1204,6 +1325,8 @@ class SchemaManager:
         self._ensure_date_column(table, "monitor_date", not_null=True)
         self._ensure_date_column(table, "env_weekly_asof_trade_date", not_null=False)
         self._ensure_varchar_length(table, "run_id", 64)
+        self._ensure_numeric_column(table, "env_final_cap_pct", "DOUBLE NULL")
+        self._ensure_varchar_length(table, "env_final_reason_json", 2000)
 
         unique_name = "ux_env_snapshot_run"
         if not self._index_exists(table, unique_name):

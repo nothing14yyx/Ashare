@@ -1711,6 +1711,44 @@ class MA5MA20StrategyRunner:
         self._clear_table(tbl)
         self.db_writer.write_dataframe(cands, tbl, if_exists="append")
 
+    def _precompute_chip_filter(self, signals: pd.DataFrame) -> None:
+        """策略运行结束后触发筹码预计算，盘前准备 ready signals。"""
+
+        if signals.empty:
+            return
+
+        chip_inputs = [
+            "date",
+            "sig_date",
+            "code",
+            "vol_ratio",
+            "close",
+            "ma20",
+            "runup_pct",
+            "fear_score",
+            "pct_chg",
+            "pct_change",
+            "change_pct",
+            "ret_1d",
+            "ret",
+        ]
+        sig_for_chip = signals[[c for c in chip_inputs if c in signals.columns]].copy()
+        if "sig_date" not in sig_for_chip.columns and "date" in sig_for_chip.columns:
+            sig_for_chip = sig_for_chip.rename(columns={"date": "sig_date"})
+        if "sig_date" not in sig_for_chip.columns:
+            return
+        sig_for_chip["sig_date"] = pd.to_datetime(sig_for_chip["sig_date"], errors="coerce")
+        if "date" not in sig_for_chip.columns:
+            sig_for_chip["date"] = sig_for_chip["sig_date"]
+        sig_for_chip = sig_for_chip.dropna(subset=["sig_date", "code"])
+        if sig_for_chip.empty:
+            return
+
+        try:
+            ChipFilter().apply(sig_for_chip)
+        except Exception as exc:  # noqa: BLE001
+            self.logger.warning("筹码预计算失败（已跳过，不影响信号写入）：%s", exc)
+
     def run(self, *, force: bool = False) -> None:
         """执行 MA5-MA20 策略。
 
@@ -1792,6 +1830,8 @@ class MA5MA20StrategyRunner:
         self._write_signal_events(latest_date, sig_for_write, calc_codes)
         if not bool(getattr(self.params, "candidates_as_view", False)):
             self._write_candidates(latest_date, sig_for_candidates)
+
+        self._precompute_chip_filter(sig_for_write)
 
         latest_sig = sig[sig["date"].dt.date == latest_date]
         dup_count = int(latest_sig.duplicated(subset=["code", "date"]).sum())
