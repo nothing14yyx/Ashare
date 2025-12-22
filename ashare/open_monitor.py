@@ -750,6 +750,7 @@ class MA5MA20OpenMonitorRunner:
             weekly_soft_gate_strength_threshold=self.weekly_soft_gate_strength_threshold,
         )
         self.weekly_env_fallback_asof_date: str | None = None
+        self._ready_signals_used: bool = False
 
     def _resolve_volume_ratio_threshold(self) -> float:
         strat = get_section("strategy_ma5_ma20_trend") or {}
@@ -1516,8 +1517,20 @@ class MA5MA20OpenMonitorRunner:
         return {d: i for i, d in enumerate(dates)}
 
     def _load_recent_buy_signals(self) -> Tuple[str | None, List[str], pd.DataFrame]:
-        events_table = self.params.ready_signals_view or self.params.signal_events_table
+        preferred_view = self.params.ready_signals_view
+        fallback_events = self.params.signal_events_table
+        events_table = preferred_view or fallback_events
+        use_ready_view = False
+        if preferred_view and self._table_exists(preferred_view):
+            events_table = preferred_view
+            use_ready_view = True
+        elif fallback_events and self._table_exists(fallback_events):
+            events_table = fallback_events
+        self._ready_signals_used = use_ready_view
         indicator_table = self.params.indicator_table
+        if not self._table_exists(events_table):
+            self.logger.error("信号来源表/视图 %s 不存在，跳过开盘监测。", events_table)
+            return None, [], pd.DataFrame()
         monitor_date = dt.date.today().isoformat()
         # 严格最近 N 个交易日窗口：只由 signal_lookback_days 决定
         lookback = max(int(self.params.signal_lookback_days or 0), 1)
@@ -1638,32 +1651,59 @@ class MA5MA20OpenMonitorRunner:
             signal_dates,
         )
 
+        available_cols = set(self._get_table_columns(events_table))
+
+        def _field_or_null(name: str) -> str:
+            return f"`{name}`" if name in available_cols else f"NULL AS `{name}`"
+
+        events_fields = [
+            _field_or_null("sig_date"),
+            _field_or_null("code"),
+            _field_or_null("signal"),
+            _field_or_null("final_action"),
+            _field_or_null("final_reason"),
+            _field_or_null("final_cap"),
+            _field_or_null("reason"),
+            _field_or_null("risk_tag"),
+            _field_or_null("risk_note"),
+            _field_or_null("stop_ref"),
+            _field_or_null("macd_event"),
+            _field_or_null("chip_score"),
+            _field_or_null("gdhs_delta_pct"),
+            _field_or_null("gdhs_announce_date"),
+            _field_or_null("chip_reason"),
+            _field_or_null("chip_penalty"),
+            _field_or_null("chip_note"),
+            _field_or_null("age_days"),
+            _field_or_null("deadzone_hit"),
+            _field_or_null("stale_hit"),
+            _field_or_null("fear_score"),
+            _field_or_null("wave_type"),
+            _field_or_null("extra_json"),
+        ]
+        if use_ready_view:
+            events_fields.extend(
+                [
+                    _field_or_null("close"),
+                    _field_or_null("ma5"),
+                    _field_or_null("ma20"),
+                    _field_or_null("ma60"),
+                    _field_or_null("ma250"),
+                    _field_or_null("vol_ratio"),
+                    _field_or_null("macd_hist"),
+                    _field_or_null("kdj_k"),
+                    _field_or_null("kdj_d"),
+                    _field_or_null("atr14"),
+                    _field_or_null("yearline_state"),
+                    _field_or_null("industry"),
+                    _field_or_null("board_name"),
+                    _field_or_null("board_code"),
+                ]
+            )
         events_stmt = text(
             f"""
             SELECT
-              `sig_date`,
-              `code`,
-              `signal`,
-              `final_action`,
-              `final_reason`,
-              `final_cap`,
-              `reason`,
-              `risk_tag`,
-              `risk_note`,
-              `stop_ref`,
-              `macd_event`,
-              `chip_score`,
-              `gdhs_delta_pct`,
-              `gdhs_announce_date`,
-              `chip_reason`,
-              `chip_penalty`,
-              `chip_note`,
-              `age_days`,
-              `deadzone_hit`,
-              `stale_hit`,
-              `fear_score`,
-              `wave_type`,
-              `extra_json`
+              {",".join(events_fields)}
             FROM `{events_table}`
             WHERE `sig_date` IN :dates
               AND COALESCE(`final_action`, `signal`) IN ('BUY','BUY_CONFIRM')
@@ -1713,7 +1753,7 @@ class MA5MA20OpenMonitorRunner:
             "yearline_state",
         ]
         ind_df = pd.DataFrame()
-        if indicator_table and self._table_exists(indicator_table):
+        if (not use_ready_view) and indicator_table and self._table_exists(indicator_table):
             try:
                 with self.db_writer.engine.begin() as conn:
                     ind_df = pd.read_sql_query(
@@ -1781,6 +1821,9 @@ class MA5MA20OpenMonitorRunner:
             "ma20_bias",
             "risk_tag",
             "risk_note",
+            "industry",
+            "board_name",
+            "board_code",
         ]
         for col in base_cols + optional_cols:
             if col not in merged.columns:
@@ -2155,6 +2198,10 @@ class MA5MA20OpenMonitorRunner:
             run_id,
             checked_at,
             env_context,
+        )
+
+        self.env_builder._finalize_env_directives(
+            env_context, weekly_gate_policy=weekly_gate_policy
         )
 
         self._persist_env_snapshot(
@@ -2574,6 +2621,7 @@ class MA5MA20OpenMonitorRunner:
         run_id = self._calc_run_id(checked_at_ts)
         monitor_date = checked_at_ts.date().isoformat()
         run_id_norm = str(run_id or "").strip().upper()
+        ready_signals_used = getattr(self, "_ready_signals_used", False)
 
         env_final_gate_action = None
         env_final_cap_pct = None
@@ -2595,9 +2643,19 @@ class MA5MA20OpenMonitorRunner:
             env_weekly_risk_level = env_context.get("weekly_risk_level")
             env_weekly_scene = env_context.get("weekly_scene_code")
 
+        if env_final_gate_action is not None:
+            env_final_gate_action = str(env_final_gate_action).strip().upper()
+
         if env_final_gate_action is None:
             self.logger.error(
                 "环境快照缺少 env_final_gate_action，已终止评估（monitor_date=%s, run_id=%s）。",
+                monitor_date,
+                run_id,
+            )
+            return pd.DataFrame()
+        if env_final_cap_pct is None:
+            self.logger.error(
+                "环境快照缺少 env_final_cap_pct，已终止评估（monitor_date=%s, run_id=%s）。",
                 monitor_date,
                 run_id,
             )
@@ -2623,42 +2681,58 @@ class MA5MA20OpenMonitorRunner:
         merged["code"] = merged["code"].astype(str)
         merged = merged.merge(q, on="code", how="left", suffixes=("", "_q"))
 
-        industry_dim = self._load_stock_industry_dim()
-        if not industry_dim.empty:
-            rename_map = {}
-            if "industryClassification" in industry_dim.columns:
-                rename_map["industryClassification"] = "industry_classification"
-            industry_dim = industry_dim.rename(columns=rename_map)
-            if "industry" not in industry_dim.columns and "industry_classification" in industry_dim.columns:
-                industry_dim["industry"] = industry_dim["industry_classification"]
-            merged = merged.merge(
-                industry_dim[[c for c in ["code", "industry", "industry_classification"] if c in industry_dim.columns]],
-                on="code",
-                how="left",
-            )
+        if not ready_signals_used:
+            industry_dim = self._load_stock_industry_dim()
+            if not industry_dim.empty:
+                rename_map = {}
+                if "industryClassification" in industry_dim.columns:
+                    rename_map["industryClassification"] = "industry_classification"
+                industry_dim = industry_dim.rename(columns=rename_map)
+                if "industry" not in industry_dim.columns and "industry_classification" in industry_dim.columns:
+                    industry_dim["industry"] = industry_dim["industry_classification"]
+                merged = merged.merge(
+                    industry_dim[[c for c in ["code", "industry", "industry_classification"] if c in industry_dim.columns]],
+                    on="code",
+                    how="left",
+                )
 
-        board_dim = self._load_board_constituent_dim()
-        if not board_dim.empty:
-            cols = [c for c in ["code", "board_name", "board_code"] if c in board_dim.columns]
-            if cols:
-                deduped = board_dim.drop_duplicates(subset=["code"], keep="first")
-                merged = merged.merge(deduped[cols], on="code", how="left")
+            board_dim = self._load_board_constituent_dim()
+            if not board_dim.empty:
+                cols = [c for c in ["code", "board_name", "board_code"] if c in board_dim.columns]
+                if cols:
+                    deduped = board_dim.drop_duplicates(subset=["code"], keep="first")
+                    merged = merged.merge(deduped[cols], on="code", how="left")
 
-        if not latest_snapshots.empty:
-            snap = latest_snapshots.copy()
-            snap["_has_latest_snapshot"] = True
-            rename_map = {
-                c: f"asof_{c}"
-                for c in snap.columns
-                if c not in {"code", "_has_latest_snapshot"}
-            }
-            snap = snap.rename(columns=rename_map)
-            merged = merged.merge(snap, on="code", how="left")
+            if not latest_snapshots.empty:
+                snap = latest_snapshots.copy()
+                snap["_has_latest_snapshot"] = True
+                rename_map = {
+                    c: f"asof_{c}"
+                    for c in snap.columns
+                    if c not in {"code", "_has_latest_snapshot"}
+                }
+                snap = snap.rename(columns=rename_map)
+                merged = merged.merge(snap, on="code", how="left")
 
         if "_has_latest_snapshot" not in merged.columns:
             merged["_has_latest_snapshot"] = False
         else:
             merged["_has_latest_snapshot"] = merged["_has_latest_snapshot"].eq(True)
+
+        for col in [
+            "asof_trade_date",
+            "asof_close",
+            "asof_ma5",
+            "asof_ma20",
+            "asof_ma60",
+            "asof_ma250",
+            "asof_vol_ratio",
+            "asof_macd_hist",
+            "asof_atr14",
+            "asof_stop_ref",
+        ]:
+            if col not in merged.columns:
+                merged[col] = None
 
         avg_volume_map = self._load_avg_volume(
             latest_trade_date, merged["code"].dropna().astype(str).unique().tolist()
