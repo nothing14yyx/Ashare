@@ -2604,62 +2604,23 @@ class MA5MA20OpenMonitorRunner:
         lower = reason_text.lower()
         return ("回踩" in reason_text) and (("ma20" in lower) or ("ma 20" in lower))
 
-    def _evaluate(
+
+    def _prepare_monitor_frame(
         self,
         signals: pd.DataFrame,
         quotes: pd.DataFrame,
         latest_snapshots: pd.DataFrame,
         latest_trade_date: str,
-        env_context: dict[str, Any] | None = None,
+        checked_at_ts: dt.datetime,
         *,
-        checked_at: dt.datetime | None = None,
-    ) -> pd.DataFrame:
-        if signals.empty:
-            return pd.DataFrame()
+        ready_signals_used: bool,
+    ) -> tuple[pd.DataFrame, dict[str, float] | None, int, int]:
+        """准备 open_monitor 评估所需的宽表输入。
 
-        checked_at_ts = checked_at or dt.datetime.now()
-        run_id = self._calc_run_id(checked_at_ts)
-        monitor_date = checked_at_ts.date().isoformat()
-        run_id_norm = str(run_id or "").strip().upper()
-        ready_signals_used = getattr(self, "_ready_signals_used", False)
-
-        env_final_gate_action = None
-        env_final_cap_pct = None
-        env_final_reason_json = None
-        env_index_snapshot_hash = None
-        env_regime = None
-        env_position_hint = None
-        env_weekly_asof_trade_date = None
-        env_weekly_risk_level = None
-        env_weekly_scene = None
-        if isinstance(env_context, dict):
-            env_final_gate_action = env_context.get("env_final_gate_action")
-            env_final_cap_pct = _to_float(env_context.get("env_final_cap_pct"))
-            env_final_reason_json = env_context.get("env_final_reason_json")
-            env_index_snapshot_hash = env_context.get("env_index_snapshot_hash")
-            env_regime = env_context.get("regime")
-            env_position_hint = _to_float(env_context.get("position_hint"))
-            env_weekly_asof_trade_date = env_context.get("weekly_asof_trade_date")
-            env_weekly_risk_level = env_context.get("weekly_risk_level")
-            env_weekly_scene = env_context.get("weekly_scene_code")
-
-        if env_final_gate_action is not None:
-            env_final_gate_action = str(env_final_gate_action).strip().upper()
-
-        if env_final_gate_action is None:
-            self.logger.error(
-                "环境快照缺少 env_final_gate_action，已终止评估（monitor_date=%s, run_id=%s）。",
-                monitor_date,
-                run_id,
-            )
-            return pd.DataFrame()
-        if env_final_cap_pct is None:
-            self.logger.error(
-                "环境快照缺少 env_final_cap_pct，已终止评估（monitor_date=%s, run_id=%s）。",
-                monitor_date,
-                run_id,
-            )
-            return pd.DataFrame()
+        说明：
+        - 这里聚合/清洗/合并属于数据准备（ETL）职责，避免挤占 _evaluate 的决策逻辑。
+        - 保持行为与旧实现一致：quotes 重命名、(signals+quotes) merge、必要时补 industry/board/snapshot。
+        """
 
         q = quotes.copy()
         live_rename_map = {
@@ -2684,7 +2645,7 @@ class MA5MA20OpenMonitorRunner:
         if not ready_signals_used:
             industry_dim = self._load_stock_industry_dim()
             if not industry_dim.empty:
-                rename_map = {}
+                rename_map: dict[str, str] = {}
                 if "industryClassification" in industry_dim.columns:
                     rename_map["industryClassification"] = "industry_classification"
                 industry_dim = industry_dim.rename(columns=rename_map)
@@ -2692,7 +2653,8 @@ class MA5MA20OpenMonitorRunner:
                     industry_dim["industry"] = industry_dim["industry_classification"]
                 merged = merged.merge(
                     industry_dim[
-                        [c for c in ["code", "industry", "industry_classification"] if c in industry_dim.columns]],
+                        [c for c in ["code", "industry", "industry_classification"] if c in industry_dim.columns]
+                    ],
                     on="code",
                     how="left",
                 )
@@ -2785,6 +2747,74 @@ class MA5MA20OpenMonitorRunner:
         live_vol_scale = _infer_volume_scale_factor(merged)
         if live_vol_scale != 1.0 and "live_volume" in merged.columns:
             merged["live_volume"] = merged["live_volume"].apply(lambda x: None if x is None else x * live_vol_scale)
+
+        return merged, avg_volume_map, minutes_elapsed, total_minutes
+
+    def _evaluate(
+        self,
+        signals: pd.DataFrame,
+        quotes: pd.DataFrame,
+        latest_snapshots: pd.DataFrame,
+        latest_trade_date: str,
+        env_context: dict[str, Any] | None = None,
+        *,
+        checked_at: dt.datetime | None = None,
+    ) -> pd.DataFrame:
+        if signals.empty:
+            return pd.DataFrame()
+
+        checked_at_ts = checked_at or dt.datetime.now()
+        run_id = self._calc_run_id(checked_at_ts)
+        monitor_date = checked_at_ts.date().isoformat()
+        run_id_norm = str(run_id or "").strip().upper()
+        ready_signals_used = getattr(self, "_ready_signals_used", False)
+
+        env_final_gate_action = None
+        env_final_cap_pct = None
+        env_final_reason_json = None
+        env_index_snapshot_hash = None
+        env_regime = None
+        env_position_hint = None
+        env_weekly_asof_trade_date = None
+        env_weekly_risk_level = None
+        env_weekly_scene = None
+        if isinstance(env_context, dict):
+            env_final_gate_action = env_context.get("env_final_gate_action")
+            env_final_cap_pct = _to_float(env_context.get("env_final_cap_pct"))
+            env_final_reason_json = env_context.get("env_final_reason_json")
+            env_index_snapshot_hash = env_context.get("env_index_snapshot_hash")
+            env_regime = env_context.get("regime")
+            env_position_hint = _to_float(env_context.get("position_hint"))
+            env_weekly_asof_trade_date = env_context.get("weekly_asof_trade_date")
+            env_weekly_risk_level = env_context.get("weekly_risk_level")
+            env_weekly_scene = env_context.get("weekly_scene_code")
+
+        if env_final_gate_action is not None:
+            env_final_gate_action = str(env_final_gate_action).strip().upper()
+
+        if env_final_gate_action is None:
+            self.logger.error(
+                "环境快照缺少 env_final_gate_action，已终止评估（monitor_date=%s, run_id=%s）。",
+                monitor_date,
+                run_id,
+            )
+            return pd.DataFrame()
+        if env_final_cap_pct is None:
+            self.logger.error(
+                "环境快照缺少 env_final_cap_pct，已终止评估（monitor_date=%s, run_id=%s）。",
+                monitor_date,
+                run_id,
+            )
+            return pd.DataFrame()
+
+        merged, avg_volume_map, minutes_elapsed, total_minutes = self._prepare_monitor_frame(
+            signals,
+            quotes,
+            latest_snapshots,
+            latest_trade_date,
+            checked_at_ts,
+            ready_signals_used=ready_signals_used,
+        )
 
         def _resolve_ref_close(row: pd.Series) -> float | None:
             for key in ("prev_close", "sig_close"):

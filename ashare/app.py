@@ -2058,7 +2058,7 @@ class AshareApp:
 
             universe_snapshot_table = TABLE_A_SHARE_UNIVERSE
             self.logger.info(
-                "已生成候选池 行数=%s",
+                "已生成候选池 表=%s 行数=%s",
                 universe_snapshot_table,
                 len(universe_df),
             )
