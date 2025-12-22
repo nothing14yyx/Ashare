@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import logging
 from typing import Any, Dict
 
@@ -628,6 +629,10 @@ class WeeklyEnvironmentBuilder:
             if isinstance(index_trend, dict) and key in index_trend:
                 env_context[key] = index_trend[key]
 
+        weekly_gate_policy = self.resolve_env_weekly_gate_policy(env_context)
+        env_context["weekly_gate_policy"] = weekly_gate_policy
+        self._finalize_env_directives(env_context, weekly_gate_policy=weekly_gate_policy)
+
         return env_context
 
     @staticmethod
@@ -672,6 +677,89 @@ class WeeklyEnvironmentBuilder:
             return "ALLOW"
 
         return None
+
+    @staticmethod
+    def _merge_gate_actions(*actions: str | None) -> str | None:
+        severity = {"STOP": 3, "WAIT": 2, "ALLOW_SMALL": 1, "ALLOW": 0, None: -1}
+        normalized = []
+        for action in actions:
+            if action is None:
+                normalized.append((severity[None], None))
+                continue
+            action_norm = str(action).strip().upper()
+            if action_norm == "GO":
+                action_norm = "ALLOW"
+            normalized.append((severity.get(action_norm, 0), action_norm))
+        if not normalized:
+            return None
+        normalized.sort(key=lambda x: x[0], reverse=True)
+        return normalized[0][1]
+
+    @staticmethod
+    def _derive_gate_action(regime: str | None, position_hint: float | None) -> str | None:
+        regime_norm = str(regime or "").strip().upper() or None
+        pos_hint_val = to_float(position_hint)
+        if regime_norm in {"BREAKDOWN", "BEAR_CONFIRMED"}:
+            return "STOP"
+        if regime_norm == "RISK_OFF":
+            return "WAIT"
+        if regime_norm == "PULLBACK":
+            if pos_hint_val is not None and pos_hint_val <= 0.3:
+                return "WAIT"
+            return "ALLOW"
+        if regime_norm == "RISK_ON":
+            return "ALLOW"
+        if pos_hint_val is not None:
+            if pos_hint_val <= 0:
+                return "STOP"
+            if pos_hint_val < 0.3:
+                return "WAIT"
+            return "ALLOW"
+        return None
+
+    def _finalize_env_directives(
+        self,
+        env_context: dict[str, Any] | None,
+        *,
+        weekly_gate_policy: str | None = None,
+    ) -> None:
+        if not isinstance(env_context, dict):
+            return
+
+        gate_candidates: list[str | None] = []
+        reason_parts: dict[str, Any] = {}
+        if weekly_gate_policy:
+            gate_norm = str(weekly_gate_policy).strip().upper()
+            gate_candidates.append(gate_norm)
+            reason_parts["weekly_gate_policy"] = gate_norm
+
+        index_snapshot = env_context.get("index_intraday")
+        if isinstance(index_snapshot, dict):
+            index_gate = index_snapshot.get("env_index_gate_action")
+            if index_gate is not None:
+                gate_norm = str(index_gate).strip().upper()
+                gate_candidates.append(gate_norm)
+                reason_parts["index_gate_action"] = gate_norm
+
+        regime_gate = self._derive_gate_action(
+            env_context.get("regime"), env_context.get("position_hint_raw") or env_context.get("position_hint")
+        )
+        if regime_gate:
+            gate_candidates.append(regime_gate)
+            reason_parts["regime_gate_action"] = regime_gate
+
+        final_gate = self._merge_gate_actions(*gate_candidates) or "ALLOW"
+
+        cap_candidates = [
+            to_float(env_context.get("effective_position_hint")),
+            to_float(env_context.get("position_hint")),
+        ]
+        final_cap = next((c for c in cap_candidates if c is not None), 1.0)
+        final_cap = min(max(final_cap, 0.0), 1.0)
+
+        env_context["env_final_gate_action"] = final_gate
+        env_context["env_final_cap_pct"] = final_cap
+        env_context["env_final_reason_json"] = json.dumps(reason_parts, ensure_ascii=False)
 
     @property
     def calendar_cache(self) -> set[str]:

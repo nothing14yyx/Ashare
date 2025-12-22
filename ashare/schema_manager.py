@@ -934,6 +934,7 @@ class SchemaManager:
             "e.`reason`",
             "e.`risk_tag`",
             "e.`risk_note`",
+            "e.`extra_json`",
         ]
         optional_cols = [
             "stop_ref",
@@ -945,16 +946,122 @@ class SchemaManager:
             "stale_hit",
             "fear_score",
             "wave_type",
+            "yearline_state",
         ]
         for col in optional_cols:
             expr = _col(col)
             if expr:
                 field_exprs.append(f"e.`{expr}`")
 
+        def _coalesce_expr(cols: list[str], alias: str) -> str:
+            if not cols:
+                return f"NULL AS `{alias}`"
+            return f"COALESCE({', '.join(cols)}) AS `{alias}`"
+
+        gdhs_delta_sources = []
+        announce_sources = []
+        chip_score_sources = []
+        chip_reason_sources = []
+        chip_penalty_sources = []
+        chip_note_sources = []
+        chip_age_sources = []
+        chip_deadzone_sources = []
+        chip_stale_sources = []
+
+        if _col("gdhs_delta_pct"):
+            gdhs_delta_sources.append("e.`gdhs_delta_pct`")
+        if _col("gdhs_announce_date"):
+            announce_sources.append("e.`gdhs_announce_date`")
+        if _col("chip_score"):
+            chip_score_sources.append("e.`chip_score`")
+        if _col("chip_reason"):
+            chip_reason_sources.append("e.`chip_reason`")
+        if _col("chip_penalty"):
+            chip_penalty_sources.append("e.`chip_penalty`")
+        if _col("chip_note"):
+            chip_note_sources.append("e.`chip_note`")
+        if _col("age_days"):
+            chip_age_sources.append("e.`age_days`")
+        if _col("deadzone_hit"):
+            chip_deadzone_sources.append("e.`deadzone_hit`")
+        if _col("stale_hit"):
+            chip_stale_sources.append("e.`stale_hit`")
+
         if ind_fields:
             field_exprs.append(ind_fields.strip())
         if chip_fields:
             field_exprs.append(chip_fields.strip())
+
+        if chip_fields:
+            gdhs_delta_sources.append("cf.`gdhs_delta_pct`")
+            announce_sources.append("cf.`announce_date`")
+            chip_score_sources.append("cf.`chip_score`")
+            chip_reason_sources.append("cf.`chip_reason`")
+            chip_penalty_sources.append("cf.`chip_penalty`")
+            chip_note_sources.append("cf.`chip_note`")
+            chip_age_sources.append("cf.`age_days`")
+            chip_deadzone_sources.append("cf.`deadzone_hit`")
+            chip_stale_sources.append("cf.`stale_hit`")
+
+        field_exprs.extend(
+            [
+                _coalesce_expr(gdhs_delta_sources, "gdhs_delta_pct"),
+                _coalesce_expr(announce_sources, "gdhs_announce_date"),
+                _coalesce_expr(chip_score_sources, "chip_score"),
+                _coalesce_expr(chip_reason_sources, "chip_reason"),
+                _coalesce_expr(chip_penalty_sources, "chip_penalty"),
+                _coalesce_expr(chip_note_sources, "chip_note"),
+                _coalesce_expr(chip_age_sources, "age_days"),
+                _coalesce_expr(chip_deadzone_sources, "deadzone_hit"),
+                _coalesce_expr(chip_stale_sources, "stale_hit"),
+            ]
+        )
+
+        industry_join = ""
+        industry_fields: list[str] = ["NULL AS `industry`", "NULL AS `industry_classification`"]
+        for candidate in ("dim_stock_industry", "a_share_stock_industry"):
+            if self._table_exists(candidate):
+                industry_join = (
+                    f"""
+                    LEFT JOIN `{candidate}` ind_dim
+                      ON e.`code` = ind_dim.`code`
+                    """
+                )
+                industry_meta = self._column_meta(candidate)
+                industry_name_col = None
+                for key in ["industry", "industryClassification"]:
+                    if key in industry_meta:
+                        industry_name_col = key
+                        break
+                industry_class_col = "industry_classification" if "industry_classification" in industry_meta else None
+                industry_fields = [
+                    f"ind_dim.`{industry_name_col}` AS `industry`" if industry_name_col else "NULL AS `industry`",
+                    f"ind_dim.`{industry_class_col}` AS `industry_classification`"
+                    if industry_class_col
+                    else "NULL AS `industry_classification`",
+                ]
+                break
+
+        board_join = ""
+        board_fields: list[str] = ["NULL AS `board_name`", "NULL AS `board_code`"]
+        board_table = "dim_stock_board_industry"
+        if self._table_exists(board_table):
+            board_join = (
+                f"""
+                LEFT JOIN `{board_table}` bd
+                  ON e.`code` = bd.`code`
+                """
+            )
+            board_meta = self._column_meta(board_table)
+            board_name_col = "board_name" if "board_name" in board_meta else None
+            board_code_col = "board_code" if "board_code" in board_meta else None
+            board_fields = [
+                f"bd.`{board_name_col}` AS `board_name`" if board_name_col else "NULL AS `board_name`",
+                f"bd.`{board_code_col}` AS `board_code`" if board_code_col else "NULL AS `board_code`",
+            ]
+
+        field_exprs.extend(industry_fields)
+        field_exprs.extend(board_fields)
 
         select_clause = ",\n              ".join(field_exprs)
         stmt = text(
@@ -965,6 +1072,8 @@ class SchemaManager:
             FROM `{events_table}` e
             {ind_join}
             {chip_join}
+            {industry_join}
+            {board_join}
             WHERE COALESCE(e.`final_action`, e.`signal`) IN ('BUY','BUY_CONFIRM')
             """
         )
