@@ -968,9 +968,6 @@ class SchemaManager:
             "live_latest": "DOUBLE NULL",
             "live_volume": "DOUBLE NULL",
             "live_amount": "DOUBLE NULL",
-            "live_gap_pct": "DOUBLE NULL",
-            "live_pct_change": "DOUBLE NULL",
-            "live_intraday_vol_ratio": "DOUBLE NULL",
         }
         if not self._table_exists(table):
             self._create_table(
@@ -1031,14 +1028,11 @@ class SchemaManager:
             "signal_kind": "VARCHAR(16) NULL",
             "sig_signal": "VARCHAR(16) NULL",
             "sig_reason": "VARCHAR(255) NULL",
-            "candidate_stage": "VARCHAR(16) NULL",
-            "candidate_state": "VARCHAR(32) NULL",
-            "candidate_status": "VARCHAR(32) NULL",
-            "primary_status": "VARCHAR(32) NULL",
+            "state": "VARCHAR(32) NULL",
             "status_reason": "VARCHAR(255) NULL",
             "action": "VARCHAR(16) NULL",
             "action_reason": "VARCHAR(255) NULL",
-            "status_tags_json": "TEXT NULL",
+            "rule_hits_json": "TEXT NULL",
             "summary_line": "VARCHAR(512) NULL",
             "risk_tag": "VARCHAR(255) NULL",
             "risk_note": "VARCHAR(255) NULL",
@@ -1277,11 +1271,8 @@ class SchemaManager:
             live_high_expr = "q.`live_high`"
             live_low_expr = "q.`live_low`"
             live_latest_expr = "q.`live_latest`"
-            live_pct_expr = "COALESCE(e.`live_pct_change`, q.`live_pct_change`)"
             live_volume_expr = "q.`live_volume`"
             live_amount_expr = "q.`live_amount`"
-            live_gap_expr = "COALESCE(e.`live_gap_pct`, q.`live_gap_pct`)"
-            live_intraday_expr = "COALESCE(e.`live_intraday_vol_ratio`, q.`live_intraday_vol_ratio`)"
 
         stmt = text(
             f"""
@@ -1323,14 +1314,11 @@ class SchemaManager:
               e.`signal_kind`,
               e.`sig_signal`,
               e.`sig_reason`,
-              e.`candidate_stage`,
-              e.`candidate_state`,
-              e.`candidate_status`,
-              e.`primary_status`,
+              e.`state`,
               e.`status_reason`,
               e.`action`,
               e.`action_reason`,
-              e.`status_tags_json`,
+              e.`rule_hits_json`,
               e.`summary_line`,
               e.`risk_tag`,
               e.`risk_note`,
