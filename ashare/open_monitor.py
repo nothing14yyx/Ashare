@@ -3207,9 +3207,11 @@ class MA5MA20OpenMonitorRunner:
                 )
                 risk_note = f"{risk_note}|{detail}" if risk_note else detail
 
-            open_px = row.get("live_open")
-            latest_px = row.get("live_latest")
+            run_id_norm = str(row.get("run_id") or "").strip().upper()
+            open_px = _to_float(row.get("live_open"))
+            latest_px = _to_float(row.get("live_latest"))
             entry_px = open_px
+            entry_px_label = "入场价"
             ma20 = _dec(row, "ma20")
             ma5 = _dec(row, "ma5")
             ma60 = _dec(row, "ma60")
@@ -3229,10 +3231,19 @@ class MA5MA20OpenMonitorRunner:
             signal_age = row.get("signal_age")
             is_pullback = self._is_pullback_signal(signal_reason)
 
-            used_latest_as_entry = False
+            asof_close_px = _to_float(row.get("asof_close"))
+            if run_id_norm == "POSTCLOSE" and latest_px is not None and latest_px > 0:
+                # POSTCLOSE：用收盘价（最新价）做为入场评估基准，避免“今开价”导致误判
+                entry_px = latest_px
+                entry_px_label = "入场价(收盘)"
+            elif run_id_norm == "PREOPEN" and asof_close_px is not None and asof_close_px > 0:
+                # PREOPEN：无今开价，使用昨收价做为入场评估基准
+                entry_px = asof_close_px
+                entry_px_label = "入场价(昨收)"
+
             if entry_px is None or entry_px <= 0:
                 entry_px = latest_px
-                used_latest_as_entry = True
+                entry_px_label = "入场价(最新)"
             if entry_px is None or entry_px <= 0:
                 ctx.action = "UNKNOWN"
                 ctx.state = "UNKNOWN"
@@ -3321,10 +3332,16 @@ class MA5MA20OpenMonitorRunner:
                     dev_ma20_atr = dev_ma20 / max(atr14, eps)
 
             sig_close_val = _to_float(signal_close)
+            runup_live_ref = row.get("live_high")
+            runup_live_ref_label = "live_high"
+            if run_id_norm == "POSTCLOSE" and latest_px is not None and latest_px > 0:
+                # POSTCLOSE：用收盘价替代盘中 high，避免盘中尖峰导致 runup 误杀
+                runup_live_ref = latest_px
+                runup_live_ref_label = "live_latest"
             runup_metrics = compute_runup_metrics(
                 sig_close_val,
                 asof_close=_coalesce(row, "asof_close", "sig_close"),
-                live_high=row.get("live_high"),
+                live_high=runup_live_ref,
                 sig_atr14=sig_atr14_val if sig_atr14_val is not None else atr14,
                 eps=eps,
             )
@@ -3332,6 +3349,12 @@ class MA5MA20OpenMonitorRunner:
             runup_from_sigclose_atr = runup_metrics.runup_from_sigclose_atr
             runup_ref_price_val = runup_metrics.runup_ref_price
             runup_ref_source_val = runup_metrics.runup_ref_source
+            if run_id_norm == "POSTCLOSE" and runup_live_ref_label == "live_latest":
+                # 纠正 ref_source 文案（compute_runup_metrics 的参数名为 live_high）
+                if runup_ref_source_val == "max(asof_close, live_high)":
+                    runup_ref_source_val = "max(asof_close, live_latest)"
+                elif runup_ref_source_val == "live_high":
+                    runup_ref_source_val = "live_latest"
 
             runup_atr_cap = runup_atr_max
             dev_ma20_gate = None
@@ -3672,9 +3695,7 @@ class MA5MA20OpenMonitorRunner:
                         predicate=lambda ctx, cond=(
                             ctx.action == "EXECUTE" and entry_px < threshold_ma20
                         ): cond,
-                        effect=lambda ctx, px=entry_px, th=threshold_ma20, label=(
-                            "入场价(最新)" if used_latest_as_entry else "入场价"
-                        ): RuleResult(
+                        effect=lambda ctx, px=entry_px, th=threshold_ma20, label=entry_px_label: RuleResult(
                             reason=f"{label} {px:.2f} 跌破 MA20 阈值 {th:.2f}",
                             action_override="SKIP",
                         ),
@@ -3691,10 +3712,7 @@ class MA5MA20OpenMonitorRunner:
                             ctx.action == "EXECUTE" and entry_px > threshold_ma5
                         ): cond,
                         effect=lambda ctx, px=entry_px, th=threshold_ma5: RuleResult(
-                            reason=(
-                                f"{'入场价(最新)' if used_latest_as_entry else '入场价'} {px:.2f} 高于 MA5 阈值 {th:.2f}"
-                                f"（>{max_entry_vs_ma5*100:.2f}%）"
-                            ),
+                            reason=(f"{entry_px_label} {px:.2f} 高于 MA5 阈值 {th:.2f}"),
                             action_override="SKIP",
                         ),
                     )

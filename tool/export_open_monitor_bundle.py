@@ -1,4 +1,4 @@
-# export_open_monitor_bundle.py
+# export_db_bundle.py
 from __future__ import annotations
 
 import argparse
