@@ -170,6 +170,42 @@ class RunupMetrics:
     runup_from_sigclose_atr: float | None
 
 
+@dataclass(frozen=True)
+class RuleHit:
+    name: str
+    category: str  # STRUCTURE / EXECUTION / ENV
+    severity: int
+    reason: str
+    action_override: str | None = None
+    state_override: str | None = None
+    cap_override: float | None = None
+
+    def to_dict(self) -> dict[str, Any]:  # noqa: ANN401
+        payload: dict[str, Any] = {
+            "name": self.name,
+            "category": self.category,
+            "severity": self.severity,
+            "reason": self.reason,
+        }
+        if self.action_override is not None:
+            payload["action_override"] = self.action_override
+        if self.state_override is not None:
+            payload["state_override"] = self.state_override
+        if self.cap_override is not None:
+            payload["cap_override"] = self.cap_override
+        return payload
+
+
+@dataclass(frozen=True)
+class Decision:
+    state: str
+    action: str
+    cap: float | None
+    hits_json: str
+    state_reason: str
+    action_reason: str
+
+
 def compute_runup_metrics(
     sig_close: float | None,
     *,
@@ -2437,14 +2473,13 @@ class MA5MA20OpenMonitorRunner:
             out["runup_from_sigclose_atr"] = None
             out["runup_ref_price"] = None
             out["runup_ref_source"] = None
-            out["status_tags_json"] = None
-            out["primary_status"] = None
+            out["rule_hits_json"] = None
+            out["state"] = "UNKNOWN"
             out["env_index_snapshot_hash"] = None
             out["env_final_gate_action"] = None
-            out["summary_line"] = "INACTIVE/UNKNOWN UNKNOWN | 行情数据不可用"
+            out["summary_line"] = "UNKNOWN UNKNOWN | 行情数据不可用"
             out["action"] = "UNKNOWN"
             out["action_reason"] = "行情数据不可用"
-            out["candidate_status"] = "UNKNOWN"
             out["status_reason"] = "行情数据不可用"
             out["checked_at"] = checked_at_ts
             out["run_id"] = run_id
@@ -2767,8 +2802,8 @@ class MA5MA20OpenMonitorRunner:
         weekly_gate_policy = self._resolve_env_weekly_gate_policy(env_context)
 
         actions: List[str] = []
-        reasons: List[str] = []
-        statuses: List[str] = []
+        action_reasons: List[str] = []
+        states: List[str] = []
         status_reasons: List[str] = []
         signal_kinds: List[str] = []
         trade_stop_refs: List[float | None] = []
@@ -2809,10 +2844,8 @@ class MA5MA20OpenMonitorRunner:
         runup_from_sigclose_atr_list: List[float | None] = []
         runup_ref_price_list: List[float | None] = []
         runup_ref_source_list: List[str | None] = []
-        primary_statuses: List[str | None] = []
-        status_tags_json_list: List[str | None] = []
-        candidate_stages: List[str] = []
-        candidate_states: List[str] = []
+        rule_hits_json_list: List[str | None] = []
+        decision_states: List[str] = []
         summary_lines: List[str | None] = []
         env_index_snapshot_hashes: List[str | None] = []
 
@@ -2974,14 +3007,70 @@ class MA5MA20OpenMonitorRunner:
         eps = 1e-6
 
         status_priority = ["STOP_LOSS", "INVALID", "RUNUP_TOO_LARGE", "OVEREXTENDED", "STALE"]
+        status_severity_map = {name: (len(status_priority) - idx) * 10 for idx, name in enumerate(status_priority)}
+        action_priority = ["STOP", "SKIP", "REDUCE_50%", "WAIT", "EXECUTE"]
+
+        def _action_rank(val: str | None) -> int:
+            if val is None:
+                return len(action_priority)
+            val_norm = str(val).strip().upper()
+            try:
+                return action_priority.index(val_norm)
+            except ValueError:
+                return len(action_priority)
+
+        def _merge_action(curr_action: str, curr_reason: str, new_action: str, new_reason: str) -> tuple[str, str]:
+            if _action_rank(new_action) < _action_rank(curr_action):
+                return new_action, new_reason
+            return curr_action, curr_reason
 
         for idx, row in merged.iterrows():
             action = "EXECUTE"
-            reason = "OK"
-            candidate_status = "ACTIVE"
+            action_reason = "OK"
             status_reason = "结构/时效通过"
             status_hits: list[tuple[str, str]] = []
+            rule_hits: list[RuleHit] = []
             entry_exposure_cap = None
+
+            def _add_structure_hit(name: str, reason_text: str, severity: int) -> None:
+                status_hits.append((name, reason_text))
+                rule_hits.append(
+                    RuleHit(
+                        name=name,
+                        category="STRUCTURE",
+                        severity=severity,
+                        reason=reason_text,
+                        state_override=name,
+                    )
+                )
+
+            def _add_action_hit(
+                name: str,
+                new_action: str,
+                reason_text: str,
+                *,
+                category: str = "EXECUTION",
+                severity: int = 10,
+                cap_override: float | None = None,
+            ) -> None:
+                nonlocal action, action_reason, entry_exposure_cap
+                action, action_reason = _merge_action(action, action_reason, new_action, reason_text)
+                if cap_override is not None:
+                    entry_exposure_cap = (
+                        cap_override
+                        if entry_exposure_cap is None
+                        else min(entry_exposure_cap, cap_override)
+                    )
+                rule_hits.append(
+                    RuleHit(
+                        name=name,
+                        category=category,
+                        severity=severity,
+                        reason=reason_text,
+                        action_override=new_action,
+                        cap_override=cap_override,
+                    )
+                )
 
             risk_tag_raw = str(row.get("risk_tag") or "").strip()
             risk_note = str(row.get("risk_note") or "").strip()
@@ -3152,8 +3241,10 @@ class MA5MA20OpenMonitorRunner:
                 runup_take_profit = runup_from_sigclose / sig_close_val
 
             if valid_days > 0 and signal_age is not None and signal_age > valid_days:
-                status_hits.append(
-                    ("STALE", f"signal_age={int(signal_age)} > valid_days={valid_days}")
+                _add_structure_hit(
+                    "STALE",
+                    f"signal_age={int(signal_age)} > valid_days={valid_days}",
+                    status_severity_map.get("STALE", 10),
                 )
 
             invalid_reason = None
@@ -3200,29 +3291,38 @@ class MA5MA20OpenMonitorRunner:
                 invalid_reason = "多头排列/趋势破坏"
 
             if invalid_reason:
-                status_hits.append(("INVALID", invalid_reason))
+                _add_structure_hit(
+                    "INVALID", invalid_reason, status_severity_map.get("INVALID", 50)
+                )
 
             if hard_stop:
-                status_hits.append(
-                    (
-                        "STOP_LOSS",
-                        f"最新价 {latest_px_float:.2f} 触发硬止损阈值 ≤ 信号收盘*0.75={sig_close_val*0.75:.2f}",
-                    )
+                _add_structure_hit(
+                    "STOP_LOSS",
+                    f"最新价 {latest_px_float:.2f} 触发硬止损阈值 ≤ 信号收盘*0.75={sig_close_val*0.75:.2f}",
+                    status_severity_map.get("STOP_LOSS", 100),
                 )
-                action = "STOP"
-                reason = (
-                    f"硬止损：最新价≤信号收盘*0.75（{latest_px_float:.2f}/{sig_close_val*0.75:.2f}）"
+                _add_action_hit(
+                    "HARD_STOP",
+                    "STOP",
+                    f"硬止损：最新价≤信号收盘*0.75（{latest_px_float:.2f}/{sig_close_val*0.75:.2f}）",
+                    cap_override=0.0,
                 )
                 entry_exposure_cap = 0.0
 
             if runup_triggered and runup_detail:
-                status_hits.append(("RUNUP_TOO_LARGE", runup_detail))
+                _add_structure_hit(
+                    "RUNUP_TOO_LARGE",
+                    runup_detail,
+                    status_severity_map.get("RUNUP_TOO_LARGE", 80),
+                )
 
             if runup_take_profit is not None and runup_take_profit >= 0.15:
-                status_hits.append(("TAKE_PROFIT", f"信号后涨幅 {runup_take_profit*100:.2f}% ≥ 15%"))
-                if action not in {"STOP", "SKIP"}:
-                    action = "REDUCE_50%"
-                    reason = f"分批止盈：{runup_take_profit*100:.2f}%"
+                _add_action_hit(
+                    "TAKE_PROFIT",
+                    "REDUCE_50%",
+                    f"信号后涨幅 {runup_take_profit*100:.2f}% ≥ 15%",
+                    severity=60,
+                )
 
             overextend_reasons: list[str] = []
             if dev_ma5_atr is not None and dev_ma5_atr > dev_ma5_atr_max:
@@ -3234,11 +3334,19 @@ class MA5MA20OpenMonitorRunner:
                     f"dev_ma20_atr={dev_ma20_atr:.2f} > {dev_ma20_atr_max:.2f}"
                 )
             if overextend_reasons:
-                status_hits.append(("OVEREXTENDED", "；".join(overextend_reasons)))
+                _add_structure_hit(
+                    "OVEREXTENDED",
+                    "；".join(overextend_reasons),
+                    status_severity_map.get("OVEREXTENDED", 70),
+                )
 
             if "MANIA" in risk_tags_split:
                 mania_reason = risk_note or "风险标签=MANIA：短期过热，默认不追"
-                status_hits.append(("INVALID", mania_reason))
+                _add_structure_hit(
+                    "INVALID",
+                    mania_reason,
+                    status_severity_map.get("INVALID", 50),
+                )
 
             primary_state = next(
                 (
@@ -3252,147 +3360,186 @@ class MA5MA20OpenMonitorRunner:
                 (hit[1] for hit in status_hits if hit[0] == primary_state),
                 "结构/时效通过",
             )
-            status_tags_json_value = json.dumps(
-                {
-                    "primary": {"state": primary_state, "reason": primary_reason},
-                    "hits": [{"state": s, "reason": r} for s, r in status_hits],
-                },
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
+            if not status_hits:
+                rule_hits.append(
+                    RuleHit(
+                        name="OK",
+                        category="STRUCTURE",
+                        severity=1,
+                        reason="结构/时效通过",
+                        state_override="OK",
+                    )
+                )
 
-            candidate_stage = "ACTIVE" if primary_state == "OK" else "INACTIVE"
-            candidate_state = primary_state
-            candidate_status = "ACTIVE" if candidate_stage == "ACTIVE" else candidate_state
             status_reason = primary_reason or "结构/时效通过"
 
-            if candidate_status != "ACTIVE" and action not in {"STOP", "REDUCE_50%"}:
-                action = "SKIP"
-                if (
-                    runup_triggered
-                    and candidate_status != "RUNUP_TOO_LARGE"
-                    and runup_detail
-                ):
-                    status_reason = f"{status_reason}；{runup_detail}"
-                reason = status_reason
-            else:
-                if action == "EXECUTE" and signal_day_pct is not None and signal_day_pct >= signal_day_limit_up:
-                    action = "SKIP"
-                    reason = f"信号日涨幅 {signal_day_pct*100:.2f}% 接近涨停，次日不追"
+            if primary_state != "OK":
+                action, action_reason = _merge_action(
+                    action, action_reason, "SKIP", status_reason
+                )
 
-                if action == "EXECUTE" and pct is not None and pct >= limit_up_trigger:
-                    action = "SKIP"
-                    reason = f"涨幅 {pct:.2f}% 接近/达到涨停"
+            if action == "EXECUTE" and signal_day_pct is not None and signal_day_pct >= signal_day_limit_up:
+                _add_action_hit(
+                    "SIGNAL_DAY_LIMIT_UP",
+                    "SKIP",
+                    f"信号日涨幅 {signal_day_pct*100:.2f}% 接近涨停，次日不追",
+                    severity=40,
+                )
 
-                if action == "EXECUTE" and gap is not None and gap > 0:
-                    gap_up_threshold = max_up
-                    atr_based = None
-                    if ref_close is not None and ref_close > 0 and atr14 is not None and atr14 > 0 and max_up_atr_mult > 0:
-                        atr_based = max_up_atr_mult * atr14 / ref_close
-                        if atr_based > 0:
-                            gap_up_threshold = min(max_up, atr_based)
+            if action == "EXECUTE" and pct is not None and pct >= limit_up_trigger:
+                _add_action_hit(
+                    "LIMIT_UP",
+                    "SKIP",
+                    f"涨幅 {pct:.2f}% 接近/达到涨停",
+                    severity=50,
+                )
 
-                    if gap > gap_up_threshold:
-                        action = "SKIP"
-                        reason = (
+            if action == "EXECUTE" and gap is not None and gap > 0:
+                gap_up_threshold = max_up
+                atr_based = None
+                if ref_close is not None and ref_close > 0 and atr14 is not None and atr14 > 0 and max_up_atr_mult > 0:
+                    atr_based = max_up_atr_mult * atr14 / ref_close
+                    if atr_based > 0:
+                        gap_up_threshold = min(max_up, atr_based)
+
+                if gap > gap_up_threshold:
+                    reason_text = (
+                        f"高开 {gap*100:.2f}% 超过阈值 {gap_up_threshold*100:.2f}%"
+                        if atr_based is None
+                        else (
                             f"高开 {gap*100:.2f}% 超过阈值 {gap_up_threshold*100:.2f}%"
-                            if atr_based is None
-                            else (
-                                f"高开 {gap*100:.2f}% 超过阈值 {gap_up_threshold*100:.2f}%"
-                                f"（min(固定{max_up*100:.2f}%, ATR×{max_up_atr_mult:.1f}={atr_based*100:.2f}% )）"
-                            )
-                        )
-
-                if action == "EXECUTE" and gap is not None and gap < max_down:
-                    action = "SKIP"
-                    reason = f"低开 {gap*100:.2f}% 低于阈值 {max_down*100:.2f}%"
-
-                if action == "EXECUTE" and (ma20 is not None) and (entry_px is not None):
-                    threshold = ma20 * (
-                        1.0
-                        + (
-                            pullback_min_vs_ma20
-                            if is_pullback
-                            else min_vs_ma20
+                            f"（min(固定{max_up*100:.2f}%, ATR×{max_up_atr_mult:.1f}={atr_based*100:.2f}% )）"
                         )
                     )
-                    if entry_px < threshold:
-                        action = "SKIP"
-                        px_label = "入场价(最新)" if used_latest_as_entry else "入场价"
-                        reason = f"{px_label} {entry_px:.2f} 跌破 MA20 阈值 {threshold:.2f}"
-
-                if action == "EXECUTE" and (ma5 is not None) and (entry_px is not None) and (max_entry_vs_ma5 > 0):
-                    threshold_ma5 = ma5 * (1.0 + max_entry_vs_ma5)
-                    if entry_px > threshold_ma5:
-                        action = "SKIP"
-                        px_label = "入场价(最新)" if used_latest_as_entry else "入场价"
-                        reason = (
-                            f"{px_label} {entry_px:.2f} 高于 MA5 阈值 {threshold_ma5:.2f}"
-                            f"（>{max_entry_vs_ma5*100:.2f}%）"
-                        )
-
-                if action == "EXECUTE" and strength_score is not None:
-                    if strength_score < 0:
-                        action = "WAIT"
-                        status_reason = "信号强度<0，等待修复"
-                        reason = status_reason
-                    elif strength_trend == "WEAKENING":
-                        action = "WAIT"
-                        status_reason = "信号强度走弱，等待确认"
-
-                if vol_used is not None and vol_used < vol_threshold and action == "EXECUTE":
-                    action = "WAIT"
-                    status_reason = (
-                        f"量能不足：{vol_used:.2f} < 量比阈值 {vol_threshold:.2f}"
+                    _add_action_hit(
+                        "GAP_UP",
+                        "SKIP",
+                        reason_text,
+                        severity=45,
                     )
-                    reason = status_reason
 
-                if (
-                    idx_score_float is not None
-                    and action == "EXECUTE"
-                    and idx_score_float < self.env_index_score_threshold
-                ):
-                    action = "WAIT"
-                    status_reason = (
-                        f"大盘趋势分数 {idx_score_float:.1f} 低于阈值 {self.env_index_score_threshold:.1f}，观望"
+            if action == "EXECUTE" and gap is not None and gap < max_down:
+                _add_action_hit(
+                    "GAP_DOWN",
+                    "SKIP",
+                    f"低开 {gap*100:.2f}% 低于阈值 {max_down*100:.2f}%",
+                    severity=45,
+                )
+
+            if action == "EXECUTE" and (ma20 is not None) and (entry_px is not None):
+                threshold = ma20 * (
+                    1.0
+                    + (
+                        pullback_min_vs_ma20
+                        if is_pullback
+                        else min_vs_ma20
                     )
-                    reason = status_reason
-
-                if board_status == "weak" and action == "EXECUTE":
-                    action = "WAIT"
-                    status_reason = "所属板块走势偏弱，建议降低优先级"
-                    reason = status_reason
-                elif board_status == "strong" and action == "WAIT":
-                    rank_display = f"{board_rank:.0f}" if board_rank is not None else "-"
-                    status_reason = f"板块强势(rank={rank_display})，等待入场条件"
-                    reason = status_reason
-
-                fear_score_val = _to_float(row.get("sig_fear_score"))
-                if (
-                    fear_score_val is not None
-                    and fear_score_val < -0.5
-                    and gap is not None
-                    and gap >= 0.05
-                ):
-                    status_hits.append(
-                        (
-                            "FEAR_SKIP",
-                            f"fear_score={fear_score_val:.2f} gap={gap*100:.2f}%",
-                        )
+                )
+                if entry_px < threshold:
+                    px_label = "入场价(最新)" if used_latest_as_entry else "入场价"
+                    _add_action_hit(
+                        "BELOW_MA20",
+                        "SKIP",
+                        f"{px_label} {entry_px:.2f} 跌破 MA20 阈值 {threshold:.2f}",
+                        severity=40,
                     )
-                    if action in {"EXECUTE", "EXECUTE_SMALL"}:
-                        action = "WAIT"
-                    entry_exposure_cap = 0.0
-                    status_reason = (
-                        f"FEAR_SKIP fear={fear_score_val:.2f} gap={gap*100:.2f}%"
-                    )
-                    reason = status_reason
 
-                if risk_tags_split and action == "EXECUTE":
-                    action = "WAIT"
-                    note_text = risk_note or "存在风险标签，建议谨慎"
-                    reason = note_text
-                    status_reason = note_text
+            if action == "EXECUTE" and (ma5 is not None) and (entry_px is not None) and (max_entry_vs_ma5 > 0):
+                threshold_ma5 = ma5 * (1.0 + max_entry_vs_ma5)
+                if entry_px > threshold_ma5:
+                    px_label = "入场价(最新)" if used_latest_as_entry else "入场价"
+                    _add_action_hit(
+                        "ABOVE_MA5",
+                        "SKIP",
+                        f"{px_label} {entry_px:.2f} 高于 MA5 阈值 {threshold_ma5:.2f}"
+                        f"（>{max_entry_vs_ma5*100:.2f}%）",
+                        severity=35,
+                    )
+
+            if action == "EXECUTE" and strength_score is not None:
+                if strength_score < 0:
+                    _add_action_hit(
+                        "STRENGTH_NEGATIVE",
+                        "WAIT",
+                        "信号强度<0，等待修复",
+                        severity=30,
+                    )
+                    status_reason = "信号强度<0，等待修复"
+                elif strength_trend == "WEAKENING":
+                    _add_action_hit(
+                        "STRENGTH_WEAKENING",
+                        "WAIT",
+                        "信号强度走弱，等待确认",
+                        severity=25,
+                    )
+                    status_reason = "信号强度走弱，等待确认"
+
+            if vol_used is not None and vol_used < vol_threshold and action == "EXECUTE":
+                _add_action_hit(
+                    "LOW_VOLUME",
+                    "WAIT",
+                    f"量能不足：{vol_used:.2f} < 量比阈值 {vol_threshold:.2f}",
+                    severity=20,
+                )
+                status_reason = f"量能不足：{vol_used:.2f} < 量比阈值 {vol_threshold:.2f}"
+
+            if (
+                idx_score_float is not None
+                and action == "EXECUTE"
+                and idx_score_float < self.env_index_score_threshold
+            ):
+                _add_action_hit(
+                    "INDEX_WEAK",
+                    "WAIT",
+                    f"大盘趋势分数 {idx_score_float:.1f} 低于阈值 {self.env_index_score_threshold:.1f}，观望",
+                    category="ENV",
+                    severity=25,
+                )
+                status_reason = (
+                    f"大盘趋势分数 {idx_score_float:.1f} 低于阈值 {self.env_index_score_threshold:.1f}，观望"
+                )
+
+            if board_status == "weak" and action == "EXECUTE":
+                _add_action_hit(
+                    "BOARD_WEAK",
+                    "WAIT",
+                    "所属板块走势偏弱，建议降低优先级",
+                    severity=20,
+                )
+                status_reason = "所属板块走势偏弱，建议降低优先级"
+            elif board_status == "strong" and action == "WAIT":
+                rank_display = f"{board_rank:.0f}" if board_rank is not None else "-"
+                status_reason = f"板块强势(rank={rank_display})，等待入场条件"
+                action_reason = status_reason
+
+            fear_score_val = _to_float(row.get("sig_fear_score"))
+            if (
+                fear_score_val is not None
+                and fear_score_val < -0.5
+                and gap is not None
+                and gap >= 0.05
+            ):
+                _add_action_hit(
+                    "FEAR_SKIP",
+                    "WAIT",
+                    f"fear_score={fear_score_val:.2f} gap={gap*100:.2f}%",
+                    severity=40,
+                    cap_override=0.0,
+                )
+                status_reason = (
+                    f"FEAR_SKIP fear={fear_score_val:.2f} gap={gap*100:.2f}%"
+                )
+                entry_exposure_cap = 0.0
+
+            if risk_tags_split and action == "EXECUTE":
+                note_text = risk_note or "存在风险标签，建议谨慎"
+                _add_action_hit(
+                    "RISK_TAG",
+                    "WAIT",
+                    note_text,
+                    severity=15,
+                )
+                status_reason = note_text
 
             risk_tag_value = "|".join(risk_tags_split) if risk_tags_split else None
             merged.at[idx, "risk_tag"] = risk_tag_value
@@ -3421,23 +3568,27 @@ class MA5MA20OpenMonitorRunner:
                 )
                 breakdown_reason = f"大盘结构破位，执行跳过{pos_hint_text}"
                 if env_regime == "BREAKDOWN":
-                    action = "SKIP"
-                    if candidate_status == "ACTIVE":
-                        status_reason = "市场环境 BREAKDOWN，暂不执行"
-                    if reason and reason != "OK":
-                        reason = breakdown_reason + "；" + reason
-                    else:
-                        reason = breakdown_reason
+                    _add_action_hit(
+                        "ENV_BREAKDOWN",
+                        "SKIP",
+                        breakdown_reason,
+                        category="ENV",
+                        severity=90,
+                        cap_override=0.0,
+                    )
                 elif env_regime == "RISK_OFF":
-                    action = "WAIT"
-                    if candidate_status == "ACTIVE":
-                        status_reason = "市场环境 RISK_OFF，轻仓观望"
-                    if reason == "OK":
-                        reason = f"大盘偏弱{pos_hint_text}"
-                elif env_regime == "PULLBACK" and not risk_tags_split and reason == "OK":
-                    reason = f"大盘处于回踩阶段{pos_hint_text}"
+                    _add_action_hit(
+                        "ENV_RISK_OFF",
+                        "WAIT",
+                        f"市场环境 RISK_OFF{pos_hint_text or ''}",
+                        category="ENV",
+                        severity=60,
+                        cap_override=0.0,
+                    )
+                elif env_regime == "PULLBACK" and not risk_tags_split and action_reason == "OK":
+                    action_reason = f"大盘处于回踩阶段{pos_hint_text}"
 
-            if action == "EXECUTE" and candidate_status == "ACTIVE":
+            if action == "EXECUTE":
                 plan_tail = ""
                 if env_weekly_plan_a:
                     plan_tail = str(env_weekly_plan_a)
@@ -3452,17 +3603,19 @@ class MA5MA20OpenMonitorRunner:
                 )
                 if not env_weekly_gating_enabled:
                     append_note = "周线数据不足，轻仓"
-                    if reason and reason != "OK":
-                        reason = f"{reason}；{append_note}"
-                    else:
-                        reason = append_note
+                    action_reason = append_note if action_reason == "OK" else f"{action_reason}；{append_note}"
                 else:
                     if env_weekly_risk_level == "HIGH":
-                        action = "WAIT"
+                        _add_action_hit(
+                            "WEEKLY_HIGH",
+                            "WAIT",
+                            "周线风险高：观望/防守",
+                            category="ENV",
+                            severity=70,
+                            cap_override=0.0,
+                        )
                         weekly_gate_action = "WAIT"
-                        append_note = "周线风险高：观望/防守"
-                        status_reason = f"{status_reason}；{append_note}" if status_reason else append_note
-                        reason = f"{reason}；{append_note}" if reason and reason != "OK" else append_note
+                        status_reason = f"{status_reason}；周线风险高：观望/防守" if status_reason else "周线风险高：观望/防守"
                     elif env_weekly_risk_level == "MEDIUM" and (
                         env_weekly_structure_status or env_weekly_status
                     ) == "FORMING":
@@ -3472,7 +3625,14 @@ class MA5MA20OpenMonitorRunner:
                             and strength_score >= self.weekly_soft_gate_strength_threshold
                         ) or board_status == "strong"
                         if strong_enough:
-                            action = "EXECUTE_SMALL"
+                            _add_action_hit(
+                                "WEEKLY_SOFT_ALLOW",
+                                "EXECUTE",
+                                soft_note,
+                                category="ENV",
+                                severity=30,
+                                cap_override=None,
+                            )
                             weekly_gate_action = "ALLOW_SMALL"
                             entry_exposure_cap = (
                                 min(entry_exposure_cap, 0.2)
@@ -3493,29 +3653,30 @@ class MA5MA20OpenMonitorRunner:
                                 if status_reason
                                 else soft_note
                             )
-                            reason = (
-                                f"{reason}；{soft_note}"
-                                if reason and reason != "OK"
+                            action_reason = (
+                                f"{action_reason}；{soft_note}"
+                                if action_reason and action_reason != "OK"
                                 else soft_note
                             )
                             if plan_tail:
                                 combined = (
-                                    f"{reason}；{plan_tail}{exposure_hint}"
-                                    if reason and reason != "OK"
+                                    f"{action_reason}；{plan_tail}{exposure_hint}"
+                                    if action_reason and action_reason != "OK"
                                     else f"{plan_tail}{exposure_hint}"
                                 )
-                                reason = combined[:255]
+                                action_reason = combined[:255]
                         else:
-                            action = "WAIT"
+                            _add_action_hit(
+                                "WEEKLY_SOFT_WAIT",
+                                "WAIT",
+                                soft_note,
+                                category="ENV",
+                                severity=50,
+                            )
                             weekly_gate_action = "WAIT"
                             status_reason = (
                                 f"{status_reason}；{soft_note}"
                                 if status_reason
-                                else soft_note
-                            )
-                            reason = (
-                                f"{reason}；{soft_note}"
-                                if reason and reason != "OK"
                                 else soft_note
                             )
                     elif env_weekly_risk_level == "MEDIUM":
@@ -3524,35 +3685,36 @@ class MA5MA20OpenMonitorRunner:
                             "CONFIRMED",
                             "FORMING",
                         }:
-                            action = "WAIT"
-                            weekly_gate_action = "WAIT"
                             append_note = "周线偏空/未修复，等待"
+                            _add_action_hit(
+                                "WEEKLY_MEDIUM_WAIT",
+                                "WAIT",
+                                append_note,
+                                category="ENV",
+                                severity=45,
+                            )
+                            weekly_gate_action = "WAIT"
                             status_reason = (
                                 f"{status_reason}；{append_note}" if status_reason else append_note
-                            )
-                            reason = (
-                                f"{reason}；{append_note}"
-                                if reason and reason != "OK"
-                                else append_note
                             )
                         else:
                             weekly_gate_action = "ALLOW"
                             if plan_tail:
                                 combined = (
-                                    f"{reason}；{plan_tail}{exposure_hint}"
-                                    if reason and reason != "OK"
+                                    f"{action_reason}；{plan_tail}{exposure_hint}"
+                                    if action_reason and action_reason != "OK"
                                     else f"{plan_tail}{exposure_hint}"
                                 )
-                                reason = combined[:255]
+                                action_reason = combined[:255]
                     elif env_weekly_risk_level == "LOW":
                         weekly_gate_action = "ALLOW"
                         if plan_tail:
                             combined = (
-                                f"{reason}；{plan_tail}{exposure_hint}"
-                                if reason and reason != "OK"
+                                f"{action_reason}；{plan_tail}{exposure_hint}"
+                                if action_reason and action_reason != "OK"
                                 else f"{plan_tail}{exposure_hint}"
                             )
-                            reason = combined[:255]
+                            action_reason = combined[:255]
 
                     if weekly_gate_action is None:
                         weekly_gate_action = "ALLOW"
@@ -3569,51 +3731,68 @@ class MA5MA20OpenMonitorRunner:
 
             if final_gate_action == "STOP":
                 gate_reason_text = gate_note_text or "指数门控=STOP"
-                if action in {"EXECUTE", "EXECUTE_SMALL"}:
-                    action = "WAIT"
+                _add_action_hit(
+                    "INDEX_GATE_STOP",
+                    "WAIT",
+                    gate_reason_text,
+                    category="ENV",
+                    severity=85,
+                    cap_override=0.0,
+                )
                 entry_exposure_cap = 0.0
-                if candidate_status == "ACTIVE":
-                    status_reason = (
-                        f"{status_reason}；{gate_reason_text}"
-                        if status_reason
-                        else gate_reason_text
-                    )
-                if reason and reason != "OK":
-                    reason = f"{reason}；{gate_reason_text}"
-                else:
-                    reason = gate_reason_text
+                status_reason = (
+                    f"{status_reason}；{gate_reason_text}"
+                    if status_reason
+                    else gate_reason_text
+                )
             elif final_gate_action == "WAIT" and action == "EXECUTE":
                 wait_text = gate_note_text or "指数门控=WAIT"
-                action = "WAIT"
+                _add_action_hit(
+                    "INDEX_GATE_WAIT",
+                    "WAIT",
+                    wait_text,
+                    category="ENV",
+                    severity=60,
+                    cap_override=0.0,
+                )
                 entry_exposure_cap = 0.0
                 status_reason = (
                     f"{status_reason}；{wait_text}" if status_reason else wait_text
                 )
-                reason = f"{reason}；{wait_text}" if reason and reason != "OK" else wait_text
 
-            if candidate_status == "ACTIVE" and action in {"SKIP", "WAIT"}:
-                status_reason = reason
+            if action in {"SKIP", "WAIT"}:
+                status_reason = action_reason
 
             exposure_chain = None
-            if candidate_status == "ACTIVE":
-                chain_parts = [f"{name}={val*100:.0f}%" for name, val in cap_candidates]
-                if entry_exposure_cap is not None:
-                    chain_tail = f"{entry_exposure_cap*100:.0f}%"
-                    exposure_chain = (
-                        f"entry_exposure_cap=min({', '.join(chain_parts)}) => {chain_tail}"
-                        if chain_parts
-                        else f"entry_exposure_cap={chain_tail}"
-                    )
-                elif chain_parts:
-                    exposure_chain = f"entry_exposure_cap=min({', '.join(chain_parts)})"
-                else:
-                    exposure_chain = "entry_exposure_cap=无显式上限（未提供环境上限）"
+            chain_parts = [f"{name}={val*100:.0f}%" for name, val in cap_candidates]
+            if entry_exposure_cap is not None:
+                chain_tail = f"{entry_exposure_cap*100:.0f}%"
+                exposure_chain = (
+                    f"entry_exposure_cap=min({', '.join(chain_parts)}) => {chain_tail}"
+                    if chain_parts
+                    else f"entry_exposure_cap={chain_tail}"
+                )
+            elif chain_parts:
+                exposure_chain = f"entry_exposure_cap=min({', '.join(chain_parts)})"
 
             if exposure_chain:
-                if reason and reason != "OK":
-                    reason = f"{reason}；{exposure_chain}"
+                if action_reason and action_reason != "OK":
+                    action_reason = f"{action_reason}；{exposure_chain}"
                 else:
-                    reason = exposure_chain
+                    action_reason = exposure_chain
+
+            decision = Decision(
+                state=primary_state,
+                action=action,
+                cap=entry_exposure_cap,
+                hits_json=json.dumps(
+                    [hit.to_dict() for hit in rule_hits],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+                state_reason=status_reason,
+                action_reason=action_reason if action_reason else status_reason,
+            )
 
             env_regimes.append(env_regime)
             env_position_hints.append(env_position_hint)
@@ -3645,10 +3824,8 @@ class MA5MA20OpenMonitorRunner:
             runup_from_sigclose_atr_list.append(_to_float(runup_from_sigclose_atr))
             runup_ref_price_list.append(_to_float(runup_ref_price_val))
             runup_ref_source_list.append(runup_ref_source_val)
-            primary_statuses.append(primary_state)
-            status_tags_json_list.append(status_tags_json_value)
-            candidate_stages.append(candidate_stage)
-            candidate_states.append(candidate_state)
+            decision_states.append(decision.state)
+            rule_hits_json_list.append(decision.hits_json)
             env_index_snapshot_hashes.append(index_intraday.get("env_index_snapshot_hash"))
             env_final_gate_action_list.append(final_gate_action)
 
@@ -3672,7 +3849,7 @@ class MA5MA20OpenMonitorRunner:
                 else "-"
             )
             summary_line = (
-                f"{candidate_stage}/{candidate_state} {action}"
+                f"{decision.state} {decision.action}"
                 f" | 量比={vol_ratio_txt}"
                 f" | 偏离20ATR={dev_ma20_atr_txt}"
                 f" | runupATR={runup_atr_txt}"
@@ -3693,10 +3870,10 @@ class MA5MA20OpenMonitorRunner:
             env_weekly_pattern_statuses.append(env_weekly_pattern_status)
             env_weekly_gate_action_list.append(weekly_gate_action)
 
-            actions.append(action)
-            reasons.append(reason)
-            statuses.append(candidate_status)
-            status_reasons.append(status_reason)
+            actions.append(decision.action)
+            action_reasons.append(decision.action_reason)
+            states.append(decision.state)
+            status_reasons.append(decision.state_reason)
             signal_kinds.append("PULLBACK" if is_pullback else "CROSS")
             trade_stop_refs.append(trade_stop_ref_val)
             sig_stop_refs.append(_to_float(signal_stop_ref_val))
@@ -3706,10 +3883,8 @@ class MA5MA20OpenMonitorRunner:
         merged["monitor_date"] = checked_at_ts.date().isoformat()
         merged["live_trade_date"] = merged["monitor_date"]
         merged["action"] = actions
-        merged["action_reason"] = reasons
-        merged["candidate_status"] = statuses
-        merged["candidate_stage"] = candidate_stages
-        merged["candidate_state"] = candidate_states
+        merged["action_reason"] = action_reasons
+        merged["state"] = states
         merged["status_reason"] = status_reasons
         merged["trade_stop_ref"] = trade_stop_refs
         merged["sig_stop_ref"] = sig_stop_refs
@@ -3760,8 +3935,7 @@ class MA5MA20OpenMonitorRunner:
         merged["runup_from_sigclose_atr"] = runup_from_sigclose_atr_list
         merged["runup_ref_price"] = runup_ref_price_list
         merged["runup_ref_source"] = runup_ref_source_list
-        merged["status_tags_json"] = status_tags_json_list
-        merged["primary_status"] = primary_statuses
+        merged["rule_hits_json"] = rule_hits_json_list
         merged["summary_line"] = summary_lines
         if "asof_close" not in merged.columns:
             merged["asof_close"] = merged.get("sig_close")
@@ -3862,13 +4036,12 @@ class MA5MA20OpenMonitorRunner:
             "strength_note",
             "risk_tag",
             "risk_note",
-            "status_tags_json",
-            "primary_status",
+            "rule_hits_json",
             "summary_line",
             "signal_kind",
             "sig_signal",
             "sig_reason",
-            "candidate_status",
+            "state",
             "status_reason",
             "action",
             "action_reason",
@@ -3922,9 +4095,7 @@ class MA5MA20OpenMonitorRunner:
             "env_weekly_structure_status",
             "env_weekly_pattern_status",
             "env_weekly_gate_action",
-            "candidate_stage",
-            "candidate_state",
-            "candidate_status",
+            "state",
             "status_reason",
             "action",
             "action_reason",
@@ -3932,8 +4103,7 @@ class MA5MA20OpenMonitorRunner:
             "strength_note",
             "risk_tag",
             "risk_note",
-            "status_tags_json",
-            "primary_status",
+            "rule_hits_json",
             "summary_line",
             "checked_at",
             "run_id",
@@ -3970,9 +4140,6 @@ class MA5MA20OpenMonitorRunner:
             "live_latest",
             "live_volume",
             "live_amount",
-            "live_gap_pct",
-            "live_pct_change",
-            "live_intraday_vol_ratio",
         ]
         for col in keep_cols:
             if col not in df.columns:
@@ -4064,24 +4231,10 @@ class MA5MA20OpenMonitorRunner:
                 df["summary_line"].fillna("").astype(str).str.slice(0, 512)
             )
 
-        if "status_tags_json" in df.columns:
-            df["status_tags_json"] = (
-                df["status_tags_json"].fillna("").astype(str).str.slice(0, 4000)
+        if "rule_hits_json" in df.columns:
+            df["rule_hits_json"] = (
+                df["rule_hits_json"].fillna("").astype(str).str.slice(0, 4000)
             )
-        if "primary_status" in df.columns:
-            df["primary_status"] = (
-                df["primary_status"].fillna("").astype(str).str.slice(0, 64)
-            )
-        else:
-            if "status_tags_json" in df.columns:
-                try:
-                    df["primary_status"] = df["status_tags_json"].apply(
-                        lambda x: (json.loads(x).get("primary", {}) or {}).get("state")
-                        if isinstance(x, str) and x.strip()
-                        else None
-                    )
-                except Exception:
-                    df["primary_status"] = None
 
         df["snapshot_hash"] = df.apply(lambda row: make_snapshot_hash(row.to_dict()), axis=1)
         df = df.drop_duplicates(
@@ -4197,45 +4350,26 @@ class MA5MA20OpenMonitorRunner:
         action_rank = {"EXECUTE": 0, "WAIT": 1, "SKIP": 2, "UNKNOWN": 3}
         export_df["_action_rank"] = export_df["action"].map(action_rank).fillna(99)
 
-        if "candidate_stage" in export_df.columns and "candidate_state" in export_df.columns:
-            stage_rank = {"ACTIVE": 0, "INACTIVE": 1}
-            state_rank = {
-                "OK": 0,
-                "OVEREXTENDED": 1,
-                "RUNUP_TOO_LARGE": 2,
-                "INVALID": 3,
-                "STALE": 4,
-                "UNKNOWN": 9,
-            }
-            export_df["_stage_rank"] = export_df["candidate_stage"].map(stage_rank).fillna(99)
-            export_df["_state_rank"] = export_df["candidate_state"].map(state_rank).fillna(99)
-            export_df = export_df.sort_values(
-                by=["_stage_rank", "_action_rank", "_state_rank", gap_col],
-                ascending=[True, True, True, True],
-            )
-            export_df = export_df.drop(
-                columns=["_action_rank", "_stage_rank", "_state_rank"],
-                errors="ignore",
-            )
+        state_rank = {
+            "OK": 0,
+            "OVEREXTENDED": 1,
+            "RUNUP_TOO_LARGE": 2,
+            "INVALID": 3,
+            "STALE": 4,
+            "UNKNOWN": 9,
+        }
+        if "state" in export_df.columns:
+            export_df["_state_rank"] = export_df["state"].map(state_rank).fillna(99)
         else:
-            status_rank = {
-                "ACTIVE": 0,
-                "OVEREXTENDED": 1,
-                "RUNUP_TOO_LARGE": 2,
-                "INVALID": 3,
-                "STALE": 4,
-                "UNKNOWN": 5,
-            }
-            export_df["_status_rank"] = (
-                export_df["candidate_status"].map(status_rank).fillna(99)
-            )
-            export_df = export_df.sort_values(
-                by=["_status_rank", "_action_rank", gap_col],
-                ascending=[True, True, True],
-            )
-            export_df = export_df.drop(
-                columns=["_action_rank", "_status_rank"], errors="ignore"
-            )
+            export_df["_state_rank"] = 99
+        export_df = export_df.sort_values(
+            by=["_action_rank", "_state_rank", gap_col],
+            ascending=[True, True, True],
+        )
+        export_df = export_df.drop(
+            columns=["_action_rank", "_state_rank"],
+            errors="ignore",
+        )
         if self.params.export_top_n > 0:
             export_df = export_df.head(self.params.export_top_n)
 
