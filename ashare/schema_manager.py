@@ -50,6 +50,7 @@ class TableNames:
     env_snapshot_table: str
     env_index_snapshot_table: str
     open_monitor_view: str
+    open_monitor_wide_view: str
     open_monitor_quote_table: str
     open_monitor_compat_view: str
 
@@ -87,6 +88,7 @@ class SchemaManager:
         self._ensure_env_index_snapshot_table(tables.env_index_snapshot_table)
         self._ensure_open_monitor_view(
             tables.open_monitor_view,
+            tables.open_monitor_wide_view,
             tables.open_monitor_eval_table,
             tables.env_snapshot_table,
             tables.env_index_snapshot_table,
@@ -156,6 +158,15 @@ class SchemaManager:
             str(
                 open_monitor_cfg.get(
                     "open_monitor_view",
+                    VIEW_STRATEGY_OPEN_MONITOR,
+                )
+            ).strip()
+            or VIEW_STRATEGY_OPEN_MONITOR
+        )
+        open_monitor_wide_view = (
+            str(
+                open_monitor_cfg.get(
+                    "open_monitor_wide_view",
                     VIEW_STRATEGY_OPEN_MONITOR_WIDE,
                 )
             ).strip()
@@ -190,6 +201,7 @@ class SchemaManager:
             env_snapshot_table=env_snapshot_table,
             env_index_snapshot_table=env_index_snapshot_table,
             open_monitor_view=open_monitor_view,
+            open_monitor_wide_view=open_monitor_wide_view,
             open_monitor_quote_table=open_monitor_quote_table,
             open_monitor_compat_view=open_monitor_compat_view,
         )
@@ -1220,13 +1232,14 @@ class SchemaManager:
     def _ensure_open_monitor_view(
         self,
         view: str,
+        wide_view: str,
         eval_table: str,
         env_table: str,
         env_index_table: str,
         quote_table: str,
         compat_view: str,
     ) -> None:
-        if not (view and eval_table and env_table and env_index_table):
+        if not (wide_view and eval_table and env_table and env_index_table):
             return
 
         dim_stock_exists = self._table_exists("dim_stock_industry")
@@ -1273,9 +1286,10 @@ class SchemaManager:
             live_volume_expr = "q.`live_volume`"
             live_amount_expr = "q.`live_amount`"
 
+        target_wide_view = wide_view or view
         stmt = text(
             f"""
-            CREATE OR REPLACE VIEW `{view}` AS
+            CREATE OR REPLACE VIEW `{target_wide_view}` AS
             SELECT
               e.`monitor_date`,
               e.`sig_date`,
@@ -1364,19 +1378,66 @@ class SchemaManager:
         )
         with self.engine.begin() as conn:
             conn.execute(stmt)
-        self.logger.info("已创建/更新开盘监测宽视图 %s。", view)
+        self.logger.info("已创建/更新开盘监测宽视图 %s。", target_wide_view)
 
-        if compat_view and compat_view != view:
+        if view and view != target_wide_view:
+            compact_columns = [
+                "monitor_date",
+                "sig_date",
+                "run_id",
+                "code",
+                "name",
+                "industry",
+                "board_name",
+                "board_code",
+                "signal_kind",
+                "sig_signal",
+                "sig_reason",
+                "live_trade_date",
+                "live_open",
+                "live_latest",
+                "live_pct_change",
+                "live_gap_pct",
+                "live_intraday_vol_ratio",
+                "state",
+                "status_reason",
+                "action",
+                "action_reason",
+                "entry_exposure_cap",
+                "env_final_gate_action",
+                "env_index_position_cap",
+                "env_position_hint",
+                "env_index_live_pct_change",
+                "env_index_gate_action",
+                "env_index_gate_reason",
+                "rule_hits_json",
+                "summary_line",
+                "checked_at",
+            ]
+            compact_select = ", ".join(f"`{col}`" for col in compact_columns)
+            compact_stmt = text(
+                f"""
+                CREATE OR REPLACE VIEW `{view}` AS
+                SELECT {compact_select}
+                FROM `{target_wide_view}`
+                """
+            )
+            with self.engine.begin() as conn:
+                conn.execute(compact_stmt)
+            self.logger.info("已创建/更新开盘监测精简视图 %s。", view)
+
+        target_for_compat = view or target_wide_view
+        if compat_view and compat_view not in {target_for_compat, target_wide_view}:
             self._drop_relation_any(compat_view)
             compat_stmt = text(
                 f"""
                 CREATE OR REPLACE VIEW `{compat_view}` AS
-                SELECT * FROM `{view}`
+                SELECT * FROM `{target_for_compat}`
                 """
             )
             with self.engine.begin() as conn:
                 conn.execute(compat_stmt)
-            self.logger.info("已创建/更新兼容视图 %s -> %s。", compat_view, view)
+            self.logger.info("已创建/更新兼容视图 %s -> %s。", compat_view, target_for_compat)
 
 
 def ensure_schema() -> None:
