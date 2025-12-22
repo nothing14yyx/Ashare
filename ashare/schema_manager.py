@@ -23,6 +23,8 @@ TABLE_STRATEGY_INDICATOR_DAILY = "strategy_indicator_daily"
 TABLE_STRATEGY_SIGNAL_EVENTS = "strategy_signal_events"
 TABLE_STRATEGY_SIGNAL_CANDIDATES = "strategy_signal_candidates"
 VIEW_STRATEGY_SIGNAL_CANDIDATES = "v_strategy_signal_candidates"
+# 兼容旧版本候选池视图（历史命名）：避免遗留 view 引用失效
+VIEW_STRATEGY_MA5_MA20_CANDIDATES = "v_strategy_ma5_ma20_candidates"
 TABLE_STRATEGY_CHIP_FILTER = "strategy_chip_filter"
 TABLE_STRATEGY_TRADE_METRICS = "strategy_trade_metrics"
 VIEW_STRATEGY_BACKTEST = "v_backtest"
@@ -71,12 +73,18 @@ class SchemaManager:
 
         self._ensure_indicator_table(tables.indicator_table)
         self._ensure_signal_events_table(tables.signal_events_table)
-        # candidates 事实表始终存在：稳定事实表（可选额外创建视图做实时派生/兼容查询）
-        self._ensure_candidates_table(tables.candidates_table)
+        # candidates：统一以 candidates_view 作为下游入口；是否保留物化表由 candidates_as_view 控制
+        self._ensure_candidates_view(
+            tables.candidates_view, tables.signal_events_table, tables.indicator_table
+        )
+        self._ensure_candidates_compat_view(
+            VIEW_STRATEGY_MA5_MA20_CANDIDATES,
+            tables.candidates_view,
+        )
         if tables.candidates_as_view:
-            self._ensure_candidates_view(
-                tables.candidates_view, tables.signal_events_table, tables.indicator_table
-            )
+            self._drop_relation_any(tables.candidates_table)
+        else:
+            self._ensure_candidates_table(tables.candidates_table)
         self._ensure_trade_metrics_table()
         self._ensure_backtest_view()
         self._ensure_chip_filter_table()
@@ -125,7 +133,8 @@ class SchemaManager:
             str(strat_cfg.get("candidates_view", VIEW_STRATEGY_SIGNAL_CANDIDATES)).strip()
             or VIEW_STRATEGY_SIGNAL_CANDIDATES
         )
-        raw_candidates_as_view = strat_cfg.get("candidates_as_view", False)
+        # 默认使用视图候选池（不落地表），避免 candidates 表冗余与维护成本
+        raw_candidates_as_view = strat_cfg.get("candidates_as_view", True)
         if isinstance(raw_candidates_as_view, str):
             lowered = raw_candidates_as_view.strip().lower()
             if lowered in {"1", "true", "yes", "y", "on"}:
@@ -843,6 +852,46 @@ class SchemaManager:
         with self.engine.begin() as conn:
             conn.execute(stmt)
         self.logger.info("已创建/更新候选视图 %s。", view)
+
+    def _ensure_candidates_compat_view(self, compat_view: str, base_view: str) -> None:
+        """兼容旧命名的候选池视图，防止遗留依赖报错。
+
+        典型场景：历史 view `v_strategy_ma5_ma20_candidates` 仍被外部脚本/BI 引用。
+        """
+        if not compat_view or not base_view:
+            return
+
+        # 兼容视图可能曾经被创建为 table/view，统一清理后重建
+        self._drop_relation_any(compat_view)
+
+        stmt = text(
+            f"""
+            CREATE OR REPLACE VIEW `{compat_view}` AS
+            SELECT
+              `sig_date` AS `date`,
+              `sig_date`,
+              `code`,
+              `strategy_code`,
+              `sig_signal` AS `signal`,
+              `sig_signal`,
+              `sig_reason` AS `reason`,
+              `sig_reason`,
+              `signal_age`,
+              `valid_days`,
+              `close`,
+              `ma5`,`ma20`,`ma60`,`ma250`,
+              `vol_ratio`,`macd_hist`,`kdj_k`,`kdj_d`,`atr14`,
+              `stop_ref`,
+              `yearline_state`,
+              `risk_tag`,`risk_note`,
+              `final_action`,`final_reason`,`final_cap`,
+              `extra_json`
+            FROM `{base_view}`
+            """
+        )
+        with self.engine.begin() as conn:
+            conn.execute(stmt)
+        self.logger.info("已创建/更新候选兼容视图 %s（基于 %s）。", compat_view, base_view)
 
     def _ensure_trade_metrics_table(self) -> None:
         columns = {
