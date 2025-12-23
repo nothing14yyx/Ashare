@@ -20,6 +20,8 @@ import datetime as dt
 from datetime import timedelta
 import time
 
+import pandas as pd
+
 from ashare.config import get_section
 from ashare.open_monitor import MA5MA20OpenMonitorRunner
 from ashare.schema_manager import ensure_schema
@@ -136,27 +138,88 @@ def main() -> None:
         raise ValueError("interval must be positive")
 
     ensured_monitor_date: str | None = None
+    ensured_env_ready: bool = False
+
+    def _load_latest_trade_date() -> str | None:
+        """尽量从日线/指标表解析最新交易日，用于自动补齐环境快照。"""
+        base_table = runner._daily_table()
+        date_col = "date"
+        if not runner._table_exists(base_table):
+            indicator_table = str(getattr(runner.params, "indicator_table", "") or "").strip()
+            if indicator_table and runner._table_exists(indicator_table):
+                base_table = indicator_table
+                date_col = "trade_date"
+            else:
+                return None
+        try:
+            with runner.db_writer.engine.begin() as conn:
+                df = pd.read_sql_query(
+                    f"SELECT MAX(`{date_col}`) AS max_date FROM `{base_table}`",
+                    conn,
+                )
+        except Exception:  # noqa: BLE001
+            return None
+        if df.empty:
+            return None
+        val = df.iloc[0].get("max_date")
+        if pd.isna(val) or not str(val).strip():
+            return None
+        return str(val)[:10]
 
     def _ensure_env_snapshot(now: dt.datetime) -> str:
-        nonlocal ensured_monitor_date
+        nonlocal ensured_monitor_date, ensured_env_ready
 
         trade_day = _next_trading_day(now.date(), runner)
         monitor_date = trade_day.isoformat()
-        if ensured_monitor_date == monitor_date:
+        if ensured_monitor_date == monitor_date and ensured_env_ready:
             return monitor_date
 
+        # 1) 严格检查：当日快照必须存在（不允许静默回退）
+        env_context = runner.load_env_snapshot_context(
+            monitor_date, None, allow_fallback=False
+        )
+        if env_context:
+            ensured_monitor_date = monitor_date
+            ensured_env_ready = True
+            return monitor_date
+
+        # 2) 自动补齐：尝试构建并落库 env snapshot
+        latest_trade_date = _load_latest_trade_date()
+        if latest_trade_date:
+            try:
+                runner.build_and_persist_env_snapshot(
+                    latest_trade_date,
+                    monitor_date=monitor_date,
+                    checked_at=now,
+                )
+                logger.info(
+                    "已自动补齐环境快照（monitor_date=%s, latest_trade_date=%s）。",
+                    monitor_date,
+                    latest_trade_date,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("自动补齐环境快照失败（monitor_date=%s）：%s", monitor_date, exc)
+        else:
+            logger.warning(
+                "无法解析 latest_trade_date，跳过自动补齐环境快照（monitor_date=%s）。",
+                monitor_date,
+            )
+
+        # 3) 重新加载（允许回退，避免极端情况下空跑）
         env_context = runner.load_env_snapshot_context(
             monitor_date, None, allow_fallback=True
         )
         if env_context:
             ensured_monitor_date = monitor_date
+            ensured_env_ready = True
             return monitor_date
 
         logger.warning(
-            "未找到环境快照（monitor_date=%s），请先运行 run_index_weekly_channel 产出环境。",
+            "未找到环境快照（monitor_date=%s），本次调度将继续但 open_monitor 可能返回空；建议先运行 run_index_weekly_channel。",
             monitor_date,
         )
         ensured_monitor_date = monitor_date
+        ensured_env_ready = False
         return monitor_date
 
     _ensure_env_snapshot(dt.datetime.now())

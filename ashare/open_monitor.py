@@ -262,6 +262,21 @@ class DecisionContext:
     env_gate_action: str | None = None
     env_gate_reason: str | None = None
     env_position_cap: float | None = None
+
+    # --- inputs for RuleEngine predicates (optional) ---
+    env: MarketEnvironment | None = None
+    chip_score: float | None = None
+    price_now: float | None = None
+    live_gap: float | None = None
+    live_pct: float | None = None
+    threshold_gap_up: float | None = None
+    max_gap_down: float | None = None
+    sig_ma20: float | None = None
+    ma20_thresh: float | None = None
+    limit_up_trigger: float | None = None
+    runup_breach: bool = False
+    runup_breach_reason: str | None = None
+
     rule_hits: list[RuleHit] = field(default_factory=list)
 
     def record_hit(
@@ -387,6 +402,97 @@ class RuleEngine:
                     else:
                         ctx.apply_env_overlay(rule, result, self.merge_gate_actions)
         ctx.finalize_env_overlay(self.merge_gate_actions)
+
+
+
+# -------------------------
+# Default monitor rules (hard gates)
+# -------------------------
+DEFAULT_MONITOR_RULES: list[Rule] = [
+    Rule(
+        id="ENV_STOP",
+        category="ACTION",
+        severity=100,
+        predicate=lambda ctx: bool(ctx.env and ctx.env.gate_action == "STOP"),
+        effect=lambda ctx: RuleResult(reason="环境阻断", action_override="SKIP"),
+    ),
+    Rule(
+        id="ENV_WAIT",
+        category="ACTION",
+        severity=90,
+        predicate=lambda ctx: bool(ctx.env and ctx.env.gate_action == "WAIT"),
+        effect=lambda ctx: RuleResult(reason="环境等待", action_override="WAIT"),
+    ),
+    Rule(
+        id="CHIP_SCORE_NEG",
+        category="ACTION",
+        severity=80,
+        predicate=lambda ctx: (ctx.chip_score is not None and ctx.chip_score < 0),
+        effect=lambda ctx: RuleResult(reason="筹码评分<0", action_override="WAIT"),
+    ),
+    Rule(
+        id="QUOTE_MISSING",
+        category="ACTION",
+        severity=75,
+        predicate=lambda ctx: ctx.price_now is None,
+        effect=lambda ctx: RuleResult(reason="行情数据不可用", action_override="SKIP"),
+    ),
+    Rule(
+        id="GAP_UP_TOO_MUCH",
+        category="ACTION",
+        severity=70,
+        predicate=lambda ctx: (
+            ctx.live_gap is not None
+            and ctx.threshold_gap_up is not None
+            and ctx.live_gap > ctx.threshold_gap_up
+        ),
+        effect=lambda ctx: RuleResult(reason="高开过阈值", action_override="SKIP"),
+    ),
+    Rule(
+        id="GAP_DOWN_BREAK",
+        category="ACTION",
+        severity=70,
+        predicate=lambda ctx: (
+            ctx.live_gap is not None
+            and ctx.max_gap_down is not None
+            and ctx.live_gap < ctx.max_gap_down
+        ),
+        effect=lambda ctx: RuleResult(reason="低开破位", action_override="SKIP"),
+    ),
+    Rule(
+        id="BELOW_MA20_REQ",
+        category="ACTION",
+        severity=60,
+        predicate=lambda ctx: (
+            ctx.price_now is not None
+            and ctx.sig_ma20 is not None
+            and ctx.ma20_thresh is not None
+            and ctx.price_now < ctx.sig_ma20 * (1 + ctx.ma20_thresh)
+        ),
+        effect=lambda ctx: RuleResult(reason="未站上MA20要求", action_override="SKIP"),
+    ),
+    Rule(
+        id="LIMIT_UP",
+        category="ACTION",
+        severity=60,
+        predicate=lambda ctx: (
+            ctx.live_pct is not None
+            and ctx.limit_up_trigger is not None
+            and ctx.live_pct >= ctx.limit_up_trigger
+        ),
+        effect=lambda ctx: RuleResult(reason="涨停不可成交", action_override="SKIP"),
+    ),
+    Rule(
+        id="RUNUP_BREACH",
+        category="ACTION",
+        severity=55,
+        predicate=lambda ctx: bool(ctx.runup_breach),
+        effect=lambda ctx: RuleResult(
+            reason=ctx.runup_breach_reason or "拉升过快",
+            action_override="WAIT",
+        ),
+    ),
+]
 
 
 def compute_runup_metrics(
@@ -2899,12 +3005,15 @@ class MA5MA20OpenMonitorRunner:
         cross_valid_days = self.params.cross_valid_days
         pullback_valid_days = self.params.pullback_valid_days
 
+        rule_engine = RuleEngine(self._merge_gate_actions)
+
         for _, row in merged.iterrows():
             sig_reason_text = str(row.get("sig_reason") or row.get("reason") or "")
             is_pullback = self._is_pullback_signal(sig_reason_text)
             valid_days = pullback_valid_days if is_pullback else cross_valid_days
             valid_days_list.append(valid_days)
-            sig_stop_refs.append(_to_float(row.get("sig_stop_ref")))
+            sig_stop_ref = _to_float(row.get("sig_stop_ref"))
+            sig_stop_refs.append(sig_stop_ref)
 
             price_now = _to_float(row.get("live_open")) or _to_float(row.get("live_latest"))
             ref_close = _resolve_ref_close(row)
@@ -2959,9 +3068,10 @@ class MA5MA20OpenMonitorRunner:
             dev_ma5_atr_list.append(dev_ma5_atr)
             dev_ma20_atr_list.append(dev_ma20_atr)
 
+            ref_asof_close = _to_float(row.get("asof_close")) or ref_close or _to_float(row.get("sig_close"))
             runup_metrics = compute_runup_metrics(
                 _to_float(row.get("sig_close")),
-                asof_close=_to_float(row.get("sig_close")),
+                asof_close=ref_asof_close,
                 live_high=_to_float(row.get("live_high")) or price_now,
                 sig_atr14=sig_atr14,
             )
@@ -2975,49 +3085,44 @@ class MA5MA20OpenMonitorRunner:
                 atr_gap = max_up_atr_mult * sig_atr14 / ref_close
                 threshold_gap_up = min(max_up, atr_gap)
 
-            action = "EXECUTE"
-            action_reason = "OK"
-
-            def apply_action(candidate: str, reason: str) -> None:
-                nonlocal action, action_reason
-                if _action_rank(candidate) < _action_rank(action):
-                    action = candidate
-                    action_reason = reason
-
-            if env.gate_action == "STOP":
-                apply_action("SKIP", "环境阻断")
-            elif env.gate_action == "WAIT":
-                apply_action("WAIT", "环境等待")
+            ma20_thresh = pullback_min_vs_ma20 if is_pullback else min_vs_ma20
 
             chip_score = _to_float(row.get("sig_chip_score") or row.get("chip_score"))
-            if chip_score is not None and chip_score < 0:
-                apply_action("WAIT", "筹码评分<0")
 
-            if price_now is None:
-                apply_action("UNKNOWN", "行情数据不可用")
-            else:
-                if live_gap is not None and threshold_gap_up is not None and live_gap > threshold_gap_up:
-                    apply_action("SKIP", "高开过阈值")
-                if live_gap is not None and max_down is not None and live_gap < max_down:
-                    apply_action("SKIP", "低开破位")
-                ma20_thresh = pullback_min_vs_ma20 if is_pullback else min_vs_ma20
-                if sig_ma20 is not None and ma20_thresh is not None:
-                    if price_now < sig_ma20 * (1 + ma20_thresh):
-                        apply_action("SKIP", "未站上MA20要求")
-                if live_pct is not None and limit_up_trigger is not None and live_pct >= limit_up_trigger:
-                    apply_action("SKIP", "涨停不可成交")
-
+            breach = False
+            breach_reason = None
+            if price_now is not None:
                 dev_ma20_atr_val = dev_ma20_atr
                 runup_limit = pullback_runup_atr_max if is_pullback else runup_atr_max
-                breach, reason = evaluate_runup_breach(
+                breach, breach_reason = evaluate_runup_breach(
                     runup_metrics,
                     runup_atr_max=runup_limit,
                     runup_atr_tol=self.params.runup_atr_tol,
                     dev_ma20_atr=dev_ma20_atr_val,
                     dev_ma20_atr_min=pullback_runup_dev_ma20_atr_min if is_pullback else None,
                 )
-                if breach:
-                    apply_action("WAIT", reason or "拉升过快")
+
+            ctx = DecisionContext(
+                entry_exposure_cap=env.position_cap_pct,
+                env=env,
+                chip_score=chip_score,
+                price_now=price_now,
+                live_gap=live_gap,
+                live_pct=live_pct,
+                threshold_gap_up=threshold_gap_up,
+                max_gap_down=max_down,
+                sig_ma20=sig_ma20,
+                ma20_thresh=ma20_thresh,
+                limit_up_trigger=limit_up_trigger,
+                runup_breach=breach,
+                runup_breach_reason=breach_reason,
+            )
+            rule_engine.apply(ctx, DEFAULT_MONITOR_RULES)
+
+
+            action = ctx.action
+            action_reason = ctx.action_reason
+
 
             trade_stop_ref = None
             if price_now is not None and sig_atr14 is not None:
@@ -3045,7 +3150,7 @@ class MA5MA20OpenMonitorRunner:
             actions.append(action)
             action_reasons.append(action_reason)
             signal_kinds.append("PULLBACK" if is_pullback else "CROSS")
-            rule_hits_json_list.append(None)
+            rule_hits_json_list.append(json.dumps([h.to_dict() for h in ctx.rule_hits], ensure_ascii=False))
             summary_lines.append(f"{state} {action} | {action_reason}")
             env_index_snapshot_hashes.append(env.index_snapshot_hash)
             env_final_gate_action_list.append(env.gate_action)
@@ -3064,6 +3169,7 @@ class MA5MA20OpenMonitorRunner:
         merged["action_reason"] = action_reasons
         merged["state"] = states
         merged["status_reason"] = status_reasons
+        merged["signal_kind"] = signal_kinds
         merged["signal_age"] = merged.get("signal_age")
         merged["valid_days"] = valid_days_list
         merged["trade_stop_ref"] = trade_stop_refs
