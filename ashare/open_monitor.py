@@ -40,7 +40,6 @@ from .db import DatabaseConfig, MySQLWriter
 from .ma5_ma20_trend_strategy import _atr, _macd
 from .schema_manager import (
     TABLE_ENV_INDEX_SNAPSHOT,
-    TABLE_STRATEGY_INDICATOR_DAILY,
     TABLE_STRATEGY_OPEN_MONITOR_ENV,
     TABLE_STRATEGY_OPEN_MONITOR_EVAL,
     TABLE_STRATEGY_OPEN_MONITOR_QUOTE,
@@ -110,8 +109,20 @@ def normalize_quotes_columns(df: pd.DataFrame) -> pd.DataFrame:
     - 可选：live_pct_change、prev_close 等
     """
 
-    if not isinstance(df, pd.DataFrame) or df.empty:
-        return df if isinstance(df, pd.DataFrame) else pd.DataFrame()
+    if not isinstance(df, pd.DataFrame):
+        return pd.DataFrame(
+            columns=[
+                "code",
+                "live_open",
+                "live_high",
+                "live_low",
+                "live_latest",
+                "live_volume",
+                "live_amount",
+                "live_pct_change",
+                "prev_close",
+            ]
+        )
 
     out = df.copy()
 
@@ -140,6 +151,18 @@ def normalize_quotes_columns(df: pd.DataFrame) -> pd.DataFrame:
     rename_cols = {k: v for k, v in mapping.items() if k in out.columns and v not in out.columns}
     if rename_cols:
         out = out.rename(columns=rename_cols)
+
+    # 确保统一列存在（即便为空行情，也保持契约列结构稳定）
+    for col in (
+        "live_open",
+        "live_high",
+        "live_low",
+        "live_latest",
+        "live_volume",
+        "live_amount",
+    ):
+        if col not in out.columns:
+            out[col] = None
 
     return out
 
@@ -565,8 +588,12 @@ class OpenMonitorParams:
 
     # 信号来源表：默认使用 strategy_signal_events
     signal_events_table: str = TABLE_STRATEGY_SIGNAL_EVENTS
-    indicator_table: str = TABLE_STRATEGY_INDICATOR_DAILY
+    # DEPRECATED: open_monitor 不再依赖 strategy_indicator_daily（保留字段仅为兼容旧配置）
+    indicator_table: str = ""
     ready_signals_view: str = VIEW_STRATEGY_READY_SIGNALS
+    # 契约与 fail-fast（默认开启）
+    strict_ready_signals_required: bool = True
+    strict_quotes: bool = True
     quote_table: str = TABLE_STRATEGY_OPEN_MONITOR_QUOTE
     strategy_code: str = STRATEGY_CODE_MA5_MA20_TREND
 
@@ -629,6 +656,10 @@ class OpenMonitorParams:
             sec = {}
 
         # 默认信号事件表/策略 code 与 strategy_ma5_ma20_trend 保持一致（指标表已废弃）
+        default_indicator = cls.indicator_table
+        default_events = cls.signal_events_table
+        default_strategy_code = STRATEGY_CODE_MA5_MA20_TREND
+
         strat = get_section("strategy_ma5_ma20_trend") or {}
         if isinstance(strat, dict):
             default_indicator = strat.get("indicator_table", cls.indicator_table)
@@ -639,6 +670,7 @@ class OpenMonitorParams:
             )
             default_strategy_code = strat.get("strategy_code", STRATEGY_CODE_MA5_MA20_TREND)
         else:
+            default_indicator = cls.indicator_table
             default_events = cls.signal_events_table
             default_strategy_code = STRATEGY_CODE_MA5_MA20_TREND
 
@@ -685,6 +717,10 @@ class OpenMonitorParams:
                 sec.get("ready_signals_view", cls.ready_signals_view)
             ).strip()
             or cls.ready_signals_view,
+            strict_ready_signals_required=_get_bool(
+                "strict_ready_signals_required", cls.strict_ready_signals_required
+            ),
+            strict_quotes=_get_bool("strict_quotes", cls.strict_quotes),
             quote_table=str(sec.get("quote_table", cls.quote_table)).strip() or cls.quote_table,
             strategy_code=str(sec.get("strategy_code", default_strategy_code)).strip()
             or default_strategy_code,
@@ -1541,6 +1577,61 @@ class MA5MA20OpenMonitorRunner:
 
         return {d: i for i, d in enumerate(dates)}
 
+    def _resolve_latest_trade_date(
+        self,
+        *,
+        signals: pd.DataFrame | None = None,
+        ready_view: str | None = None,
+    ) -> str | None:
+        """统一推导 latest_trade_date，避免对 indicator_table 的隐性依赖。
+
+        优先级：
+        1) signals 中的 asof_trade_date / sig_date
+        2) 日线表（_daily_table）MAX(date)
+        3) ready_signals_view MAX(sig_date)
+        """
+
+        if isinstance(signals, pd.DataFrame) and not signals.empty:
+            for col in ("asof_trade_date", "sig_date"):
+                if col in signals.columns:
+                    s = pd.to_datetime(signals[col], errors="coerce").dropna()
+                    if not s.empty:
+                        return s.max().date().isoformat()
+
+        daily = self._daily_table()
+        if daily and self._table_exists(daily):
+            try:
+                with self.db_writer.engine.begin() as conn:
+                    df = pd.read_sql_query(
+                        text(f"SELECT MAX(`date`) AS latest_trade_date FROM `{daily}`"),
+                        conn,
+                    )
+                if df is not None and not df.empty:
+                    v = df.iloc[0].get("latest_trade_date")
+                    ts = pd.to_datetime(v, errors="coerce")
+                    if pd.notna(ts):
+                        return ts.date().isoformat()
+            except Exception as exc:  # noqa: BLE001
+                self.logger.debug("推导 latest_trade_date 失败（daily_table）：%s", exc)
+
+        view = ready_view or str(self.params.ready_signals_view or "").strip()
+        if view and self._table_exists(view):
+            try:
+                with self.db_writer.engine.begin() as conn:
+                    df = pd.read_sql_query(
+                        text(f"SELECT MAX(`sig_date`) AS latest_sig_date FROM `{view}`"),
+                        conn,
+                    )
+                if df is not None and not df.empty:
+                    v = df.iloc[0].get("latest_sig_date")
+                    ts = pd.to_datetime(v, errors="coerce")
+                    if pd.notna(ts):
+                        return ts.date().isoformat()
+            except Exception as exc:  # noqa: BLE001
+                self.logger.debug("推导 latest_trade_date 失败（ready_view）：%s", exc)
+
+        return None
+
     def _load_recent_buy_signals(self) -> Tuple[str | None, List[str], pd.DataFrame]:
         """从 ready_signals_view 读取最近 BUY 信号（严格模式，无旧逻辑回退）。
 
@@ -1550,54 +1641,53 @@ class MA5MA20OpenMonitorRunner:
         """
 
         view = str(self.params.ready_signals_view or "").strip()
+        strict_ready = bool(getattr(self.params, "strict_ready_signals_required", True))
         if not view:
-            self.logger.error("未配置 ready_signals_view，已跳过开盘监测。")
+            msg = "未配置 ready_signals_view"
+            if strict_ready:
+                raise RuntimeError(msg)
+            self.logger.error("%s，已跳过开盘监测。", msg)
             return None, [], pd.DataFrame()
         if not self._table_exists(view):
+            msg = f"ready_signals_view={view} 不存在"
+            if strict_ready:
+                raise RuntimeError(msg)
             self.logger.error(
-                "ready_signals_view=%s 不存在，已跳过开盘监测；请先确保 SchemaManager.ensure_all 已执行或检查配置。",
-                view,
+                "%s，已跳过开盘监测；请先确保 SchemaManager.ensure_all 已执行或检查配置。",
+                msg,
             )
             return None, [], pd.DataFrame()
 
-        # 进入严格模式：只走 ready_signals_view
+        required_view_cols = {"sig_date", "code", "strategy_code", "close", "ma20", "atr14"}
+        view_cols = set(self._get_table_columns(view))
+        missing_view_cols = sorted(required_view_cols - view_cols)
+        if missing_view_cols:
+            msg = f"ready_signals_view `{view}` 缺少关键列：{missing_view_cols}"
+            if strict_ready:
+                raise RuntimeError(msg)
+            self.logger.error("%s，已跳过开盘监测。", msg)
+            return None, [], pd.DataFrame()
+
+        # 严格模式，无旧逻辑回退
         self._ready_signals_used = True
 
-        indicator_table = str(self.params.indicator_table or "").strip()
         monitor_date = dt.date.today().isoformat()
         lookback = max(int(self.params.signal_lookback_days or 0), 1)
 
-        # 1) 解析最新交易日（优先日线表；无日线表则回退指标表；都没有则退回 view 的日期）
+        # 1) 推导最新交易日（优先 daily_table；再回退 view.sig_date）
+        latest_trade_date = self._resolve_latest_trade_date(ready_view=view)
+        if not latest_trade_date:
+            self.logger.error("无法推导 latest_trade_date（daily_table/view 均不可用），已跳过开盘监测。")
+            return None, [], pd.DataFrame()
+
+        # 2) 取严格“最近 N 个交易日窗口”（优先日线表；若无日线表则退化为信号日序列）
         base_table = self._daily_table()
         date_col = "date"
         if not self._table_exists(base_table):
-            if indicator_table and self._table_exists(indicator_table):
-                base_table = indicator_table
-                date_col = "trade_date"
-            else:
-                base_table = view
-                date_col = "sig_date"
+            base_table = view
+            date_col = "sig_date"
 
-        try:
-            with self.db_writer.engine.begin() as conn:
-                max_df = pd.read_sql_query(
-                    text(f"SELECT MAX(`{date_col}`) AS max_date FROM `{base_table}`"),
-                    conn,
-                )
-        except Exception as exc:  # noqa: BLE001
-            self.logger.error("读取最新交易日失败（table=%s）：%s", base_table, exc)
-            return None, [], pd.DataFrame()
-
-        if max_df.empty:
-            return None, [], pd.DataFrame()
-
-        max_date = max_df.iloc[0].get("max_date")
-        if pd.isna(max_date) or not str(max_date).strip():
-            return None, [], pd.DataFrame()
-
-        latest_trade_date = str(max_date)[:10]
-
-        # 2) 先取严格“最近 N 个交易日窗口”（优先日线/指标表；若只能从 view 回退，则窗口也将退化为信号日序列）
+        # 取最近 N 个交易日窗口（含 latest_trade_date）
         try:
             with self.db_writer.engine.begin() as conn:
                 trade_dates_df = pd.read_sql_query(
@@ -1721,7 +1811,10 @@ class MA5MA20OpenMonitorRunner:
         ]
         missing = [c for c in required_cols if c not in events_df.columns]
         if missing:
-            self.logger.error("ready_signals_view=%s 缺少关键列 %s，已跳过开盘监测。", view, missing)
+            msg = f"ready_signals_view `{view}` 缺少关键列：{missing}"
+            if strict_ready:
+                raise RuntimeError(msg)
+            self.logger.error("%s，已跳过开盘监测。", msg)
             return latest_trade_date, signal_dates, pd.DataFrame()
 
         # 输出列补齐（保持下游 _prepare_monitor_frame/_evaluate 依赖稳定）
@@ -1837,52 +1930,18 @@ class MA5MA20OpenMonitorRunner:
                 df[target] = None
 
         return latest_trade_date, signal_dates, df
+
     def _load_latest_snapshots(self, latest_trade_date: str, codes: List[str]) -> pd.DataFrame:
         if not latest_trade_date or not codes:
             return pd.DataFrame()
 
-        indicator_table = self.params.indicator_table
+        daily_table = self._daily_table()
         events_table = self.params.signal_events_table
-        if not indicator_table or not self._table_exists(indicator_table):
+        if not daily_table or not self._table_exists(daily_table):
             return pd.DataFrame()
 
         codes = [str(c) for c in codes if str(c).strip()]
         if not codes:
-            return pd.DataFrame()
-
-        indicator_cols = [
-            "trade_date",
-            "code",
-            "close",
-            "ma5",
-            "ma20",
-            "ma60",
-            "ma250",
-            "vol_ratio",
-            "macd_hist",
-            "atr14",
-        ]
-        indicator_stmt = (
-            text(
-                f"""
-                SELECT {",".join(f"`{c}`" for c in indicator_cols)}
-                FROM `{indicator_table}`
-                WHERE `trade_date` = :d AND `code` IN :codes
-                """
-            ).bindparams(bindparam("codes", expanding=True))
-        )
-        try:
-            with self.db_writer.engine.begin() as conn:
-                ind_df = pd.read_sql_query(
-                    indicator_stmt,
-                    conn,
-                    params={"d": latest_trade_date, "codes": codes},
-                )
-        except Exception as exc:  # noqa: BLE001
-            self.logger.debug("读取最新指标失败，将跳过最新快照：%s", exc)
-            return pd.DataFrame()
-
-        if ind_df is None or ind_df.empty:
             return pd.DataFrame()
 
         stop_df = pd.DataFrame()
@@ -1910,8 +1969,27 @@ class MA5MA20OpenMonitorRunner:
                 self.logger.debug("读取 stop_ref 失败：%s", exc)
                 stop_df = pd.DataFrame()
 
-        ind_df["code"] = ind_df["code"].astype(str)
-        merged = ind_df.copy()
+        stmt = (
+            text(
+                f"""
+                SELECT CAST(`date` AS CHAR) AS trade_date, `code`, `close`
+                FROM `{daily_table}`
+                WHERE `date` = :d AND `code` IN :codes
+                """
+            ).bindparams(bindparam("codes", expanding=True))
+        )
+        try:
+            with self.db_writer.engine.begin() as conn:
+                snap_df = pd.read_sql_query(stmt, conn, params={"d": latest_trade_date, "codes": codes})
+        except Exception as exc:  # noqa: BLE001
+            self.logger.debug("读取日线快照失败，将跳过最新快照：%s", exc)
+            return pd.DataFrame()
+
+        if snap_df is None or snap_df.empty:
+            return pd.DataFrame()
+
+        snap_df["code"] = snap_df["code"].astype(str)
+        merged = snap_df.copy()
         if not stop_df.empty:
             stop_df = stop_df.rename(columns={"sig_date": "trade_date"})
             stop_df["trade_date"] = pd.to_datetime(stop_df["trade_date"]).dt.strftime("%Y-%m-%d")
@@ -2188,17 +2266,17 @@ class MA5MA20OpenMonitorRunner:
             import akshare as ak  # type: ignore
         except Exception as exc:  # noqa: BLE001
             self.logger.info("AkShare 不可用（将回退）：%s", exc)
-            return pd.DataFrame()
+            return normalize_quotes_columns(pd.DataFrame())
 
         digits = {_strip_baostock_prefix(c) for c in codes}
         try:
             spot = ak.stock_zh_a_spot_em()
         except Exception as exc:  # noqa: BLE001
             self.logger.warning("AkShare 行情拉取失败（将回退）：%s", exc)
-            return pd.DataFrame()
+            return normalize_quotes_columns(pd.DataFrame())
 
         if spot is None or getattr(spot, "empty", True):
-            return pd.DataFrame()
+            return normalize_quotes_columns(pd.DataFrame())
 
         rename_map = {
             "代码": "symbol",
@@ -2207,6 +2285,10 @@ class MA5MA20OpenMonitorRunner:
             "涨跌幅": "pct_change",
             "今开": "open",
             "昨收": "prev_close",
+            "最高": "high",
+            "最低": "low",
+            "成交量": "volume",
+            "成交额": "amount",
         }
         for k in list(rename_map.keys()):
             if k not in spot.columns:
@@ -2214,12 +2296,12 @@ class MA5MA20OpenMonitorRunner:
 
         spot = spot.rename(columns=rename_map)
         if "symbol" not in spot.columns:
-            return pd.DataFrame()
+            return normalize_quotes_columns(pd.DataFrame())
 
         spot["symbol"] = spot["symbol"].astype(str)
         spot = spot[spot["symbol"].isin(digits)].copy()
         if spot.empty:
-            return pd.DataFrame()
+            return normalize_quotes_columns(pd.DataFrame())
 
         out = pd.DataFrame()
         out["code"] = spot["symbol"].apply(lambda x: _to_baostock_code("auto", str(x)))
@@ -2228,10 +2310,24 @@ class MA5MA20OpenMonitorRunner:
         out["open"] = spot.get("open", pd.Series([None] * len(spot))).apply(_to_float)
         out["latest"] = spot.get("latest", pd.Series([None] * len(spot))).apply(_to_float)
         out["prev_close"] = spot.get("prev_close", pd.Series([None] * len(spot))).apply(_to_float)
+        out["high"] = spot.get("high", pd.Series([None] * len(spot))).apply(_to_float)
+        out["low"] = spot.get("low", pd.Series([None] * len(spot))).apply(_to_float)
+        out["volume"] = spot.get("volume", pd.Series([None] * len(spot))).apply(_to_float)
+        out["amount"] = spot.get("amount", pd.Series([None] * len(spot))).apply(_to_float)
         out["pct_change"] = spot.get("pct_change", pd.Series([None] * len(spot))).apply(_to_float)
 
         mapping = {_strip_baostock_prefix(c): c for c in codes}
         out["code"] = out["symbol"].map(mapping).fillna(out["code"])
+        out = normalize_quotes_columns(out)
+        required = ["code", "live_open", "live_high", "live_low", "live_latest", "live_volume", "live_amount"]
+        missing = [c for c in required if c not in out.columns]
+        if missing:
+            msg = f"akshare 行情缺少统一列：{missing}"
+            if bool(getattr(self.params, "strict_quotes", True)):
+                raise RuntimeError(msg)
+            self.logger.error("%s（strict_quotes=false，将补空列）", msg)
+            for c in missing:
+                out[c] = None
         return out.reset_index(drop=True)
 
     def _urlopen_json_no_proxy(self, url: str, *, timeout: int = 10, retries: int = 2) -> Dict[str, Any]:
@@ -2268,7 +2364,7 @@ class MA5MA20OpenMonitorRunner:
 
     def _fetch_quotes_eastmoney(self, codes: List[str]) -> pd.DataFrame:
         if not codes:
-            return pd.DataFrame()
+            return normalize_quotes_columns(pd.DataFrame())
 
         base_url = "https://push2.eastmoney.com/api/qt/ulist.np/get"
         fields = "f2,f3,f4,f5,f6,f12,f14,f15,f16,f17,f18"
@@ -2297,7 +2393,7 @@ class MA5MA20OpenMonitorRunner:
                 rows.extend([r for r in diff if isinstance(r, dict)])
 
         if not rows:
-            return pd.DataFrame()
+            return normalize_quotes_columns(pd.DataFrame())
 
         out_rows: List[Dict[str, Any]] = []
         mapping = {_strip_baostock_prefix(c): c for c in codes}
@@ -2334,7 +2430,18 @@ class MA5MA20OpenMonitorRunner:
                 }
             )
 
-        return pd.DataFrame(out_rows)
+        out_df = pd.DataFrame(out_rows)
+        out_df = normalize_quotes_columns(out_df)
+        required = ["code", "live_open", "live_high", "live_low", "live_latest", "live_volume", "live_amount"]
+        missing = [c for c in required if c not in out_df.columns]
+        if missing:
+            msg = f"eastmoney 行情缺少统一列：{missing}"
+            if bool(getattr(self.params, "strict_quotes", True)):
+                raise RuntimeError(msg)
+            self.logger.error("%s（strict_quotes=false，将补空列）", msg)
+            for c in missing:
+                out_df[c] = None
+        return out_df
 
     # -------------------------
     # Evaluate
@@ -2582,21 +2689,48 @@ class MA5MA20OpenMonitorRunner:
         - 本函数只负责 quotes 标准化 + 合并 + 最新快照补齐（asof_*）。
         """
 
-        q = quotes.copy()
-        live_rename_map = {
-            "open": "live_open",
-            "high": "live_high",
-            "low": "live_low",
-            "latest": "live_latest",
-            "volume": "live_volume",
-            "amount": "live_amount",
-            "pct_change": "live_pct_change",
-            "gap_pct": "live_gap_pct",
-            "intraday_vol_ratio": "live_intraday_vol_ratio",
-            "prev_close": "prev_close",
-        }
-        q = q.rename(columns={k: v for k, v in live_rename_map.items() if k in q.columns})
-        q["code"] = q["code"].astype(str) if not q.empty and "code" in q.columns else q.get("code")
+        strict_quotes = bool(getattr(self.params, "strict_quotes", True))
+        if quotes is None or getattr(quotes, "empty", True):
+            q = pd.DataFrame(
+                columns=[
+                    "code",
+                    "live_open",
+                    "live_high",
+                    "live_low",
+                    "live_latest",
+                    "live_volume",
+                    "live_amount",
+                    "live_pct_change",
+                    "live_gap_pct",
+                    "live_intraday_vol_ratio",
+                    "prev_close",
+                ]
+            )
+        else:
+            q = quotes.copy()
+            if "code" not in q.columns:
+                msg = "quotes 缺少 code 列"
+                if strict_quotes:
+                    raise RuntimeError(msg)
+                self.logger.error("%s（strict_quotes=false，将跳过行情合并）", msg)
+                q["code"] = ""
+            q["code"] = q["code"].astype(str)
+            required = [
+                "live_open",
+                "live_high",
+                "live_low",
+                "live_latest",
+                "live_volume",
+                "live_amount",
+            ]
+            missing = [c for c in required if c not in q.columns]
+            if missing:
+                msg = f"quotes 缺少统一行情列：{missing}"
+                if strict_quotes:
+                    raise RuntimeError(msg)
+                self.logger.error("%s（strict_quotes=false，将补空列）", msg)
+                for c in missing:
+                    q[c] = None
 
         merged = signals.copy()
         merged["code"] = merged["code"].astype(str)
