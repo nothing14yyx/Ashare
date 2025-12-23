@@ -408,91 +408,15 @@ class RuleEngine:
 # -------------------------
 # Default monitor rules (hard gates)
 # -------------------------
-DEFAULT_MONITOR_RULES: list[Rule] = [
-    Rule(
-        id="ENV_STOP",
-        category="ACTION",
-        severity=100,
-        predicate=lambda ctx: bool(ctx.env and ctx.env.gate_action == "STOP"),
-        effect=lambda ctx: RuleResult(reason="环境阻断", action_override="SKIP"),
-    ),
-    Rule(
-        id="ENV_WAIT",
-        category="ACTION",
-        severity=90,
-        predicate=lambda ctx: bool(ctx.env and ctx.env.gate_action == "WAIT"),
-        effect=lambda ctx: RuleResult(reason="环境等待", action_override="WAIT"),
-    ),
-    Rule(
-        id="CHIP_SCORE_NEG",
-        category="ACTION",
-        severity=80,
-        predicate=lambda ctx: (ctx.chip_score is not None and ctx.chip_score < 0),
-        effect=lambda ctx: RuleResult(reason="筹码评分<0", action_override="WAIT"),
-    ),
-    Rule(
-        id="QUOTE_MISSING",
-        category="ACTION",
-        severity=75,
-        predicate=lambda ctx: ctx.price_now is None,
-        effect=lambda ctx: RuleResult(reason="行情数据不可用", action_override="SKIP"),
-    ),
-    Rule(
-        id="GAP_UP_TOO_MUCH",
-        category="ACTION",
-        severity=70,
-        predicate=lambda ctx: (
-            ctx.live_gap is not None
-            and ctx.threshold_gap_up is not None
-            and ctx.live_gap > ctx.threshold_gap_up
-        ),
-        effect=lambda ctx: RuleResult(reason="高开过阈值", action_override="SKIP"),
-    ),
-    Rule(
-        id="GAP_DOWN_BREAK",
-        category="ACTION",
-        severity=70,
-        predicate=lambda ctx: (
-            ctx.live_gap is not None
-            and ctx.max_gap_down is not None
-            and ctx.live_gap < ctx.max_gap_down
-        ),
-        effect=lambda ctx: RuleResult(reason="低开破位", action_override="SKIP"),
-    ),
-    Rule(
-        id="BELOW_MA20_REQ",
-        category="ACTION",
-        severity=60,
-        predicate=lambda ctx: (
-            ctx.price_now is not None
-            and ctx.sig_ma20 is not None
-            and ctx.ma20_thresh is not None
-            and ctx.price_now < ctx.sig_ma20 * (1 + ctx.ma20_thresh)
-        ),
-        effect=lambda ctx: RuleResult(reason="未站上MA20要求", action_override="SKIP"),
-    ),
-    Rule(
-        id="LIMIT_UP",
-        category="ACTION",
-        severity=60,
-        predicate=lambda ctx: (
-            ctx.live_pct is not None
-            and ctx.limit_up_trigger is not None
-            and ctx.live_pct >= ctx.limit_up_trigger
-        ),
-        effect=lambda ctx: RuleResult(reason="涨停不可成交", action_override="SKIP"),
-    ),
-    Rule(
-        id="RUNUP_BREACH",
-        category="ACTION",
-        severity=55,
-        predicate=lambda ctx: bool(ctx.runup_breach),
-        effect=lambda ctx: RuleResult(
-            reason=ctx.runup_breach_reason or "拉升过快",
-            action_override="WAIT",
-        ),
-    ),
-]
+from .monitor_rules import MonitorRuleConfig, build_default_monitor_rules
+
+
+MONITOR_RULE_CONFIG = MonitorRuleConfig()
+DEFAULT_MONITOR_RULES: list[Rule] = build_default_monitor_rules(
+    MONITOR_RULE_CONFIG,
+    Rule=Rule,
+    RuleResult=RuleResult,
+)
 
 
 def compute_runup_metrics(
