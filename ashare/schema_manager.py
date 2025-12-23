@@ -60,6 +60,24 @@ class TableNames:
     open_monitor_compat_view: str
 
 
+
+
+def _to_bool(value: object, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "y", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "n", "off"}:
+            return False
+    return default
+
+
 class SchemaManager:
     def __init__(self, engine: Engine, *, db_name: str | None = None) -> None:
         self.engine = engine
@@ -80,10 +98,30 @@ class SchemaManager:
         self._ensure_candidates_view(
             tables.candidates_view, tables.signal_events_table, tables.indicator_table
         )
-        self._ensure_candidates_compat_view(
-            VIEW_STRATEGY_MA5_MA20_CANDIDATES,
-            tables.candidates_view,
-        )
+        schema_cfg = get_section("schema") or {}
+        open_monitor_cfg = get_section("open_monitor") or {}
+        compat_views_enabled = True
+        if isinstance(schema_cfg, dict):
+            compat_views_enabled = _to_bool(schema_cfg.get("compat_views"), True)
+        if isinstance(open_monitor_cfg, dict) and ("compat_candidates_view" in open_monitor_cfg):
+            compat_views_enabled = _to_bool(
+                open_monitor_cfg.get("compat_candidates_view"),
+                compat_views_enabled,
+            )
+
+        if compat_views_enabled:
+            self._ensure_candidates_compat_view(
+                VIEW_STRATEGY_MA5_MA20_CANDIDATES,
+                tables.candidates_view,
+            )
+        else:
+            # feat: 禁用旧候选兼容视图创建，推动迁移到 v_strategy_signal_candidates
+            self._drop_relation_any(VIEW_STRATEGY_MA5_MA20_CANDIDATES)
+            self.logger.info(
+                "已禁用候选兼容视图 %s，请改用 %s。",
+                VIEW_STRATEGY_MA5_MA20_CANDIDATES,
+                tables.candidates_view,
+            )
         if tables.candidates_as_view:
             self._drop_relation_any(tables.candidates_table)
         else:
@@ -918,6 +956,7 @@ class SchemaManager:
         def _col(name: str) -> str | None:
             return name if name in meta else None
 
+        # feat: reason 字段优先使用 final_reason，减少下游口径回填
         field_exprs = [
             "e.`sig_date`",
             "e.`code`",
@@ -926,7 +965,7 @@ class SchemaManager:
             "COALESCE(e.`final_action`, e.`signal`) AS `final_action`",
             "COALESCE(e.`final_reason`, e.`reason`) AS `final_reason`",
             "e.`final_cap`",
-            "e.`reason`",
+            "COALESCE(e.`final_reason`, e.`reason`) AS `reason`",
             "e.`risk_tag`",
             "e.`risk_note`",
             "e.`extra_json`",
@@ -1107,7 +1146,13 @@ class SchemaManager:
         )
         with self.engine.begin() as conn:
             conn.execute(stmt)
-        self.logger.info("已创建/更新候选兼容视图 %s（基于 %s）。", compat_view, base_view)
+        self.logger.warning(
+            "DEPRECATED: 已创建/更新候选兼容视图 %s（基于 %s）。请迁移到 %s；"
+            "可在 config.yaml 设置 schema.compat_views=false 或 open_monitor.compat_candidates_view=false 禁用创建。",
+            compat_view,
+            base_view,
+            base_view,
+        )
 
     def _ensure_trade_metrics_table(self) -> None:
         columns = {

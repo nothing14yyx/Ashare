@@ -141,16 +141,20 @@ def main() -> None:
     ensured_env_ready: bool = False
 
     def _load_latest_trade_date() -> str | None:
-        """尽量从日线/指标表解析最新交易日，用于自动补齐环境快照。"""
+        """尽量解析最新交易日，用于自动补齐环境快照。
+
+        约束：
+        - 不再回退读取 open_monitor.indicator_table（该字段仅为旧配置兼容，不应再作为调度入口依赖）；
+        - 优先 daily_table.date；若无日线表，则回退 ready_signals_view.sig_date。
+        """
         base_table = runner._daily_table()
         date_col = "date"
         if not runner._table_exists(base_table):
-            indicator_table = str(getattr(runner.params, "indicator_table", "") or "").strip()
-            if indicator_table and runner._table_exists(indicator_table):
-                base_table = indicator_table
-                date_col = "trade_date"
-            else:
+            view = str(getattr(runner.params, "ready_signals_view", "") or "").strip()
+            if not view or (not runner._table_exists(view)):
                 return None
+            base_table = view
+            date_col = "sig_date"
         try:
             with runner.db_writer.engine.begin() as conn:
                 df = pd.read_sql_query(

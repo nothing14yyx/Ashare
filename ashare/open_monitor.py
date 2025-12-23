@@ -23,9 +23,6 @@ import logging
 import hashlib
 import json
 import math
-import time
-import urllib.parse
-import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Tuple
@@ -52,12 +49,37 @@ from .schema_manager import (
 from .utils.convert import to_float as _to_float
 from .utils.logger import setup_logger
 from .weekly_env_builder import WeeklyEnvironmentBuilder
+from .monitor_rules import MonitorRuleConfig, build_default_monitor_rules
+from .open_monitor_quotes import (
+    fetch_quotes_akshare,
+    fetch_quotes_eastmoney,
+    normalize_quotes_columns,
+)
+from .open_monitor_rules import (
+    DecisionContext,
+    DecisionResult,
+    MarketEnvironment,
+    Rule,
+    RuleEngine,
+    RuleHit,
+    RuleResult,
+)
 
 
 SNAPSHOT_HASH_EXCLUDE = {
     "checked_at",
     "run_id",
 }
+
+READY_SIGNALS_REQUIRED_COLS = (
+    "sig_date",
+    "code",
+    "strategy_code",
+    "close",
+    "ma20",
+    "atr14",
+)
+
 
 
 def _normalize_snapshot_value(value: Any) -> Any:  # noqa: ANN401
@@ -99,72 +121,6 @@ def make_snapshot_hash(row: Dict[str, Any]) -> str:
         payload, sort_keys=True, ensure_ascii=False, separators=(",", ":")
     )
     return hashlib.md5(serialized.encode("utf-8")).hexdigest()
-
-
-def normalize_quotes_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """将不同来源行情列统一成 open_monitor 契约列。
-
-    统一后的列：
-    - live_open/live_high/live_low/live_latest/live_volume/live_amount
-    - 可选：live_pct_change、prev_close 等
-    """
-
-    if not isinstance(df, pd.DataFrame):
-        return pd.DataFrame(
-            columns=[
-                "code",
-                "live_open",
-                "live_high",
-                "live_low",
-                "live_latest",
-                "live_volume",
-                "live_amount",
-                "live_pct_change",
-                "prev_close",
-            ]
-        )
-
-    out = df.copy()
-
-    mapping: Dict[str, str] = {
-        # 统一英文列
-        "open": "live_open",
-        "high": "live_high",
-        "low": "live_low",
-        "latest": "live_latest",
-        "volume": "live_volume",
-        "amount": "live_amount",
-        "pct_change": "live_pct_change",
-        "gap_pct": "live_gap_pct",
-        "intraday_vol_ratio": "live_intraday_vol_ratio",
-        # 统一中文列（以 akshare spot 为主）
-        "今开": "live_open",
-        "最高": "live_high",
-        "最低": "live_low",
-        "最新价": "live_latest",
-        "成交量": "live_volume",
-        "成交额": "live_amount",
-        "涨跌幅": "live_pct_change",
-        "昨收": "prev_close",
-    }
-
-    rename_cols = {k: v for k, v in mapping.items() if k in out.columns and v not in out.columns}
-    if rename_cols:
-        out = out.rename(columns=rename_cols)
-
-    # 确保统一列存在（即便为空行情，也保持契约列结构稳定）
-    for col in (
-        "live_open",
-        "live_high",
-        "live_low",
-        "live_latest",
-        "live_volume",
-        "live_amount",
-    ):
-        if col not in out.columns:
-            out[col] = None
-
-    return out
 
 
 def derive_index_gate_action(regime: str | None, position_hint: float | None) -> str | None:
@@ -508,6 +464,14 @@ class RuleEngine:
 # Default monitor rules (hard gates)
 # -------------------------
 from .monitor_rules import MonitorRuleConfig, build_default_monitor_rules
+
+
+@dataclass(frozen=True)
+class RunupMetrics:
+    runup_ref_price: float | None
+    runup_ref_source: str | None
+    runup_from_sigclose: float | None
+    runup_from_sigclose_atr: float | None
 
 
 def compute_runup_metrics(
@@ -1658,7 +1622,7 @@ class MA5MA20OpenMonitorRunner:
             )
             return None, [], pd.DataFrame()
 
-        required_view_cols = {"sig_date", "code", "strategy_code", "close", "ma20", "atr14"}
+        required_view_cols = set(READY_SIGNALS_REQUIRED_COLS)
         view_cols = set(self._get_table_columns(view))
         missing_view_cols = sorted(required_view_cols - view_cols)
         if missing_view_cols:
@@ -1789,11 +1753,7 @@ class MA5MA20OpenMonitorRunner:
             self.logger.info("%s 内无 BUY 信号，跳过开盘监测。", signal_dates)
             return latest_trade_date, signal_dates, events_df
 
-        # 统一字段口径
-        if "final_action" in events_df.columns and "signal" in events_df.columns:
-            events_df["signal"] = events_df["final_action"].fillna(events_df["signal"])
-        if "final_reason" in events_df.columns and "reason" in events_df.columns:
-            events_df["reason"] = events_df["final_reason"].fillna(events_df["reason"])
+        # feat: 统一字段口径由 ready_signals_view 保证，避免 Python 端回填
 
         if "code" in events_df.columns:
             events_df["code"] = events_df["code"].astype(str)
@@ -1805,6 +1765,7 @@ class MA5MA20OpenMonitorRunner:
             "sig_date",
             "code",
             "strategy_code",
+            "signal",
             "close",
             "ma20",
             "atr14",
@@ -2262,186 +2223,12 @@ class MA5MA20OpenMonitorRunner:
         return row
 
     def _fetch_quotes_akshare(self, codes: List[str]) -> pd.DataFrame:
-        try:
-            import akshare as ak  # type: ignore
-        except Exception as exc:  # noqa: BLE001
-            self.logger.info("AkShare 不可用（将回退）：%s", exc)
-            return normalize_quotes_columns(pd.DataFrame())
-
-        digits = {_strip_baostock_prefix(c) for c in codes}
-        try:
-            spot = ak.stock_zh_a_spot_em()
-        except Exception as exc:  # noqa: BLE001
-            self.logger.warning("AkShare 行情拉取失败（将回退）：%s", exc)
-            return normalize_quotes_columns(pd.DataFrame())
-
-        if spot is None or getattr(spot, "empty", True):
-            return normalize_quotes_columns(pd.DataFrame())
-
-        rename_map = {
-            "代码": "symbol",
-            "名称": "name",
-            "最新价": "latest",
-            "涨跌幅": "pct_change",
-            "今开": "open",
-            "昨收": "prev_close",
-            "最高": "high",
-            "最低": "low",
-            "成交量": "volume",
-            "成交额": "amount",
-        }
-        for k in list(rename_map.keys()):
-            if k not in spot.columns:
-                rename_map.pop(k, None)
-
-        spot = spot.rename(columns=rename_map)
-        if "symbol" not in spot.columns:
-            return normalize_quotes_columns(pd.DataFrame())
-
-        spot["symbol"] = spot["symbol"].astype(str)
-        spot = spot[spot["symbol"].isin(digits)].copy()
-        if spot.empty:
-            return normalize_quotes_columns(pd.DataFrame())
-
-        out = pd.DataFrame()
-        out["code"] = spot["symbol"].apply(lambda x: _to_baostock_code("auto", str(x)))
-        out["symbol"] = spot["symbol"].astype(str)
-        out["name"] = spot.get("name", pd.Series([""] * len(spot))).astype(str)
-        out["open"] = spot.get("open", pd.Series([None] * len(spot))).apply(_to_float)
-        out["latest"] = spot.get("latest", pd.Series([None] * len(spot))).apply(_to_float)
-        out["prev_close"] = spot.get("prev_close", pd.Series([None] * len(spot))).apply(_to_float)
-        out["high"] = spot.get("high", pd.Series([None] * len(spot))).apply(_to_float)
-        out["low"] = spot.get("low", pd.Series([None] * len(spot))).apply(_to_float)
-        out["volume"] = spot.get("volume", pd.Series([None] * len(spot))).apply(_to_float)
-        out["amount"] = spot.get("amount", pd.Series([None] * len(spot))).apply(_to_float)
-        out["pct_change"] = spot.get("pct_change", pd.Series([None] * len(spot))).apply(_to_float)
-
-        mapping = {_strip_baostock_prefix(c): c for c in codes}
-        out["code"] = out["symbol"].map(mapping).fillna(out["code"])
-        out = normalize_quotes_columns(out)
-        required = ["code", "live_open", "live_high", "live_low", "live_latest", "live_volume", "live_amount"]
-        missing = [c for c in required if c not in out.columns]
-        if missing:
-            msg = f"akshare 行情缺少统一列：{missing}"
-            if bool(getattr(self.params, "strict_quotes", True)):
-                raise RuntimeError(msg)
-            self.logger.error("%s（strict_quotes=false，将补空列）", msg)
-            for c in missing:
-                out[c] = None
-        return out.reset_index(drop=True)
-
-    def _urlopen_json_no_proxy(self, url: str, *, timeout: int = 10, retries: int = 2) -> Dict[str, Any]:
-        """访问东财接口并返回 JSON（默认不使用环境代理）。
-
-        说明：urllib 默认会读取环境变量代理；这里强制 ProxyHandler({})，避免被 HTTP(S)_PROXY 影响。
-        """
-
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/123.0 Safari/537.36"
-            ),
-            "Accept": "application/json, text/plain, */*",
-            "Referer": "https://quote.eastmoney.com/",
-            "Connection": "close",
-        }
-        req = urllib.request.Request(url, headers=headers)
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-
-        last_exc: Exception | None = None
-        for i in range(retries + 1):
-            try:
-                with opener.open(req, timeout=timeout) as resp:
-                    raw = resp.read().decode("utf-8", errors="ignore")
-                return json.loads(raw) if raw else {}
-            except Exception as exc:  # noqa: BLE001
-                last_exc = exc
-                if i < retries:
-                    time.sleep(0.5 * (2**i))
-                    continue
-                raise
+        strict_quotes = bool(getattr(self.params, "strict_quotes", True))
+        return fetch_quotes_akshare(codes, strict_quotes=strict_quotes, logger=self.logger)
 
     def _fetch_quotes_eastmoney(self, codes: List[str]) -> pd.DataFrame:
-        if not codes:
-            return normalize_quotes_columns(pd.DataFrame())
-
-        base_url = "https://push2.eastmoney.com/api/qt/ulist.np/get"
-        fields = "f2,f3,f4,f5,f6,f12,f14,f15,f16,f17,f18"
-        secids = [_to_eastmoney_secid(c) for c in codes]
-
-        batch_size = 80
-        rows: List[Dict[str, Any]] = []
-        for i in range(0, len(secids), batch_size):
-            part = secids[i : i + batch_size]
-            query = {
-                "fltt": "2",
-                "invt": "2",
-                "fields": fields,
-                "secids": ",".join(part),
-            }
-            url = f"{base_url}?{urllib.parse.urlencode(query)}"
-            try:
-                payload = self._urlopen_json_no_proxy(url, timeout=10, retries=2)
-            except Exception as exc:  # noqa: BLE001
-                self.logger.error("Eastmoney 行情请求失败：%s", exc)
-                continue
-
-            data = (payload or {}).get("data") or {}
-            diff = data.get("diff") or []
-            if isinstance(diff, list):
-                rows.extend([r for r in diff if isinstance(r, dict)])
-
-        if not rows:
-            return normalize_quotes_columns(pd.DataFrame())
-
-        out_rows: List[Dict[str, Any]] = []
-        mapping = {_strip_baostock_prefix(c): c for c in codes}
-        for r in rows:
-            symbol = str(r.get("f12") or "").strip()
-            name = str(r.get("f14") or "").strip()
-            latest = _to_float(r.get("f2"))
-            pct = _to_float(r.get("f3"))
-            high = _to_float(r.get("f15"))
-            low = _to_float(r.get("f16"))
-            open_px = _to_float(r.get("f17"))
-            prev_close = _to_float(r.get("f18"))
-            # Eastmoney 成交量单位为“手”，统一转换为“股”口径
-            volume = _to_float(r.get("f5"))
-            volume = volume * 100 if volume is not None else None
-            amount = _to_float(r.get("f6"))
-
-            code_guess = _to_baostock_code("auto", symbol)
-            code = mapping.get(symbol, code_guess)
-
-            out_rows.append(
-                {
-                    "code": code,
-                    "symbol": symbol,
-                    "name": name,
-                    "open": open_px,
-                    "latest": latest,
-                    "prev_close": prev_close,
-                    "high": high,
-                    "low": low,
-                    "volume": volume,
-                    "amount": amount,
-                    "pct_change": pct,
-                }
-            )
-
-        out_df = pd.DataFrame(out_rows)
-        out_df = normalize_quotes_columns(out_df)
-        required = ["code", "live_open", "live_high", "live_low", "live_latest", "live_volume", "live_amount"]
-        missing = [c for c in required if c not in out_df.columns]
-        if missing:
-            msg = f"eastmoney 行情缺少统一列：{missing}"
-            if bool(getattr(self.params, "strict_quotes", True)):
-                raise RuntimeError(msg)
-            self.logger.error("%s（strict_quotes=false，将补空列）", msg)
-            for c in missing:
-                out_df[c] = None
-        return out_df
+        strict_quotes = bool(getattr(self.params, "strict_quotes", True))
+        return fetch_quotes_eastmoney(codes, strict_quotes=strict_quotes, logger=self.logger)
 
     # -------------------------
     # Evaluate
