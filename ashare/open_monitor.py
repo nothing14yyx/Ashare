@@ -380,6 +380,40 @@ class DecisionContext:
                 )
             )
 
+    def export_result(self) -> "DecisionResult":
+        state = "OK"
+        if self.action == "SKIP":
+            state = "INVALID"
+        elif self.action == "WAIT":
+            state = "PENDING"
+        elif self.action == "UNKNOWN":
+            state = "UNKNOWN"
+
+        rule_hits_json = json.dumps([hit.to_dict() for hit in self.rule_hits], ensure_ascii=False)
+        summary_line = f"{state} {self.action} | {self.action_reason}"
+        return DecisionResult(
+            action=self.action,
+            action_reason=self.action_reason,
+            state=state,
+            status_reason=self.action_reason,
+            entry_exposure_cap=self.entry_exposure_cap,
+            env_gate_action=self.env_gate_action,
+            rule_hits_json=rule_hits_json,
+            summary_line=summary_line,
+        )
+
+
+@dataclass(frozen=True)
+class DecisionResult:
+    action: str
+    action_reason: str | None
+    state: str
+    status_reason: str | None
+    entry_exposure_cap: float | None
+    env_gate_action: str | None
+    rule_hits_json: str
+    summary_line: str
+
 
 class RuleEngine:
     def __init__(self, merge_gate_actions: Callable[..., str | None]) -> None:
@@ -409,14 +443,6 @@ class RuleEngine:
 # Default monitor rules (hard gates)
 # -------------------------
 from .monitor_rules import MonitorRuleConfig, build_default_monitor_rules
-
-
-MONITOR_RULE_CONFIG = MonitorRuleConfig()
-DEFAULT_MONITOR_RULES: list[Rule] = build_default_monitor_rules(
-    MONITOR_RULE_CONFIG,
-    Rule=Rule,
-    RuleResult=RuleResult,
-)
 
 
 def compute_runup_metrics(
@@ -517,31 +543,6 @@ class OpenMonitorParams:
     cross_valid_days: int = 3
     pullback_valid_days: int = 5
 
-    # 核心过滤规则
-    max_gap_up_pct: float = 0.05       # 今开相对昨收涨幅 > 5% → skip
-    max_gap_up_atr_mult: float = 1.5   # 动态高开阈值：gap_up > min(max_gap_up_pct, atr_mult*ATR/昨收) → skip
-    max_gap_down_pct: float = -0.03    # 今开相对昨收跌幅 < -3% → skip
-    min_open_vs_ma20_pct: float = 0.0  # 今开 < MA20*(1+min_open_vs_ma20_pct) → skip（默认需站上 MA20）
-    pullback_min_open_vs_ma20_pct: float = -0.01  # 回踩形态允许略低于 MA20 入场
-    limit_up_trigger_pct: float = 9.7  # 涨跌幅 >= 9.7% → 视为涨停/接近涨停，skip
-
-    # 追高过滤：入场价相对 MA5 乖离过大
-    max_entry_vs_ma5_pct: float = 0.08  # 入场价 > MA5*(1+8%) → skip
-
-    # 乖离/拉升阈值
-    runup_atr_max: float = 1.2  # 信号后最大拉升 / ATR > runup_atr_max → skip
-    runup_atr_tol: float = 0.02  # 运行容差：runup_from_sigclose_atr > runup_atr_max + tol
-    pullback_runup_atr_max: float = 1.5  # 回踩形态使用更宽松的拉升阈值
-    pullback_runup_dev_ma20_atr_min: float = 1.0  # 回踩形态仅在 dev_ma20_atr 超过该阈值时判定追高
-    dev_ma5_atr_max: float = 2.0
-    dev_ma20_atr_max: float = 2.5
-
-    # 风控：开盘入场价为基准的 ATR 止损
-    stop_atr_mult: float = 2.0         # trade_stop_ref = entry - stop_atr_mult*ATR
-
-    # 情绪过滤：信号日（昨日收盘）如果是接近涨停的大阳线，次日默认不追
-    signal_day_limit_up_pct: float = 0.095  # 9.5%（兼容“接近涨停”）
-
     # 输出控制
     write_to_db: bool = True
 
@@ -610,39 +611,12 @@ class OpenMonitorParams:
                 return val.strip().lower() in {"1", "true", "yes", "y", "on"}
             return bool(val)
 
-        def _get_float(key: str, default: float) -> float:
-            raw = sec.get(key, default)
-            parsed = _to_float(raw)
-            return default if parsed is None else float(parsed)
-
         def _get_int(key: str, default: int) -> int:
             raw = sec.get(key, default)
             try:
                 return int(raw)
             except Exception:
                 return default
-
-        def _normalize_ratio_pct(value: float, key: str) -> float:
-            normalized = value / 100.0 if abs(value) > 1.5 else value
-            if abs(value) > 1.5:
-                logger.info(
-                    "配置 %s 以百分数填写（%s），已按比例 %.4f 处理。",
-                    key,
-                    value,
-                    normalized,
-                )
-            return normalized
-
-        def _normalize_percent_value(value: float, key: str) -> float:
-            normalized = value * 100.0 if abs(value) <= 1.5 else value
-            if abs(value) <= 1.5:
-                logger.info(
-                    "配置 %s 以小数比例填写（%s），已按百分数 %.2f%% 处理。",
-                    key,
-                    value,
-                    normalized,
-                )
-            return normalized
 
         quote_source = str(sec.get("quote_source", cls.quote_source)).strip().lower() or "auto"
         # 路线A：auto 也按 eastmoney 处理，避免误以为会优先 AkShare
@@ -686,53 +660,11 @@ class OpenMonitorParams:
             quote_source=quote_source,
             cross_valid_days=_get_int("cross_valid_days", cls.cross_valid_days),
             pullback_valid_days=_get_int("pullback_valid_days", cls.pullback_valid_days),
-            max_gap_up_pct=_normalize_ratio_pct(
-                _get_float("max_gap_up_pct", cls.max_gap_up_pct), "max_gap_up_pct"
-            ),
-            max_gap_up_atr_mult=_get_float("max_gap_up_atr_mult", cls.max_gap_up_atr_mult),
-            max_gap_down_pct=_normalize_ratio_pct(
-                _get_float("max_gap_down_pct", cls.max_gap_down_pct), "max_gap_down_pct"
-            ),
-            min_open_vs_ma20_pct=_normalize_ratio_pct(
-                _get_float("min_open_vs_ma20_pct", cls.min_open_vs_ma20_pct),
-                "min_open_vs_ma20_pct",
-            ),
-            pullback_min_open_vs_ma20_pct=_normalize_ratio_pct(
-                _get_float(
-                    "pullback_min_open_vs_ma20_pct", cls.pullback_min_open_vs_ma20_pct
-                ),
-                "pullback_min_open_vs_ma20_pct",
-            ),
-            limit_up_trigger_pct=_normalize_percent_value(
-                _get_float("limit_up_trigger_pct", cls.limit_up_trigger_pct),
-                "limit_up_trigger_pct",
-            ),
             index_code=str(sec.get("index_code", cls.index_code)).strip()
             or cls.index_code,
             index_hist_lookback_days=_get_int(
                 "index_hist_lookback_days", cls.index_hist_lookback_days
             ),
-
-            max_entry_vs_ma5_pct=_normalize_ratio_pct(
-                _get_float("max_entry_vs_ma5_pct", cls.max_entry_vs_ma5_pct),
-                "max_entry_vs_ma5_pct",
-            ),
-            runup_atr_max=_get_float("runup_atr_max", cls.runup_atr_max),
-            runup_atr_tol=_get_float("runup_atr_tol", cls.runup_atr_tol),
-            pullback_runup_atr_max=_get_float(
-                "pullback_runup_atr_max", cls.pullback_runup_atr_max
-            ),
-            pullback_runup_dev_ma20_atr_min=_get_float(
-                "pullback_runup_dev_ma20_atr_min", cls.pullback_runup_dev_ma20_atr_min
-            ),
-            dev_ma5_atr_max=_get_float("dev_ma5_atr_max", cls.dev_ma5_atr_max),
-            dev_ma20_atr_max=_get_float("dev_ma20_atr_max", cls.dev_ma20_atr_max),
-            stop_atr_mult=_get_float("stop_atr_mult", cls.stop_atr_mult),
-            signal_day_limit_up_pct=_normalize_ratio_pct(
-                _get_float("signal_day_limit_up_pct", cls.signal_day_limit_up_pct),
-                "signal_day_limit_up_pct",
-            ),
-
             write_to_db=_get_bool("write_to_db", cls.write_to_db),
             incremental_write=_get_bool("incremental_write", cls.incremental_write),
             incremental_export_timestamp=_get_bool(
@@ -768,6 +700,16 @@ class MA5MA20OpenMonitorRunner:
     def __init__(self) -> None:
         self.logger = setup_logger()
         self.params = OpenMonitorParams.from_config()
+        self.rule_config = MonitorRuleConfig.from_config(
+            get_section("open_monitor"),
+            logger=self.logger,
+        )
+        self.rules = build_default_monitor_rules(
+            self.rule_config,
+            Rule=Rule,
+            RuleResult=RuleResult,
+        )
+        self.rule_engine = RuleEngine(self._merge_gate_actions)
         self.db_writer = MySQLWriter(DatabaseConfig.from_env())
         self.volume_ratio_threshold = self._resolve_volume_ratio_threshold()
         app_cfg = get_section("app") or {}
@@ -782,23 +724,14 @@ class MA5MA20OpenMonitorRunner:
             board_cfg = {}
         self.board_env_enabled = bool(board_cfg.get("enabled", False))
         self.board_spot_enabled = bool(board_cfg.get("spot_enabled", True))
-        om_cfg = get_section("open_monitor") or {}
-        threshold = _to_float(om_cfg.get("env_index_score_threshold"))
-        self.env_index_score_threshold = threshold if threshold is not None else 2.0
-        weekly_strength_threshold = _to_float(
-            om_cfg.get("weekly_soft_gate_strength_threshold")
-        )
-        self.weekly_soft_gate_strength_threshold = (
-            weekly_strength_threshold if weekly_strength_threshold is not None else 3.5
-        )
         self.env_builder = WeeklyEnvironmentBuilder(
             db_writer=self.db_writer,
             logger=self.logger,
             index_codes=self.index_codes,
             board_env_enabled=self.board_env_enabled,
             board_spot_enabled=self.board_spot_enabled,
-            env_index_score_threshold=self.env_index_score_threshold,
-            weekly_soft_gate_strength_threshold=self.weekly_soft_gate_strength_threshold,
+            env_index_score_threshold=self.rule_config.env_index_score_threshold,
+            weekly_soft_gate_strength_threshold=self.rule_config.weekly_soft_gate_strength_threshold,
         )
         self.weekly_env_fallback_asof_date: str | None = None
         self._ready_signals_used: bool = False
@@ -2800,20 +2733,19 @@ class MA5MA20OpenMonitorRunner:
         env_weekly_risk_levels: List[str | None] = []
         env_weekly_scene_list: List[str | None] = []
 
-        max_up = self.params.max_gap_up_pct
-        max_up_atr_mult = self.params.max_gap_up_atr_mult
-        max_down = self.params.max_gap_down_pct
-        min_vs_ma20 = self.params.min_open_vs_ma20_pct
-        pullback_min_vs_ma20 = self.params.pullback_min_open_vs_ma20_pct
-        limit_up_trigger = self.params.limit_up_trigger_pct
-        stop_atr_mult = self.params.stop_atr_mult
-        runup_atr_max = self.params.runup_atr_max
-        pullback_runup_atr_max = self.params.pullback_runup_atr_max
-        pullback_runup_dev_ma20_atr_min = self.params.pullback_runup_dev_ma20_atr_min
+        max_up = self.rule_config.max_gap_up_pct
+        max_up_atr_mult = self.rule_config.max_gap_up_atr_mult
+        max_down = self.rule_config.max_gap_down_pct
+        min_vs_ma20 = self.rule_config.min_open_vs_ma20_pct
+        pullback_min_vs_ma20 = self.rule_config.pullback_min_open_vs_ma20_pct
+        limit_up_trigger = self.rule_config.limit_up_trigger_pct
+        stop_atr_mult = self.rule_config.stop_atr_mult
+        runup_atr_max = self.rule_config.runup_atr_max
+        pullback_runup_atr_max = self.rule_config.pullback_runup_atr_max
+        pullback_runup_dev_ma20_atr_min = self.rule_config.pullback_runup_dev_ma20_atr_min
+        runup_atr_tol = self.rule_config.runup_atr_tol
         cross_valid_days = self.params.cross_valid_days
         pullback_valid_days = self.params.pullback_valid_days
-
-        rule_engine = RuleEngine(self._merge_gate_actions)
 
         for _, row in merged.iterrows():
             sig_reason_text = str(row.get("sig_reason") or row.get("reason") or "")
@@ -2905,7 +2837,7 @@ class MA5MA20OpenMonitorRunner:
                 breach, breach_reason = evaluate_runup_breach(
                     runup_metrics,
                     runup_atr_max=runup_limit,
-                    runup_atr_tol=self.params.runup_atr_tol,
+                    runup_atr_tol=runup_atr_tol,
                     dev_ma20_atr=dev_ma20_atr_val,
                     dev_ma20_atr_min=pullback_runup_dev_ma20_atr_min if is_pullback else None,
                 )
@@ -2925,18 +2857,22 @@ class MA5MA20OpenMonitorRunner:
                 runup_breach=breach,
                 runup_breach_reason=breach_reason,
             )
-            rule_engine.apply(ctx, DEFAULT_MONITOR_RULES)
+            self.rule_engine.apply(ctx, self.rules)
 
 
-            action = ctx.action
-            action_reason = ctx.action_reason
+            result = ctx.export_result()
+
+            action = result.action
+            action_reason = result.action_reason
 
 
             trade_stop_ref = None
             if price_now is not None and sig_atr14 is not None:
                 trade_stop_ref = price_now - stop_atr_mult * sig_atr14
 
-            entry_cap = env.position_cap_pct
+            entry_cap = result.entry_exposure_cap
+            if entry_cap is None:
+                entry_cap = env.position_cap_pct
             sig_final_cap = _to_float(row.get("final_cap"))
             if sig_final_cap is not None:
                 entry_cap = sig_final_cap if entry_cap is None else min(entry_cap, sig_final_cap)
@@ -2944,24 +2880,15 @@ class MA5MA20OpenMonitorRunner:
             trade_stop_refs.append(trade_stop_ref)
             effective_stop_refs.append(trade_stop_ref)
 
-            state = "OK"
-            status_reason = action_reason
-            if action == "SKIP":
-                state = "INVALID"
-            elif action == "WAIT":
-                state = "PENDING"
-            elif action == "UNKNOWN":
-                state = "UNKNOWN"
-
-            states.append(state)
-            status_reasons.append(status_reason)
+            states.append(result.state)
+            status_reasons.append(result.status_reason)
             actions.append(action)
             action_reasons.append(action_reason)
             signal_kinds.append("PULLBACK" if is_pullback else "CROSS")
-            rule_hits_json_list.append(json.dumps([h.to_dict() for h in ctx.rule_hits], ensure_ascii=False))
-            summary_lines.append(f"{state} {action} | {action_reason}")
+            rule_hits_json_list.append(result.rule_hits_json)
+            summary_lines.append(result.summary_line)
             env_index_snapshot_hashes.append(env.index_snapshot_hash)
-            env_final_gate_action_list.append(env.gate_action)
+            env_final_gate_action_list.append(result.env_gate_action or env.gate_action)
             env_regimes.append(env.regime)
             env_position_hints.append(env.position_hint)
             env_weekly_asof_trade_dates.append(env.weekly_asof_trade_date)
