@@ -2158,25 +2158,7 @@ class MA5MA20OpenMonitorRunner:
 
 
     def _parse_market_environment(self, env_context: dict[str, Any] | None) -> MarketEnvironment:
-        if not isinstance(env_context, dict):
-            return MarketEnvironment()
-
-        gate_action = env_context.get("env_final_gate_action")
-        if gate_action is not None:
-            gate_action = str(gate_action).strip().upper()
-
-        return MarketEnvironment(
-            gate_action=gate_action,
-            position_cap_pct=_to_float(env_context.get("env_final_cap_pct")),
-            reason_json=env_context.get("env_final_reason_json"),
-            index_snapshot_hash=env_context.get("env_index_snapshot_hash"),
-            regime=env_context.get("regime"),
-            position_hint=_to_float(env_context.get("position_hint")),
-            weekly_asof_trade_date=env_context.get("weekly_asof_trade_date"),
-            weekly_risk_level=env_context.get("weekly_risk_level"),
-            weekly_scene=env_context.get("weekly_scene_code"),
-            raw=env_context,
-        )
+        return MarketEnvironment.from_snapshot(env_context)
 
 
     def _prepare_monitor_frame(

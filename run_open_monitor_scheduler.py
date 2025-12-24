@@ -11,6 +11,7 @@
   - 这是一个前台常驻脚本（Ctrl+C 退出）。
   - 默认严格对齐“整点分钟边界”：00/05/10/... 或 00/10/20/...
   - 每次触发都会执行 ashare.open_monitor.MA5MA20OpenMonitorRunner().run(force=True)
+  - 如果缺少当次 (monitor_date, run_id) 环境快照，会在触发前自动 build_and_persist_env_snapshot 补齐
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ from datetime import timedelta
 import time
 
 import pandas as pd
+from sqlalchemy import text
 
 from ashare.config import get_section
 from ashare.open_monitor import MA5MA20OpenMonitorRunner
@@ -44,7 +46,7 @@ def _next_run_at(now: dt.datetime, interval_min: int) -> dt.datetime:
     if next_minute < 60:
         return base.replace(minute=next_minute)
     # 进位到下一小时
-    return (base.replace(minute=0) + dt.timedelta(hours=1))
+    return base.replace(minute=0) + dt.timedelta(hours=1)
 
 
 def _default_interval_from_config() -> int:
@@ -78,9 +80,9 @@ def _is_trading_day(runner: MA5MA20OpenMonitorRunner, d: dt.date) -> bool:
         # 覆盖一小段范围，便于缓存复用
         start = d - timedelta(days=30)
         end = d + timedelta(days=30)
-        ok = runner._load_trading_calendar(start, end)  # 复用 runner 内置缓存（交易日已过滤）
+        ok = runner._load_trading_calendar(start, end)  # noqa: SLF001
         if ok:
-            return d.isoformat() in runner._calendar_cache
+            return d.isoformat() in runner._calendar_cache  # noqa: SLF001
     except Exception:
         pass
     return d.weekday() < 5
@@ -106,7 +108,32 @@ def _next_trading_start(ts: dt.datetime, runner: MA5MA20OpenMonitorRunner) -> dt
             return dt.datetime.combine(today, start)
         if start <= t <= end:
             return ts
-    return dt.datetime.combine(today + dt.timedelta(days=1), TRADING_WINDOWS[0][0])
+
+    nxt = _next_trading_day(today + dt.timedelta(days=1), runner)
+    return dt.datetime.combine(nxt, TRADING_WINDOWS[0][0])
+
+
+def _env_snapshot_exists(
+    runner: MA5MA20OpenMonitorRunner, *, monitor_date: str, run_id: str
+) -> bool:
+    table = str(getattr(runner.params, "env_snapshot_table", "") or "").strip()
+    if not table:
+        return False
+    if not runner._table_exists(table):  # noqa: SLF001
+        return False
+    stmt = text(
+        f"""
+        SELECT 1 FROM `{table}`
+        WHERE `run_id` = :b AND `monitor_date` = :d
+        LIMIT 1
+        """
+    )
+    try:
+        with runner.db_writer.engine.begin() as conn:
+            row = conn.execute(stmt, {"b": run_id, "d": monitor_date}).fetchone()
+            return row is not None
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def main() -> None:
@@ -137,8 +164,8 @@ def main() -> None:
     if interval_min <= 0:
         raise ValueError("interval must be positive")
 
-    ensured_monitor_date: str | None = None
-    ensured_env_ready: bool = False
+    ensured_key: tuple[str, str] | None = None
+    ensured_ready: bool = False
 
     def _load_latest_trade_date() -> str | None:
         """尽量解析最新交易日，用于自动补齐环境快照。
@@ -147,11 +174,11 @@ def main() -> None:
         - 不再回退读取 open_monitor.indicator_table（该字段仅为旧配置兼容，不应再作为调度入口依赖）；
         - 优先 daily_table.date；若无日线表，则回退 ready_signals_view.sig_date。
         """
-        base_table = runner._daily_table()
+        base_table = runner._daily_table()  # noqa: SLF001
         date_col = "date"
-        if not runner._table_exists(base_table):
+        if not runner._table_exists(base_table):  # noqa: SLF001
             view = str(getattr(runner.params, "ready_signals_view", "") or "").strip()
-            if not view or (not runner._table_exists(view)):
+            if not view or (not runner._table_exists(view)):  # noqa: SLF001
                 return None
             base_table = view
             date_col = "sig_date"
@@ -170,88 +197,112 @@ def main() -> None:
             return None
         return str(val)[:10]
 
-    def _ensure_env_snapshot(now: dt.datetime) -> str:
-        nonlocal ensured_monitor_date, ensured_env_ready
+    def _ensure_env_snapshot(trigger_at: dt.datetime) -> tuple[str, str]:
+        nonlocal ensured_key, ensured_ready
 
-        trade_day = _next_trading_day(now.date(), runner)
+        trade_day = _next_trading_day(trigger_at.date(), runner)
         monitor_date = trade_day.isoformat()
-        if ensured_monitor_date == monitor_date and ensured_env_ready:
-            return monitor_date
 
-        # 1) 严格检查：当日快照必须存在（不允许静默回退）
-        env_context = runner.load_env_snapshot_context(
-            monitor_date, None, allow_fallback=False
-        )
-        if env_context:
-            ensured_monitor_date = monitor_date
-            ensured_env_ready = True
-            return monitor_date
+        # open_monitor 严格按 run_id 匹配，因此这里必须用当前触发点计算 run_id
+        run_id = runner._calc_run_id(trigger_at)  # noqa: SLF001
+        key = (monitor_date, run_id)
 
-        # 2) 自动补齐：尝试构建并落库 env snapshot
+        if ensured_key == key and ensured_ready:
+            return monitor_date, run_id
+
+        if _env_snapshot_exists(runner, monitor_date=monitor_date, run_id=run_id):
+            ensured_key = key
+            ensured_ready = True
+            return monitor_date, run_id
+
         latest_trade_date = _load_latest_trade_date()
-        if latest_trade_date:
+        if not latest_trade_date:
+            logger.warning(
+                "无法解析 latest_trade_date，跳过自动补齐环境快照（monitor_date=%s, run_id=%s）。",
+                monitor_date,
+                run_id,
+            )
+            ensured_key = key
+            ensured_ready = False
+            return monitor_date, run_id
+
+        # 兜底：避免触发点跨 run_id 桶（±60s）
+        candidate_times = [
+            trigger_at - dt.timedelta(seconds=60),
+            trigger_at,
+            trigger_at + dt.timedelta(seconds=60),
+        ]
+        for ts in candidate_times:
+            rid = runner._calc_run_id(ts)  # noqa: SLF001
+            if not rid:
+                continue
+            if _env_snapshot_exists(runner, monitor_date=monitor_date, run_id=rid):
+                continue
             try:
                 runner.build_and_persist_env_snapshot(
                     latest_trade_date,
                     monitor_date=monitor_date,
-                    checked_at=now,
+                    run_id=rid,
+                    checked_at=ts,
                 )
                 logger.info(
-                    "已自动补齐环境快照（monitor_date=%s, latest_trade_date=%s）。",
+                    "已自动补齐环境快照（monitor_date=%s, run_id=%s, latest_trade_date=%s）。",
                     monitor_date,
+                    rid,
                     latest_trade_date,
                 )
             except Exception as exc:  # noqa: BLE001
-                logger.exception("自动补齐环境快照失败（monitor_date=%s）：%s", monitor_date, exc)
-        else:
+                logger.exception(
+                    "自动补齐环境快照失败（monitor_date=%s, run_id=%s）：%s",
+                    monitor_date,
+                    rid,
+                    exc,
+                )
+
+        ensured_key = key
+        ensured_ready = _env_snapshot_exists(runner, monitor_date=monitor_date, run_id=run_id)
+        if not ensured_ready:
             logger.warning(
-                "无法解析 latest_trade_date，跳过自动补齐环境快照（monitor_date=%s）。",
+                "环境快照仍不存在（monitor_date=%s, run_id=%s），open_monitor 可能会终止；建议检查 env_snapshot 写入或相关表/配置。",
                 monitor_date,
+                run_id,
             )
-
-        # 3) 重新加载（允许回退，避免极端情况下空跑）
-        env_context = runner.load_env_snapshot_context(
-            monitor_date, None, allow_fallback=True
-        )
-        if env_context:
-            ensured_monitor_date = monitor_date
-            ensured_env_ready = True
-            return monitor_date
-
-        logger.warning(
-            "未找到环境快照（monitor_date=%s），本次调度将继续但 open_monitor 可能返回空；建议先运行 run_index_weekly_channel。",
-            monitor_date,
-        )
-        ensured_monitor_date = monitor_date
-        ensured_env_ready = False
-        return monitor_date
-
-    _ensure_env_snapshot(dt.datetime.now())
+        return monitor_date, run_id
 
     logger.info("开盘监测调度器启动：interval=%s 分钟（整点对齐）", interval_min)
 
     try:
         while True:
             now = dt.datetime.now()
-            monitor_date = _ensure_env_snapshot(now)
             run_at = _next_run_at(now, interval_min)
+
             if not _in_trading_window(run_at):
                 next_start = _next_trading_start(run_at, runner)
                 if next_start > now:
                     logger.info(
-                        "当前不在交易时段，下一交易窗口：%s", next_start.strftime("%Y-%m-%d %H:%M:%S")
+                        "当前不在交易时段，下一交易窗口：%s",
+                        next_start.strftime("%Y-%m-%d %H:%M:%S"),
                     )
                 run_at = _next_run_at(next_start, interval_min)
+
             while not _in_trading_window(run_at):
-                next_start = _next_trading_start(run_at + dt.timedelta(minutes=interval_min))
+                next_start = _next_trading_start(run_at + dt.timedelta(minutes=interval_min), runner)
                 run_at = _next_run_at(next_start, interval_min)
-            sleep_s = (run_at - now).total_seconds()
+
+            sleep_s = (run_at - dt.datetime.now()).total_seconds()
             if sleep_s > 0:
                 logger.info("下一次触发：%s（%.1fs 后）", run_at.strftime("%Y-%m-%d %H:%M:%S"), sleep_s)
                 time.sleep(sleep_s)
 
-            # 到点执行
-            logger.info("触发开盘监测：%s", dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            trigger_at = dt.datetime.now()
+            monitor_date, run_id = _ensure_env_snapshot(trigger_at)
+
+            logger.info(
+                "触发开盘监测：%s（monitor_date=%s, run_id=%s）",
+                trigger_at.strftime("%Y-%m-%d %H:%M:%S"),
+                monitor_date,
+                run_id,
+            )
             try:
                 runner.run(force=True)
             except Exception as exc:  # noqa: BLE001

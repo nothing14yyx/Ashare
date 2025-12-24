@@ -36,6 +36,69 @@ class MarketEnvironment:
     weekly_scene: str | None = None
     raw: dict[str, Any] = field(default_factory=dict)
 
+    @classmethod
+    def from_snapshot(cls, snapshot: dict[str, Any] | None) -> "MarketEnvironment":
+        """从环境快照 dict 解析出强类型 MarketEnvironment。
+
+        约定快照 key：
+        - env_final_gate_action / env_final_cap_pct / env_final_reason_json
+        - env_index_snapshot_hash / regime / position_hint
+        - weekly_asof_trade_date / weekly_risk_level / weekly_scene_code
+
+        如果 snapshot 非 dict 或字段缺失，则返回尽可能完整的对象，缺失字段保持 None。
+        """
+
+        if not isinstance(snapshot, dict):
+            return cls()
+
+        def _to_float(val: Any) -> float | None:
+            if val is None:
+                return None
+            if isinstance(val, bool):
+                return float(val)
+            if isinstance(val, (int, float)):
+                fv = float(val)
+                if fv != fv:  # NaN
+                    return None
+                return fv
+            try:
+                s = str(val).strip()
+                if not s:
+                    return None
+                fv = float(s)
+                if fv != fv:
+                    return None
+                return fv
+            except Exception:
+                return None
+
+        gate_action = snapshot.get("env_final_gate_action")
+        if gate_action is None:
+            gate_action = snapshot.get("gate_action")
+        if gate_action is not None:
+            gate_action = str(gate_action).strip().upper() or None
+
+        position_cap = snapshot.get("env_final_cap_pct")
+        if position_cap is None:
+            position_cap = snapshot.get("position_cap_pct")
+
+        weekly_scene = snapshot.get("weekly_scene_code")
+        if weekly_scene is None:
+            weekly_scene = snapshot.get("weekly_scene")
+
+        return cls(
+            gate_action=gate_action,
+            position_cap_pct=_to_float(position_cap),
+            reason_json=snapshot.get("env_final_reason_json", snapshot.get("reason_json")),
+            index_snapshot_hash=snapshot.get("env_index_snapshot_hash", snapshot.get("index_snapshot_hash")),
+            regime=snapshot.get("regime"),
+            position_hint=_to_float(snapshot.get("position_hint")),
+            weekly_asof_trade_date=snapshot.get("weekly_asof_trade_date"),
+            weekly_risk_level=snapshot.get("weekly_risk_level"),
+            weekly_scene=weekly_scene,
+            raw=snapshot,
+        )
+
 
 @dataclass(frozen=True)
 class RuleHit:
