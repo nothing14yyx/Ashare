@@ -22,6 +22,7 @@ class MonitorRuleConfig:
     max_gap_down_pct: float = -0.03
     min_open_vs_ma20_pct: float = 0.0
     pullback_min_open_vs_ma20_pct: float = -0.01
+    below_ma20_tol_pct: float = 0.002
     limit_up_trigger_pct: float = 9.7
     max_entry_vs_ma5_pct: float = 0.08
     runup_atr_max: float = 1.2
@@ -45,8 +46,13 @@ class MonitorRuleConfig:
     enable_limit_up: bool = True
     enable_runup_breach: bool = True
 
+    enable_signal_expired: bool = True
+
     # --- thresholds ---
     chip_score_wait_threshold: float = 0.0
+
+    chip_score_allow_small_gate_action: str = "ALLOW_SMALL"
+    chip_score_allow_small_cap: float = 0.1
 
     # --- actions & reasons ---
     env_stop_action: str = "SKIP"
@@ -68,9 +74,14 @@ class MonitorRuleConfig:
     runup_breach_action: str = "WAIT"
     runup_breach_fallback_reason: str = "拉升过快"
 
+
+    signal_expired_action: str = "SKIP"
+    signal_expired_reason: str = "信号已过期"
+
     # --- severity ---
     sev_env_stop: int = 100
     sev_env_wait: int = 90
+    sev_signal_expired: int = 85
     sev_chip_score: int = 80
     sev_quote_missing: int = 75
     sev_gap_up: int = 70
@@ -141,6 +152,10 @@ class MonitorRuleConfig:
                 _get_float("pullback_min_open_vs_ma20_pct", defaults.pullback_min_open_vs_ma20_pct),
                 "pullback_min_open_vs_ma20_pct",
             ),
+            below_ma20_tol_pct=_normalize_ratio_pct(
+                _get_float("below_ma20_tol_pct", defaults.below_ma20_tol_pct),
+                "below_ma20_tol_pct",
+            ),
             limit_up_trigger_pct=_normalize_percent_value(
                 _get_float("limit_up_trigger_pct", defaults.limit_up_trigger_pct),
                 "limit_up_trigger_pct",
@@ -180,8 +195,21 @@ class MonitorRuleConfig:
             enable_below_ma20=_get_bool("enable_below_ma20", defaults.enable_below_ma20),
             enable_limit_up=_get_bool("enable_limit_up", defaults.enable_limit_up),
             enable_runup_breach=_get_bool("enable_runup_breach", defaults.enable_runup_breach),
+            enable_signal_expired=_get_bool(
+                "enable_signal_expired", defaults.enable_signal_expired
+            ),
             chip_score_wait_threshold=_get_float(
                 "chip_score_wait_threshold", defaults.chip_score_wait_threshold
+            ),
+            chip_score_allow_small_gate_action=str(
+                cfg.get(
+                    "chip_score_allow_small_gate_action",
+                    defaults.chip_score_allow_small_gate_action,
+                )
+            ).strip()
+            or defaults.chip_score_allow_small_gate_action,
+            chip_score_allow_small_cap=_get_float(
+                "chip_score_allow_small_cap", defaults.chip_score_allow_small_cap
             ),
             env_stop_action=str(cfg.get("env_stop_action", defaults.env_stop_action)).strip()
             or defaults.env_stop_action,
@@ -231,8 +259,17 @@ class MonitorRuleConfig:
                 cfg.get("runup_breach_fallback_reason", defaults.runup_breach_fallback_reason)
             ).strip()
             or defaults.runup_breach_fallback_reason,
+            signal_expired_action=str(
+                cfg.get("signal_expired_action", defaults.signal_expired_action)
+            ).strip()
+            or defaults.signal_expired_action,
+            signal_expired_reason=str(
+                cfg.get("signal_expired_reason", defaults.signal_expired_reason)
+            ).strip()
+            or defaults.signal_expired_reason,
             sev_env_stop=int(cfg.get("sev_env_stop", defaults.sev_env_stop)),
             sev_env_wait=int(cfg.get("sev_env_wait", defaults.sev_env_wait)),
+            sev_signal_expired=int(cfg.get("sev_signal_expired", defaults.sev_signal_expired)),
             sev_chip_score=int(cfg.get("sev_chip_score", defaults.sev_chip_score)),
             sev_quote_missing=int(cfg.get("sev_quote_missing", defaults.sev_quote_missing)),
             sev_gap_up=int(cfg.get("sev_gap_up", defaults.sev_gap_up)),
@@ -255,6 +292,24 @@ def build_default_monitor_rules(
     - 通过注入 Rule / RuleResult 类型，避免 monitor_rules 直接 import open_monitor 引发循环依赖。
     - predicate 依赖 DecisionContext 上的字段（由 open_monitor 在 per-row 构造 ctx 时填充）。
     """
+
+    def _get_weekly_gate_action(ctx: Any) -> str | None:
+        env = getattr(ctx, "env", None)
+        if env is None:
+            return None
+        raw = getattr(env, "raw", None)
+        if not isinstance(raw, dict):
+            return None
+        val = (
+            raw.get("env_weekly_gate_action")
+            or raw.get("weekly_gate_action")
+            or raw.get("env_weekly_gate_policy")
+            or raw.get("weekly_gate_policy")
+        )
+        if val is None:
+            return None
+        norm = str(val).strip().upper()
+        return norm or None
 
     return [
         Rule(
@@ -285,6 +340,22 @@ def build_default_monitor_rules(
                 action_override=config.env_wait_action,
             ),
         ),
+        # feat: SIGNAL_EXPIRED 过期信号直接跳过
+        Rule(
+            id="SIGNAL_EXPIRED",
+            category="ACTION",
+            severity=config.sev_signal_expired,
+            predicate=lambda ctx: bool(
+                config.enable_signal_expired
+                and getattr(ctx, "signal_age", None) is not None
+                and getattr(ctx, "valid_days", None) is not None
+                and getattr(ctx, "signal_age") > getattr(ctx, "valid_days")
+            ),
+            effect=lambda ctx: RuleResult(
+                reason=config.signal_expired_reason,
+                action_override=config.signal_expired_action,
+            ),
+        ),
         Rule(
             id="CHIP_SCORE_NEG",
             category="ACTION",
@@ -294,9 +365,17 @@ def build_default_monitor_rules(
                 and getattr(ctx, "chip_score", None) is not None
                 and getattr(ctx, "chip_score") < config.chip_score_wait_threshold
             ),
-            effect=lambda ctx: RuleResult(
-                reason=config.chip_score_reason,
-                action_override=config.chip_score_action,
+            effect=lambda ctx: (
+                RuleResult(
+                    reason=f"{config.chip_score_reason}({config.chip_score_allow_small_gate_action})",
+                    action_override="EXECUTE",
+                    cap_override=config.chip_score_allow_small_cap,
+                )
+                if _get_weekly_gate_action(ctx) == config.chip_score_allow_small_gate_action
+                else RuleResult(
+                    reason=config.chip_score_reason,
+                    action_override=config.chip_score_action,
+                )
             ),
         ),
         Rule(
@@ -348,7 +427,7 @@ def build_default_monitor_rules(
                 and getattr(ctx, "price_now", None) is not None
                 and getattr(ctx, "sig_ma20", None) is not None
                 and getattr(ctx, "ma20_thresh", None) is not None
-                and getattr(ctx, "price_now") < getattr(ctx, "sig_ma20") * (1 + getattr(ctx, "ma20_thresh"))
+                and getattr(ctx, "price_now") < getattr(ctx, "sig_ma20") * (1 + getattr(ctx, "ma20_thresh") - config.below_ma20_tol_pct)
             ),
             effect=lambda ctx: RuleResult(
                 reason=config.below_ma20_reason,

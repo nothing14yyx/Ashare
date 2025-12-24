@@ -150,8 +150,9 @@ open_monitor:
   enabled: true
   # 兼容旧候选池视图（v_strategy_ma5_ma20_candidates），仅用于旧脚本/BI；建议关闭
   compat_candidates_view: false
+  # 以下两项仅供 SchemaManager 生成 ready_signals_view 时使用（open_monitor 运行时不直接读取这些表）
   # signal_events_table 默认沿用 strategy_ma5_ma20_trend.signal_events_table，可显式覆盖
-  # indicator_table 默认沿用 strategy_ma5_ma20_trend.indicator_table
+  # indicator_table 默认沿用 strategy_ma5_ma20_trend.indicator_table（用于补齐 close/ma*/atr 等指标列）
   # signal_events_table: strategy_signal_events
   # indicator_table: strategy_indicator_daily
   quote_table: strategy_open_monitor_quote

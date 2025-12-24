@@ -179,6 +179,9 @@ class DecisionContext:
     runup_breach: bool = False
     runup_breach_reason: str | None = None
 
+
+    signal_age: int | None = None
+    valid_days: int | None = None
     rule_hits: list[RuleHit] = field(default_factory=list)
 
     def record_hit(self, rule: Rule, result: RuleResult) -> None:

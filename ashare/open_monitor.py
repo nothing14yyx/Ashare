@@ -268,10 +268,7 @@ class OpenMonitorParams:
 
     enabled: bool = True
 
-    # 信号来源表：默认使用 strategy_signal_events
-    signal_events_table: str = TABLE_STRATEGY_SIGNAL_EVENTS
-    # DEPRECATED: open_monitor 不再依赖 strategy_indicator_daily（保留字段仅为兼容旧配置）
-    indicator_table: str = ""
+    # 信号输入：只接受 ready_signals_view（由 SchemaManager 负责生成/维护）
     ready_signals_view: str = VIEW_STRATEGY_READY_SIGNALS
     # 契约与 fail-fast（默认开启）
     strict_ready_signals_required: bool = True
@@ -336,24 +333,13 @@ class OpenMonitorParams:
         sec = get_section("open_monitor") or {}
         if not isinstance(sec, dict):
             sec = {}
-
-        # 默认信号事件表/策略 code 与 strategy_ma5_ma20_trend 保持一致（指标表已废弃）
-        default_indicator = cls.indicator_table
-        default_events = cls.signal_events_table
+        # 默认策略 code 与 strategy_ma5_ma20_trend 保持一致
         default_strategy_code = STRATEGY_CODE_MA5_MA20_TREND
 
         strat = get_section("strategy_ma5_ma20_trend") or {}
         if isinstance(strat, dict):
-            default_indicator = strat.get("indicator_table", cls.indicator_table)
-            default_events = (
-                strat.get("signal_events_table")
-                or strat.get("signals_table")
-                or cls.signal_events_table
-            )
             default_strategy_code = strat.get("strategy_code", STRATEGY_CODE_MA5_MA20_TREND)
         else:
-            default_indicator = cls.indicator_table
-            default_events = cls.signal_events_table
             default_strategy_code = STRATEGY_CODE_MA5_MA20_TREND
 
         logger = logging.getLogger(__name__)
@@ -389,12 +375,6 @@ class OpenMonitorParams:
 
         return cls(
             enabled=_get_bool("enabled", cls.enabled),
-            signal_events_table=str(
-                sec.get("signal_events_table", default_events)
-            ).strip()
-            or default_events,
-            indicator_table=str(sec.get("indicator_table", default_indicator)).strip()
-            or default_indicator,
             ready_signals_view=str(
                 sec.get("ready_signals_view", cls.ready_signals_view)
             ).strip()
@@ -1265,7 +1245,7 @@ class MA5MA20OpenMonitorRunner:
         signals: pd.DataFrame | None = None,
         ready_view: str | None = None,
     ) -> str | None:
-        """统一推导 latest_trade_date，避免对 indicator_table 的隐性依赖。
+        """统一推导 latest_trade_date，避免对基础数据表（如指标表）的隐性依赖。
 
         优先级：
         1) signals 中的 asof_trade_date / sig_date
@@ -1319,7 +1299,7 @@ class MA5MA20OpenMonitorRunner:
 
         约定：
         - open_monitor 只接受数据库视图 v_strategy_ready_signals 作为信号输入；
-        - 不再回退读取 signal_events_table、indicator_table 并在 Python 端手动 merge。
+        - 不再回退读取基础表并在 Python 端手动 merge。
         """
 
         view = str(self.params.ready_signals_view or "").strip()
@@ -1615,38 +1595,12 @@ class MA5MA20OpenMonitorRunner:
             return pd.DataFrame()
 
         daily_table = self._daily_table()
-        events_table = self.params.signal_events_table
         if not daily_table or not self._table_exists(daily_table):
             return pd.DataFrame()
 
         codes = [str(c) for c in codes if str(c).strip()]
         if not codes:
             return pd.DataFrame()
-
-        stop_df = pd.DataFrame()
-        if events_table and self._table_exists(events_table):
-            try:
-                with self.db_writer.engine.begin() as conn:
-                    stop_df = pd.read_sql_query(
-                        text(
-                            f"""
-                            SELECT `sig_date`,`code`,`stop_ref`
-                            FROM `{events_table}`
-                            WHERE `sig_date` = :d
-                              AND `strategy_code` = :strategy
-                              AND `code` IN :codes
-                            """
-                        ).bindparams(bindparam("codes", expanding=True)),
-                        conn,
-                        params={
-                            "d": latest_trade_date,
-                            "codes": codes,
-                            "strategy": self.params.strategy_code,
-                        },
-                    )
-            except Exception as exc:  # noqa: BLE001
-                self.logger.debug("读取 stop_ref 失败：%s", exc)
-                stop_df = pd.DataFrame()
 
         stmt = (
             text(
@@ -2504,6 +2458,15 @@ class MA5MA20OpenMonitorRunner:
                     dev_ma20_atr_min=pullback_runup_dev_ma20_atr_min if is_pullback else None,
                 )
 
+            signal_age = None
+            raw_signal_age = row.get("signal_age")
+            if raw_signal_age is not None:
+                try:
+                    if not pd.isna(raw_signal_age):
+                        signal_age = int(float(raw_signal_age))
+                except Exception:
+                    signal_age = None
+
             ctx = DecisionContext(
                 entry_exposure_cap=env.position_cap_pct,
                 env=env,
@@ -2515,6 +2478,8 @@ class MA5MA20OpenMonitorRunner:
                 max_gap_down=max_down,
                 sig_ma20=sig_ma20,
                 ma20_thresh=ma20_thresh,
+                signal_age=signal_age,
+                valid_days=valid_days,
                 limit_up_trigger=limit_up_trigger,
                 runup_breach=breach,
                 runup_breach_reason=breach_reason,

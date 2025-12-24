@@ -944,7 +944,19 @@ class SchemaManager:
             return
 
         ind_join = ""
-        ind_fields = ""
+        ind_fields = """
+              NULL AS `close`,
+              NULL AS `ma5`,
+              NULL AS `ma20`,
+              NULL AS `ma60`,
+              NULL AS `ma250`,
+              NULL AS `vol_ratio`,
+              NULL AS `macd_hist`,
+              NULL AS `kdj_k`,
+              NULL AS `kdj_d`,
+              NULL AS `atr14`,
+              NULL AS `yearline_state`
+            """
         if indicator_table and self._table_exists(indicator_table):
             ind_join = (
                 f"""
@@ -966,6 +978,9 @@ class SchemaManager:
               ind.`atr14`,
               ind.`yearline_state`
             """
+        elif indicator_table:
+            self.logger.warning("指标表 %s 不存在，ready_signals_view 将以 NULL 补齐指标列。", indicator_table)
+
 
         chip_join = ""
         chip_enabled = False
