@@ -60,11 +60,6 @@ database:
   pool_recycle: 1800
   pool_timeout: 30
 
-schema:
-  # 是否创建 DEPRECATED 的兼容视图（例如 v_strategy_ma5_ma20_candidates / open_monitor_compat_view 等）
-  # 关闭后 ensure_schema/ensure_all 会在启动时自动清理这些旧对象。
-  compat_views: false
-
 proxy:
   http: http://127.0.0.1:7890
   https: http://127.0.0.1:7890
@@ -148,8 +143,6 @@ strategy_ma5_ma20_trend:
 # 开盘监测：检查“前一交易日收盘 BUY 信号”是否可在今日开盘执行
 open_monitor:
   enabled: true
-  # 兼容旧候选池视图（v_strategy_ma5_ma20_candidates），仅用于旧脚本/BI；建议关闭
-  compat_candidates_view: false
   # 以下两项仅供 SchemaManager 生成 ready_signals_view 时使用（open_monitor 运行时不直接读取这些表）
   # signal_events_table 默认沿用 strategy_ma5_ma20_trend.signal_events_table，可显式覆盖
   # indicator_table 默认沿用 strategy_ma5_ma20_trend.indicator_table（用于补齐 close/ma*/atr 等指标列）

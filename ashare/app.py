@@ -402,63 +402,6 @@ class AshareApp:
         self.db_writer.write_dataframe(df, table_name)
         return table_name
 
-    def _table_exists(self, table: str) -> bool:
-        try:
-            with self.db_writer.engine.begin() as conn:
-                inspector = inspect(conn)
-                return inspector.has_table(table)
-        except Exception:  # noqa: BLE001
-            return False
-
-    def _create_recent_history_view(
-        self,
-        base_table: str,
-        window_days: int,
-        end_day: dt.date,
-        view_name: str | None = None,
-    ) -> str:
-        view = view_name or f"history_recent_{window_days}_days"
-        sanitized_days = max(1, int(window_days))
-        cutoff_date = end_day.isoformat()
-
-        drop_view_sql = text(f"DROP VIEW IF EXISTS `{view}`")
-        drop_table_sql = text(f"DROP TABLE IF EXISTS `{view}`")
-        create_view_sql = text(
-            """
-            CREATE OR REPLACE VIEW `{view}` AS
-            SELECT b.*
-            FROM `{base}` AS b
-            JOIN (
-                SELECT `date`
-                FROM (
-                    SELECT DISTINCT `date`
-                    FROM `{base}`
-                    WHERE `date` <= '{cutoff}'
-                    ORDER BY `date` DESC
-                    LIMIT {window}
-                ) AS d
-            ) AS recent_dates ON b.`date` = recent_dates.`date`
-            """.format(
-                view=view,
-                base=base_table,
-                cutoff=cutoff_date,
-                window=sanitized_days,
-            )
-        )
-
-        with self.db_writer.engine.begin() as conn:
-            conn.execute(drop_view_sql)
-            conn.execute(drop_table_sql)
-            conn.execute(create_view_sql)
-
-        self.logger.info(
-            "已创建视图 %s，按 %s 截止选取最近 %s 个交易日的日线窗口。",
-            view,
-            cutoff_date,
-            sanitized_days,
-        )
-        return view
-
     def _create_recent_history_calendar_view(
         self,
         base_table: str,
@@ -698,8 +641,11 @@ class AshareApp:
         return max(1, min(self.resume_min_rows_per_code, dynamic_threshold))
 
     def _table_exists(self, table_name: str) -> bool:
-        inspector = inspect(self.db_writer.engine)
-        return inspector.has_table(table_name)
+        try:
+            inspector = inspect(self.db_writer.engine)
+            return inspector.has_table(table_name)
+        except Exception:  # noqa: BLE001
+            return False
 
     def _load_table(self, table_name: str) -> pd.DataFrame:
         """从数据库读取整表；表不存在则返回空 DataFrame。"""

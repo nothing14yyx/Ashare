@@ -25,8 +25,6 @@ TABLE_STRATEGY_SIGNAL_CANDIDATES = "strategy_signal_candidates"
 VIEW_STRATEGY_SIGNAL_CANDIDATES = "v_strategy_signal_candidates"
 # 策略准备就绪信号（含筹码）
 VIEW_STRATEGY_READY_SIGNALS = "v_strategy_ready_signals"
-# 兼容旧版本候选池视图（历史命名）：避免遗留 view 引用失效
-VIEW_STRATEGY_MA5_MA20_CANDIDATES = "v_strategy_ma5_ma20_candidates"
 TABLE_STRATEGY_CHIP_FILTER = "strategy_chip_filter"
 TABLE_STRATEGY_TRADE_METRICS = "strategy_trade_metrics"
 VIEW_STRATEGY_BACKTEST = "v_backtest"
@@ -39,8 +37,6 @@ TABLE_STRATEGY_OPEN_MONITOR_QUOTE = "strategy_open_monitor_quote"
 VIEW_STRATEGY_OPEN_MONITOR_WIDE = "v_strategy_open_monitor_wide"
 # 开盘监测默认查询视图（精简字段；完整字段请查 v_strategy_open_monitor_wide）
 VIEW_STRATEGY_OPEN_MONITOR = "strategy_open_monitor"
-# 兼容旧版本开盘监测视图（历史命名）：用于清理遗留对象
-VIEW_OPEN_MONITOR_COMPAT_LEGACY = "open_monitor_compat_view"
 # 大盘/指数环境快照
 TABLE_ENV_INDEX_SNAPSHOT = "strategy_env_index_snapshot"
 
@@ -59,7 +55,6 @@ class TableNames:
     open_monitor_view: str
     open_monitor_wide_view: str
     open_monitor_quote_table: str
-    open_monitor_compat_view: str
 
 
 
@@ -100,40 +95,16 @@ class SchemaManager:
         self._ensure_candidates_view(
             tables.candidates_view, tables.signal_events_table, tables.indicator_table
         )
-        schema_cfg = get_section("schema") or {}
-        open_monitor_cfg = get_section("open_monitor") or {}
+        # feat: 移除旧兼容视图逻辑，启动时清理遗留对象并强制使用新命名
+        legacy_objects = ("v_strategy_ma5_ma20_candidates", "open_monitor_compat_view")
+        protected_objects = {tables.candidates_view, tables.open_monitor_view, tables.open_monitor_wide_view}
+        for legacy_name in legacy_objects:
+            if legacy_name in protected_objects:
+                continue
+            if self._view_exists(legacy_name) or self._table_exists(legacy_name):
+                self._drop_relation_any(legacy_name)
+                self.logger.info("已清理遗留兼容对象 %s。", legacy_name)
 
-        schema_compat_views_enabled = False
-        if isinstance(schema_cfg, dict) and ("compat_views" in schema_cfg):
-            schema_compat_views_enabled = _to_bool(schema_cfg.get("compat_views"), False)
-
-        # compat_candidates_view: 仅控制候选池历史命名兼容（v_strategy_ma5_ma20_candidates）
-        compat_candidates_view_enabled = schema_compat_views_enabled
-        if isinstance(open_monitor_cfg, dict) and ("compat_candidates_view" in open_monitor_cfg):
-            compat_candidates_view_enabled = _to_bool(
-                open_monitor_cfg.get("compat_candidates_view"),
-                compat_candidates_view_enabled,
-            )
-
-        # 开盘监测兼容视图：仅由 schema.compat_views 控制（避免与候选池兼容开关互相影响）
-        compat_open_monitor_view_enabled = schema_compat_views_enabled
-
-        if compat_candidates_view_enabled:
-            self._ensure_candidates_compat_view(
-                VIEW_STRATEGY_MA5_MA20_CANDIDATES,
-                tables.candidates_view,
-            )
-        else:
-            compat_exists = self._view_exists(VIEW_STRATEGY_MA5_MA20_CANDIDATES) or self._table_exists(
-                VIEW_STRATEGY_MA5_MA20_CANDIDATES
-            )
-            if compat_exists:
-                self._drop_relation_any(VIEW_STRATEGY_MA5_MA20_CANDIDATES)
-                self.logger.info(
-                    "已禁用候选兼容视图 %s，请改用 %s。",
-                    VIEW_STRATEGY_MA5_MA20_CANDIDATES,
-                    tables.candidates_view,
-                )
         if tables.candidates_as_view:
             self._drop_relation_any(tables.candidates_table)
         else:
@@ -153,21 +124,6 @@ class SchemaManager:
         self._ensure_open_monitor_quote_table(tables.open_monitor_quote_table)
         self._ensure_env_snapshot_table(tables.env_snapshot_table)
         self._ensure_env_index_snapshot_table(tables.env_index_snapshot_table)
-        open_monitor_compat_view = tables.open_monitor_compat_view
-        if not compat_open_monitor_view_enabled:
-            legacy_open_monitor_views = {open_monitor_compat_view, VIEW_OPEN_MONITOR_COMPAT_LEGACY}
-            for legacy_view in legacy_open_monitor_views:
-                if (
-                    legacy_view
-                    and legacy_view not in {tables.open_monitor_view, tables.open_monitor_wide_view}
-                    and (self._view_exists(legacy_view) or self._table_exists(legacy_view))
-                ):
-                    self._drop_relation_any(legacy_view)
-                    self.logger.info(
-                        "已禁用开盘监测兼容视图 %s，请改用 %s。",
-                        legacy_view,
-                        tables.open_monitor_view,
-                    )
 
         self._ensure_open_monitor_view(
             tables.open_monitor_view,
@@ -176,7 +132,6 @@ class SchemaManager:
             tables.env_snapshot_table,
             tables.env_index_snapshot_table,
             tables.open_monitor_quote_table,
-            open_monitor_compat_view if compat_open_monitor_view_enabled else "",
         )
 
     def get_table_names(self) -> TableNames:
@@ -269,15 +224,6 @@ class SchemaManager:
             ).strip()
             or TABLE_STRATEGY_OPEN_MONITOR_QUOTE
         )
-        open_monitor_compat_view = (
-            str(
-                open_monitor_cfg.get(
-                    "open_monitor_compat_view",
-                    VIEW_STRATEGY_OPEN_MONITOR,
-                )
-            ).strip()
-            or VIEW_STRATEGY_OPEN_MONITOR
-        )
 
         return TableNames(
             indicator_table=indicator_table,
@@ -292,7 +238,6 @@ class SchemaManager:
             open_monitor_view=open_monitor_view,
             open_monitor_wide_view=open_monitor_wide_view,
             open_monitor_quote_table=open_monitor_quote_table,
-            open_monitor_compat_view=open_monitor_compat_view,
         )
 
     # ---------- generic helpers ----------
@@ -1151,52 +1096,6 @@ class SchemaManager:
             conn.execute(stmt)
         self.logger.info("已创建/更新视图 %s（含筹码预计算）。", view)
 
-    def _ensure_candidates_compat_view(self, compat_view: str, base_view: str) -> None:
-        """兼容旧命名的候选池视图，防止遗留依赖报错。
-
-        典型场景：历史 view `v_strategy_ma5_ma20_candidates` 仍被外部脚本/BI 引用。
-        """
-        if not compat_view or not base_view:
-            return
-
-        # 兼容视图可能曾经被创建为 table/view，统一清理后重建
-        self._drop_relation_any(compat_view)
-
-        stmt = text(
-            f"""
-            CREATE OR REPLACE VIEW `{compat_view}` AS
-            SELECT
-              `sig_date` AS `date`,
-              `sig_date`,
-              `code`,
-              `strategy_code`,
-              `sig_signal` AS `signal`,
-              `sig_signal`,
-              `sig_reason` AS `reason`,
-              `sig_reason`,
-              `signal_age`,
-              `valid_days`,
-              `close`,
-              `ma5`,`ma20`,`ma60`,`ma250`,
-              `vol_ratio`,`macd_hist`,`kdj_k`,`kdj_d`,`atr14`,
-              `stop_ref`,
-              `yearline_state`,
-              `risk_tag`,`risk_note`,
-              `final_action`,`final_reason`,`final_cap`,
-              `extra_json`
-            FROM `{base_view}`
-            """
-        )
-        with self.engine.begin() as conn:
-            conn.execute(stmt)
-        self.logger.warning(
-            "DEPRECATED: 已创建/更新候选兼容视图 %s（基于 %s）。请迁移到 %s；"
-            "可在 config.yaml 设置 schema.compat_views=false 或 open_monitor.compat_candidates_view=false 禁用创建。",
-            compat_view,
-            base_view,
-            base_view,
-        )
-
     def _ensure_trade_metrics_table(self) -> None:
         columns = {
             "strategy_code": "VARCHAR(32) NOT NULL",
@@ -1594,7 +1493,6 @@ class SchemaManager:
         env_table: str,
         env_index_table: str,
         quote_table: str,
-        compat_view: str,
     ) -> None:
         if not (wide_view and eval_table and env_table and env_index_table):
             return
@@ -1782,19 +1680,6 @@ class SchemaManager:
             with self.engine.begin() as conn:
                 conn.execute(compact_stmt)
             self.logger.info("已创建/更新开盘监测精简视图 %s。", view)
-
-        target_for_compat = view or target_wide_view
-        if compat_view and compat_view not in {target_for_compat, target_wide_view}:
-            self._drop_relation_any(compat_view)
-            compat_stmt = text(
-                f"""
-                CREATE OR REPLACE VIEW `{compat_view}` AS
-                SELECT * FROM `{target_for_compat}`
-                """
-            )
-            with self.engine.begin() as conn:
-                conn.execute(compat_stmt)
-            self.logger.warning("DEPRECATED: 已创建/更新兼容视图 %s -> %s。", compat_view, target_for_compat)
 
 
 def ensure_schema() -> None:
