@@ -303,3 +303,25 @@ def fetch_quotes_eastmoney(
                 "pct_change": pct,
             }
         )
+
+    out = pd.DataFrame(out_rows)
+    out = normalize_quotes_columns(out)
+    required = [
+        "code",
+        "live_open",
+        "live_high",
+        "live_low",
+        "live_latest",
+        "live_volume",
+        "live_amount",
+    ]
+    missing = [c for c in required if c not in out.columns]
+    if missing:
+        msg = f"Eastmoney 行情缺少统一列：{missing}"
+        if strict_quotes:
+            raise RuntimeError(msg)
+        if logger is not None:
+            logger.error("%s（strict_quotes=false，将补空列）", msg)
+        for c in missing:
+            out[c] = None
+    return out.reset_index(drop=True)

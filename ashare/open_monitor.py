@@ -3086,7 +3086,7 @@ class MA5MA20OpenMonitorRunner:
         self.logger.info("待监测标的数量：%s（信号日：%s）", len(codes), signal_dates)
 
         quotes = self._fetch_quotes(codes)
-        if quotes.empty:
+        if quotes is None or quotes.empty:
             self.logger.warning("未获取到任何实时行情，将输出 UNKNOWN 结果。")
         else:
             self.logger.info("实时行情已获取：%s 条", len(quotes))
