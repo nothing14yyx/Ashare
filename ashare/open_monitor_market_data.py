@@ -34,7 +34,7 @@ class OpenMonitorMarketData:
             return {"index_code": code}
         row = df.iloc[0].to_dict()
         row["index_code"] = code
-        row["live_trade_date"] = dt.date.today().isoformat()
+        row["live_trade_date"] = row.get("live_trade_date") or row.get("trade_date") or row.get("date")
         return row
 
     def _fetch_quotes_akshare(self, codes: List[str]) -> pd.DataFrame:

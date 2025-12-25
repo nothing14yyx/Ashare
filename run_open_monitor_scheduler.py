@@ -26,6 +26,7 @@ from sqlalchemy import text
 
 from ashare.config import get_section
 from ashare.open_monitor import MA5MA20OpenMonitorRunner
+from ashare.env_snapshot_utils import load_trading_calendar
 from ashare.schema_manager import ensure_schema
 
 
@@ -77,16 +78,15 @@ def _in_trading_window(ts: dt.datetime) -> bool:
 def _is_trading_day(runner: MA5MA20OpenMonitorRunner, d: dt.date) -> bool:
     """判断是否交易日：优先用 baostock 交易日历，失败则回退工作日。"""
     try:
-        # 覆盖一小段范围，便于缓存复用
+        # 覆盖一小段范围，便于缓存复用（模块级缓存）。
         start = d - timedelta(days=30)
         end = d + timedelta(days=30)
-        ok = runner._load_trading_calendar(start, end)  # noqa: SLF001
-        if ok:
-            return d.isoformat() in runner._calendar_cache  # noqa: SLF001
+        calendar = load_trading_calendar(start, end)
+        if calendar:
+            return d.isoformat() in calendar
     except Exception:
         pass
     return d.weekday() < 5
-
 
 def _next_trading_day(d: dt.date, runner: MA5MA20OpenMonitorRunner) -> dt.date:
     """返回 >=d 的下一个交易日。"""

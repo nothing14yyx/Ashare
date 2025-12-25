@@ -36,6 +36,150 @@ def _load_trading_calendar(start: dt.date, end: dt.date) -> set[str]:
     )
     return {d.isoformat() for d in dates}
 
+# 模块级交易日历缓存：避免重复请求 baostock。
+_TRADING_CALENDAR_CACHE: set[str] = set()
+_TRADING_CALENDAR_RANGE: tuple[dt.date, dt.date] | None = None
+
+def load_trading_calendar(start: dt.date, end: dt.date) -> set[str]:
+    """加载交易日历并做模块级缓存。"""
+
+    global _TRADING_CALENDAR_CACHE, _TRADING_CALENDAR_RANGE
+    if (
+        _TRADING_CALENDAR_RANGE
+        and start >= _TRADING_CALENDAR_RANGE[0]
+        and end <= _TRADING_CALENDAR_RANGE[1]
+    ):
+        return _TRADING_CALENDAR_CACHE
+
+    current_start = start
+    current_end = end
+    if _TRADING_CALENDAR_RANGE:
+        current_start = min(_TRADING_CALENDAR_RANGE[0], start)
+        current_end = max(_TRADING_CALENDAR_RANGE[1], end)
+
+    calendar = _load_trading_calendar(current_start, current_end)
+    if calendar:
+        _TRADING_CALENDAR_CACHE = set(calendar)
+        _TRADING_CALENDAR_RANGE = (current_start, current_end)
+        return _TRADING_CALENDAR_CACHE
+    return set()
+
+# 模块级交易日历缓存：避免重复请求 baostock。
+_TRADING_CALENDAR_CACHE: set[str] = set()
+_TRADING_CALENDAR_RANGE: tuple[dt.date, dt.date] | None = None
+
+def load_trading_calendar(start: dt.date, end: dt.date) -> set[str]:
+    """加载交易日历并做模块级缓存。"""
+
+    global _TRADING_CALENDAR_CACHE, _TRADING_CALENDAR_RANGE
+    if (
+        _TRADING_CALENDAR_RANGE
+        and start >= _TRADING_CALENDAR_RANGE[0]
+        and end <= _TRADING_CALENDAR_RANGE[1]
+    ):
+        return _TRADING_CALENDAR_CACHE
+
+    current_start = start
+    current_end = end
+    if _TRADING_CALENDAR_RANGE:
+        current_start = min(_TRADING_CALENDAR_RANGE[0], start)
+        current_end = max(_TRADING_CALENDAR_RANGE[1], end)
+
+    calendar = _load_trading_calendar(current_start, current_end)
+    if calendar:
+        _TRADING_CALENDAR_CACHE = set(calendar)
+        _TRADING_CALENDAR_RANGE = (current_start, current_end)
+        return _TRADING_CALENDAR_CACHE
+    return set()
+
+
+# 模块级交易日历缓存：避免重复请求 baostock。
+_TRADING_CALENDAR_CACHE: set[str] = set()
+_TRADING_CALENDAR_RANGE: tuple[dt.date, dt.date] | None = None
+
+def load_trading_calendar(start: dt.date, end: dt.date) -> set[str]:
+    """加载交易日历并做模块级缓存。"""
+
+    global _TRADING_CALENDAR_CACHE, _TRADING_CALENDAR_RANGE
+    if (
+        _TRADING_CALENDAR_RANGE
+        and start >= _TRADING_CALENDAR_RANGE[0]
+        and end <= _TRADING_CALENDAR_RANGE[1]
+    ):
+        return _TRADING_CALENDAR_CACHE
+
+    current_start = start
+    current_end = end
+    if _TRADING_CALENDAR_RANGE:
+        current_start = min(_TRADING_CALENDAR_RANGE[0], start)
+        current_end = max(_TRADING_CALENDAR_RANGE[1], end)
+
+    calendar = _load_trading_calendar(current_start, current_end)
+    if calendar:
+        _TRADING_CALENDAR_CACHE = set(calendar)
+        _TRADING_CALENDAR_RANGE = (current_start, current_end)
+        return _TRADING_CALENDAR_CACHE
+    return set()
+
+
+# 模块级交易日历缓存：避免重复请求 baostock。
+_TRADING_CALENDAR_CACHE: set[str] = set()
+_TRADING_CALENDAR_RANGE: tuple[dt.date, dt.date] | None = None
+
+def load_trading_calendar(start: dt.date, end: dt.date) -> set[str]:
+    """加载交易日历并做模块级缓存。"""
+
+    global _TRADING_CALENDAR_CACHE, _TRADING_CALENDAR_RANGE
+    if (
+        _TRADING_CALENDAR_RANGE
+        and start >= _TRADING_CALENDAR_RANGE[0]
+        and end <= _TRADING_CALENDAR_RANGE[1]
+    ):
+        return _TRADING_CALENDAR_CACHE
+
+    current_start = start
+    current_end = end
+    if _TRADING_CALENDAR_RANGE:
+        current_start = min(_TRADING_CALENDAR_RANGE[0], start)
+        current_end = max(_TRADING_CALENDAR_RANGE[1], end)
+
+    calendar = _load_trading_calendar(current_start, current_end)
+    if calendar:
+        _TRADING_CALENDAR_CACHE = set(calendar)
+        _TRADING_CALENDAR_RANGE = (current_start, current_end)
+        return _TRADING_CALENDAR_CACHE
+    return set()
+
+
+# 模块级交易日历缓存：避免重复请求 baostock。
+_TRADING_CALENDAR_CACHE: set[str] = set()
+_TRADING_CALENDAR_RANGE: tuple[dt.date, dt.date] | None = None
+
+def load_trading_calendar(start: dt.date, end: dt.date) -> set[str]:
+    """加载交易日历并做模块级缓存。"""
+
+    global _TRADING_CALENDAR_CACHE, _TRADING_CALENDAR_RANGE
+    if (
+        _TRADING_CALENDAR_RANGE
+        and start >= _TRADING_CALENDAR_RANGE[0]
+        and end <= _TRADING_CALENDAR_RANGE[1]
+    ):
+        return _TRADING_CALENDAR_CACHE
+
+    current_start = start
+    current_end = end
+    if _TRADING_CALENDAR_RANGE:
+        current_start = min(_TRADING_CALENDAR_RANGE[0], start)
+        current_end = max(_TRADING_CALENDAR_RANGE[1], end)
+
+    calendar = _load_trading_calendar(current_start, current_end)
+    if calendar:
+        _TRADING_CALENDAR_CACHE = set(calendar)
+        _TRADING_CALENDAR_RANGE = (current_start, current_end)
+        return _TRADING_CALENDAR_CACHE
+    return set()
+
+
 
 def _resolve_latest_closed_week_end(latest_trade_date: str) -> tuple[str, bool]:
     trade_date = _parse_date(latest_trade_date)
@@ -44,7 +188,7 @@ def _resolve_latest_closed_week_end(latest_trade_date: str) -> tuple[str, bool]:
 
     week_start = trade_date - dt.timedelta(days=trade_date.weekday())
     week_end = week_start + dt.timedelta(days=6)
-    calendar = _load_trading_calendar(week_start - dt.timedelta(days=60), week_end)
+    calendar = load_trading_calendar(week_start - dt.timedelta(days=60), week_end)
 
     if calendar:
         last_trade_day = None

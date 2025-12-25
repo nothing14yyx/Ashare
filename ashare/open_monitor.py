@@ -270,7 +270,6 @@ class MA5MA20OpenMonitorRunner:
             self.logger,
             self.params,
             self.env_builder,
-            env_snapshot_utils,
         )
         self.evaluator = OpenMonitorEvaluator(
             self.logger, self.params, self.rule_engine, self.rule_config, self.rules

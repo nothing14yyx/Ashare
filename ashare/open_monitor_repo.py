@@ -15,7 +15,7 @@ from .baostock_core import BaostockDataFetcher
 from .baostock_session import BaostockSession
 from .config import get_section
 from .db import DatabaseConfig, MySQLWriter
-from .env_snapshot_utils import _load_trading_calendar
+from .env_snapshot_utils import load_trading_calendar
 from .ma5_ma20_trend_strategy import _atr, _macd
 from .utils.convert import to_float as _to_float
 
@@ -111,8 +111,6 @@ class OpenMonitorRepository:
         self._ready_signals_used: bool = False
         self._recent_buy_signals_cache_key = None
         self._recent_buy_signals_cache = None
-        self._calendar_cache: set[str] = set()
-        self._calendar_range: tuple[dt.date, dt.date] | None = None
 
     @property
     def ready_signals_used(self) -> bool:
@@ -174,26 +172,6 @@ class OpenMonitorRepository:
                 return name
         return "history_daily_kline"
 
-    def _load_trading_calendar(self, start: dt.date, end: dt.date) -> set[str]:
-        if (
-            self._calendar_range
-            and start >= self._calendar_range[0]
-            and end <= self._calendar_range[1]
-        ):
-            return self._calendar_cache
-
-        current_start = start
-        current_end = end
-        if self._calendar_range:
-            current_start = min(self._calendar_range[0], start)
-            current_end = max(self._calendar_range[1], end)
-
-        calendar = _load_trading_calendar(current_start, current_end)
-        if calendar:
-            self._calendar_cache = set(calendar)
-            self._calendar_range = (current_start, current_end)
-        return self._calendar_cache
-
     def _is_trading_day(self, date_str: str, latest_trade_date: str | None = None) -> bool:
         """粗略判断是否为交易日（优先用日线表，其次用工作日）。"""
 
@@ -207,7 +185,7 @@ class OpenMonitorRepository:
 
         target_str = d.isoformat()
         start = d - dt.timedelta(days=400)
-        calendar = self._load_trading_calendar(start, d)
+        calendar = load_trading_calendar(start, d)
         if calendar:
             return target_str in calendar
 

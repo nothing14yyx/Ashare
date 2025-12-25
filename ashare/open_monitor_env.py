@@ -43,12 +43,11 @@ def derive_index_gate_action(regime: str | None, position_hint: float | None) ->
 class OpenMonitorEnvService:
     """负责环境快照构建与加载的服务层。"""
 
-    def __init__(self, repo, logger, params, env_builder, calendar_utils) -> None:
+    def __init__(self, repo, logger, params, env_builder) -> None:
         self.repo = repo
         self.logger = logger
         self.params = params
         self.env_builder = env_builder
-        self.calendar_utils = calendar_utils
 
     def load_env_snapshot_context(
         self,
