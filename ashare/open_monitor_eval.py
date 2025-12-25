@@ -422,7 +422,9 @@ class OpenMonitorEvaluator:
             sig_stop_ref = _to_float(row.get("sig_stop_ref"))
             sig_stop_refs.append(sig_stop_ref)
 
-            price_now = _to_float(row.get("live_open")) or _to_float(row.get("live_latest"))
+            price_open = _to_float(row.get("live_open"))
+            price_latest = _to_float(row.get("live_latest"))
+            price_now = price_open if price_open is not None else price_latest
             ref_close = _resolve_ref_close(row)
             if price_now is None:
                 if run_id_norm == "PREOPEN" and ref_close is not None:
@@ -434,9 +436,12 @@ class OpenMonitorEvaluator:
 
             live_gap = None
             live_pct = None
-            if ref_close and price_now:
-                live_gap = (price_now - ref_close) / ref_close
-                live_pct = (price_now / ref_close - 1.0) * 100.0
+            if ref_close is not None and ref_close > 0:
+                gap_price = price_open if price_open is not None else price_latest
+                if gap_price is not None:
+                    live_gap = (gap_price - ref_close) / ref_close
+                if price_latest is not None:
+                    live_pct = (price_latest / ref_close - 1.0) * 100.0
             live_gap_list.append(live_gap)
             live_pct_change_list.append(live_pct)
 
