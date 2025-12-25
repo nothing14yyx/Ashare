@@ -339,8 +339,7 @@ class OpenMonitorEnvService:
         if isinstance(live_quote, dict):
             snapshot.update(
                 {
-                    "env_index_live_trade_date": live_quote.get("live_trade_date")
-                    or dt.date.today().isoformat(),
+                    "env_index_live_trade_date": live_quote.get("live_trade_date"),
                     "env_index_live_open": _to_float(live_quote.get("live_open") or live_quote.get("open")),
                     "env_index_live_high": _to_float(live_quote.get("live_high") or live_quote.get("high")),
                     "env_index_live_low": _to_float(live_quote.get("live_low") or live_quote.get("low")),
