@@ -395,6 +395,8 @@ class OpenMonitorEvaluator:
         env_index_snapshot_hashes: List[str | None] = []
         env_final_gate_action_list: List[str | None] = []
         env_regimes: List[str | None] = []
+        # feat: 补齐环境侧结构化字段（避免只剩 reason 文本）
+        env_index_scores: List[float | None] = []
         env_position_hints: List[float | None] = []
         env_weekly_asof_trade_dates: List[str | None] = []
         env_weekly_risk_levels: List[str | None] = []
@@ -607,6 +609,7 @@ class OpenMonitorEvaluator:
             env_index_snapshot_hashes.append(env.index_snapshot_hash)
             env_final_gate_action_list.append(result.env_gate_action or env.gate_action)
             env_regimes.append(env.regime)
+            env_index_scores.append(env.score)
             env_position_hints.append(env.position_hint)
             env_weekly_asof_trade_dates.append(env.weekly_asof_trade_date)
             env_weekly_risk_levels.append(env.weekly_risk_level)
@@ -631,6 +634,7 @@ class OpenMonitorEvaluator:
         merged["checked_at"] = checked_at_ts
         merged["run_id"] = run_id_val
         merged["env_regime"] = env_regimes
+        merged["env_index_score"] = env_index_scores
         merged["env_position_hint"] = env_position_hints
         merged["env_weekly_asof_trade_date"] = env_weekly_asof_trade_dates
         merged["env_weekly_risk_level"] = env_weekly_risk_levels

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import re
 from typing import Any, Callable
 
 import pandas as pd
@@ -168,6 +169,7 @@ class OpenMonitorEnvService:
             "weekly_money_proxy": weekly_scenario.get("weekly_money_proxy"),
             "weekly_note": weekly_scenario.get("weekly_note"),
             "regime": row.get("env_regime"),
+            "index_score": row.get("env_index_score"),
             "position_hint": row.get("env_position_hint"),
             "position_hint_raw": row.get("env_position_hint_raw"),
             "effective_position_hint": row.get("env_position_hint"),
@@ -207,6 +209,42 @@ class OpenMonitorEnvService:
         if env_context.get("position_hint") is None:
             env_context["position_hint"] = index_snapshot.get("env_index_position_cap")
             env_context["effective_position_hint"] = env_context["position_hint"]
+
+        # feat: 宽表需要 env_regime/env_index_score 等结构化字段；若库里缺失则从 gate_reason 或 index_trend 回填
+        gate_reason = index_snapshot.get("env_index_gate_reason") or ""
+        if env_context.get("regime") is None:
+            m = re.search(r"regime=([A-Z_]+)", gate_reason)
+            if m:
+                env_context["regime"] = m.group(1)
+
+        if env_context.get("position_hint") is None:
+            m = re.search(r"pos_hint=([0-9.]+)", gate_reason)
+            if m:
+                try:
+                    env_context["position_hint"] = float(m.group(1))
+                except ValueError:
+                    pass
+            env_context["effective_position_hint"] = env_context.get("position_hint")
+
+        if env_context.get("index_score") is None:
+            trend_trade_date = (
+                row.get("env_index_asof_trade_date")
+                or index_snapshot.get("env_index_asof_trade_date")
+                or index_snapshot.get("asof_trade_date")
+                or row.get("sig_date")
+                or row.get("monitor_date")
+            )
+            if trend_trade_date:
+                try:
+                    idx_trend = self.env_builder.load_index_trend(str(trend_trade_date))
+                    if isinstance(idx_trend, dict):
+                        env_context["index_score"] = idx_trend.get("env_index_score")
+                        env_context["regime"] = env_context.get("regime") or idx_trend.get("env_regime")
+                        if env_context.get("position_hint") is None:
+                            env_context["position_hint"] = idx_trend.get("env_position_hint")
+                        env_context["effective_position_hint"] = env_context.get("position_hint")
+                except Exception as e:
+                    logger.warning("load_index_trend fallback failed: %s", e)
 
         return env_context
 
