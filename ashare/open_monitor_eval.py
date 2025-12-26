@@ -762,6 +762,7 @@ class OpenMonitorEvaluator:
             "action_reason",
             "checked_at",
             "run_id",
+            "run_pk",
             "snapshot_hash",
         ]
 
@@ -829,6 +830,7 @@ class OpenMonitorEvaluator:
             "action_reason",
             "checked_at",
             "run_id",
+            "run_pk",
             "snapshot_hash",
         ]
 

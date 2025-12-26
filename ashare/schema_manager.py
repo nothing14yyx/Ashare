@@ -22,7 +22,8 @@ TABLE_A_SHARE_UNIVERSE = "a_share_universe"
 TABLE_STRATEGY_INDICATOR_DAILY = "strategy_indicator_daily"
 TABLE_STRATEGY_SIGNAL_EVENTS = "strategy_signal_events"
 TABLE_STRATEGY_SIGNAL_CANDIDATES = "strategy_signal_candidates"
-VIEW_STRATEGY_SIGNAL_CANDIDATES = "v_strategy_signal_candidates"
+VIEW_STRATEGY_SIGNAL_CANDIDATES_RAW = "v_strategy_signal_candidates_raw"
+VIEW_STRATEGY_SIGNAL_CANDIDATES_ACTIVE = "v_strategy_signal_candidates_active"
 # 策略准备就绪信号（含筹码）
 VIEW_STRATEGY_READY_SIGNALS = "v_strategy_ready_signals"
 TABLE_STRATEGY_CHIP_FILTER = "strategy_chip_filter"
@@ -34,9 +35,10 @@ VIEW_STRATEGY_PNL = "v_pnl"
 TABLE_STRATEGY_OPEN_MONITOR_EVAL = "strategy_open_monitor_eval"
 TABLE_STRATEGY_OPEN_MONITOR_ENV = "strategy_open_monitor_env"
 TABLE_STRATEGY_OPEN_MONITOR_QUOTE = "strategy_open_monitor_quote"
+TABLE_STRATEGY_OPEN_MONITOR_RUN = "strategy_open_monitor_run"
 VIEW_STRATEGY_OPEN_MONITOR_WIDE = "v_strategy_open_monitor_wide"
 # 开盘监测默认查询视图（精简字段；完整字段请查 v_strategy_open_monitor_wide）
-VIEW_STRATEGY_OPEN_MONITOR = "strategy_open_monitor"
+VIEW_STRATEGY_OPEN_MONITOR = "v_strategy_open_monitor"
 # 大盘/指数环境快照
 TABLE_ENV_INDEX_SNAPSHOT = "strategy_env_index_snapshot"
 
@@ -47,11 +49,13 @@ class TableNames:
     signal_events_table: str
     candidates_table: str
     candidates_view: str
+    candidates_raw_view: str
     candidates_as_view: bool
     ready_signals_view: str
     open_monitor_eval_table: str
     env_snapshot_table: str
     env_index_snapshot_table: str
+    open_monitor_run_table: str
     open_monitor_view: str
     open_monitor_wide_view: str
     open_monitor_quote_table: str
@@ -92,12 +96,25 @@ class SchemaManager:
         self._ensure_indicator_table(tables.indicator_table)
         self._ensure_signal_events_table(tables.signal_events_table)
         # candidates：统一以 candidates_view 作为下游入口；是否保留物化表由 candidates_as_view 控制
-        self._ensure_candidates_view(
-            tables.candidates_view, tables.signal_events_table, tables.indicator_table
+        self._ensure_candidates_views(
+            tables.candidates_raw_view,
+            tables.candidates_view,
+            tables.signal_events_table,
+            tables.indicator_table,
         )
         # feat: 移除旧兼容视图逻辑，启动时清理遗留对象并强制使用新命名
-        legacy_objects = ("v_strategy_ma5_ma20_candidates", "open_monitor_compat_view")
-        protected_objects = {tables.candidates_view, tables.open_monitor_view, tables.open_monitor_wide_view}
+        legacy_objects = (
+            "v_strategy_ma5_ma20_candidates",
+            "open_monitor_compat_view",
+            "v_strategy_signal_candidates",
+            "strategy_open_monitor",
+        )
+        protected_objects = {
+            tables.candidates_view,
+            tables.candidates_raw_view,
+            tables.open_monitor_view,
+            tables.open_monitor_wide_view,
+        }
         for legacy_name in legacy_objects:
             if legacy_name in protected_objects:
                 continue
@@ -121,6 +138,7 @@ class SchemaManager:
         self._ensure_v_pnl_view()
 
         self._ensure_open_monitor_eval_table(tables.open_monitor_eval_table)
+        self._ensure_open_monitor_run_table(tables.open_monitor_run_table)
         self._ensure_open_monitor_quote_table(tables.open_monitor_quote_table)
         self._ensure_env_snapshot_table(tables.env_snapshot_table)
         self._ensure_env_index_snapshot_table(tables.env_index_snapshot_table)
@@ -164,9 +182,10 @@ class SchemaManager:
             or TABLE_STRATEGY_SIGNAL_CANDIDATES
         )
         candidates_view = (
-            str(strat_cfg.get("candidates_view", VIEW_STRATEGY_SIGNAL_CANDIDATES)).strip()
-            or VIEW_STRATEGY_SIGNAL_CANDIDATES
+            str(strat_cfg.get("candidates_view", VIEW_STRATEGY_SIGNAL_CANDIDATES_ACTIVE)).strip()
+            or VIEW_STRATEGY_SIGNAL_CANDIDATES_ACTIVE
         )
+        candidates_raw_view = VIEW_STRATEGY_SIGNAL_CANDIDATES_RAW
         # 默认使用视图候选池（不落地表），避免 candidates 表冗余与维护成本
         raw_candidates_as_view = strat_cfg.get("candidates_as_view", True)
         if isinstance(raw_candidates_as_view, str):
@@ -183,6 +202,10 @@ class SchemaManager:
         open_monitor_eval_table = (
             str(open_monitor_cfg.get("output_table", TABLE_STRATEGY_OPEN_MONITOR_EVAL)).strip()
             or TABLE_STRATEGY_OPEN_MONITOR_EVAL
+        )
+        open_monitor_run_table = (
+            str(open_monitor_cfg.get("run_table", TABLE_STRATEGY_OPEN_MONITOR_RUN)).strip()
+            or TABLE_STRATEGY_OPEN_MONITOR_RUN
         )
         env_snapshot_table = (
             str(open_monitor_cfg.get("env_snapshot_table", TABLE_STRATEGY_OPEN_MONITOR_ENV)).strip()
@@ -230,11 +253,13 @@ class SchemaManager:
             signal_events_table=signal_events_table,
             candidates_table=candidates_table,
             candidates_view=candidates_view,
+            candidates_raw_view=candidates_raw_view,
             candidates_as_view=candidates_as_view,
             ready_signals_view=ready_signals_view,
             open_monitor_eval_table=open_monitor_eval_table,
             env_snapshot_table=env_snapshot_table,
             env_index_snapshot_table=env_index_snapshot_table,
+            open_monitor_run_table=open_monitor_run_table,
             open_monitor_view=open_monitor_view,
             open_monitor_wide_view=open_monitor_wide_view,
             open_monitor_quote_table=open_monitor_quote_table,
@@ -843,12 +868,19 @@ class SchemaManager:
         self._ensure_varchar_length(table, "final_reason", 255)
         self._ensure_numeric_column(table, "final_cap", "DOUBLE NULL")
 
-    def _ensure_candidates_view(
-        self, view: str, events_table: str, indicator_table: str
+    def _ensure_candidates_views(
+        self,
+        raw_view: str,
+        active_view: str,
+        events_table: str,
+        indicator_table: str,
     ) -> None:
-        stmt = text(
+        if not (raw_view and active_view and events_table and indicator_table):
+            return
+
+        raw_stmt = text(
             f"""
-            CREATE OR REPLACE VIEW `{view}` AS
+            CREATE OR REPLACE VIEW `{raw_view}` AS
             SELECT
               e.`sig_date`,
               e.`code`,
@@ -875,8 +907,20 @@ class SchemaManager:
             """
         )
         with self.engine.begin() as conn:
-            conn.execute(stmt)
-        self.logger.info("已创建/更新候选视图 %s。", view)
+            conn.execute(raw_stmt)
+        self.logger.info("已创建/更新候选视图 %s。", raw_view)
+
+        active_stmt = text(
+            f"""
+            CREATE OR REPLACE VIEW `{active_view}` AS
+            SELECT *
+            FROM `{raw_view}`
+            WHERE `signal_age` <= `valid_days`
+            """
+        )
+        with self.engine.begin() as conn:
+            conn.execute(active_stmt)
+        self.logger.info("已创建/更新候选视图 %s。", active_view)
 
     def _ensure_ready_signals_view(
         self,
@@ -1219,10 +1263,44 @@ class SchemaManager:
         self.logger.info("已创建/更新视图 %s。", view)
 
     # ---------- Open monitor ----------
+    def _ensure_open_monitor_run_table(self, table: str) -> None:
+        columns = {
+            "run_pk": "BIGINT NOT NULL AUTO_INCREMENT",
+            "monitor_date": "DATE NOT NULL",
+            "run_id": "VARCHAR(64) NOT NULL",
+            "triggered_at": "DATETIME(6) NULL",
+            "checked_at": "DATETIME(6) NULL",
+            "env_index_snapshot_hash": "VARCHAR(32) NULL",
+            "params_json": "VARCHAR(2000) NULL",
+        }
+        if not self._table_exists(table):
+            self._create_table(table, columns, primary_key=("run_pk",))
+        else:
+            self._add_missing_columns(table, columns)
+        self._ensure_date_column(table, "monitor_date", not_null=True)
+        self._ensure_datetime_column(table, "triggered_at")
+        self._ensure_datetime_column(table, "checked_at")
+        self._ensure_varchar_length(table, "run_id", 64)
+        self._ensure_varchar_length(table, "params_json", 2000)
+
+        unique_name = "ux_open_monitor_run"
+        if not self._index_exists(table, unique_name):
+            with self.engine.begin() as conn:
+                conn.execute(
+                    text(
+                        f"""
+                        CREATE UNIQUE INDEX `{unique_name}`
+                        ON `{table}` (`monitor_date`, `run_id`)
+                        """
+                    )
+                )
+            self.logger.info("开盘监测运行表 %s 已新增唯一索引 %s。", table, unique_name)
+
     def _ensure_open_monitor_quote_table(self, table: str) -> None:
         columns = {
             "monitor_date": "DATE NOT NULL",
             "run_id": "VARCHAR(64) NOT NULL",
+            "run_pk": "BIGINT NULL",
             "code": "VARCHAR(20) NOT NULL",
             "live_trade_date": "DATE NULL",
             "live_open": "DOUBLE NULL",
@@ -1262,6 +1340,7 @@ class SchemaManager:
             "monitor_date": "DATE NOT NULL",
             "sig_date": "DATE NOT NULL",
             "run_id": "VARCHAR(64) NOT NULL",
+            "run_pk": "BIGINT NULL",
             "asof_trade_date": "DATE NULL",
             "live_trade_date": "DATE NULL",
             "signal_age": "INT NULL",
@@ -1390,6 +1469,7 @@ class SchemaManager:
         columns = {
             "monitor_date": "DATE NOT NULL",
             "run_id": "VARCHAR(64) NOT NULL",
+            "run_pk": "BIGINT NULL",
             "checked_at": "DATETIME(6) NULL",
             "env_weekly_asof_trade_date": "DATE NULL",
             "env_weekly_risk_level": "VARCHAR(16) NULL",
@@ -1497,6 +1577,17 @@ class SchemaManager:
         if not (wide_view and eval_table and env_table and env_index_table):
             return
 
+        eval_cols = set(self._column_meta(eval_table).keys())
+        env_cols = set(self._column_meta(env_table).keys())
+        quote_cols = set(self._column_meta(quote_table).keys()) if quote_table else set()
+
+        join_on_run_pk = "run_pk" in eval_cols and "run_pk" in env_cols
+        env_join = (
+            "ON e.`run_pk` = env.`run_pk`"
+            if join_on_run_pk
+            else "ON e.`monitor_date` = env.`monitor_date` AND e.`run_id` = env.`run_id`"
+        )
+
         dim_stock_exists = self._table_exists("dim_stock_industry")
         board_dim_exists = self._table_exists("dim_stock_board_industry")
         stock_join = (
@@ -1526,11 +1617,16 @@ class SchemaManager:
         live_gap_expr = "e.`live_gap_pct`"
         live_intraday_expr = "e.`live_intraday_vol_ratio`"
         if quote_table and self._table_exists(quote_table):
+            quote_join_on_run_pk = "run_pk" in eval_cols and "run_pk" in quote_cols
+            quote_join_cond = (
+                "e.`run_pk` = q.`run_pk`"
+                if quote_join_on_run_pk
+                else "e.`monitor_date` = q.`monitor_date` AND e.`run_id` = q.`run_id`"
+            )
             quote_join = (
                 f"""
                 LEFT JOIN `{quote_table}` q
-                  ON e.`monitor_date` = q.`monitor_date`
-                 AND e.`run_id` = q.`run_id`
+                  ON {quote_join_cond}
                  AND e.`code` = q.`code`
                 """
             )
@@ -1549,6 +1645,7 @@ class SchemaManager:
               e.`monitor_date`,
               e.`sig_date`,
               e.`run_id`,
+              e.`run_pk`,
               e.`code`,
               {name_expr} AS `name`,
               {industry_expr} AS `industry`,
@@ -1623,7 +1720,7 @@ class SchemaManager:
               idx.`position_cap` AS `env_index_position_cap`
             FROM `{eval_table}` e
             LEFT JOIN `{env_table}` env
-              ON e.`monitor_date` = env.`monitor_date` AND e.`run_id` = env.`run_id`
+              {env_join}
             LEFT JOIN `{env_index_table}` idx
               ON e.`env_index_snapshot_hash` = idx.`snapshot_hash`
             {quote_join}
@@ -1640,6 +1737,7 @@ class SchemaManager:
                 "monitor_date",
                 "sig_date",
                 "run_id",
+                "run_pk",
                 "code",
                 "name",
                 "industry",

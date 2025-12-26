@@ -135,7 +135,7 @@ strategy_ma5_ma20_trend:
 
   # 用视图替代 candidates 表（更简洁：候选清单实时从 signals 最新日筛选）
   candidates_as_view: true
-  candidates_view: v_strategy_signal_candidates
+  candidates_view: v_strategy_signal_candidates_active
 
   # signals 写入范围：latest=仅最新交易日（默认），window=回填本次计算窗口内全部交易日
   signals_write_scope: window

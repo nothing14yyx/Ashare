@@ -23,6 +23,7 @@ from .utils.convert import to_float as _to_float
 SNAPSHOT_HASH_EXCLUDE = {
     "checked_at",
     "run_id",
+    "run_pk",
 }
 
 READY_SIGNALS_REQUIRED_COLS = (
@@ -874,6 +875,70 @@ class OpenMonitorRepository:
             df["code"] = df["code"].astype(str)
         return df
 
+    def ensure_run_context(
+        self,
+        monitor_date: str,
+        run_id: str,
+        *,
+        checked_at: dt.datetime | None,
+        triggered_at: dt.datetime | None = None,
+        env_index_snapshot_hash: str | None = None,
+        params_json: str | None = None,
+    ) -> int | None:
+        table = getattr(self.params, "run_table", None)
+        if not (table and monitor_date and run_id and self._table_exists(table)):
+            return None
+
+        parsed_monitor = pd.to_datetime(monitor_date, errors="coerce")
+        monitor_date_val = parsed_monitor.date() if not pd.isna(parsed_monitor) else monitor_date
+        payload = {
+            "monitor_date": monitor_date_val,
+            "run_id": run_id,
+            "triggered_at": triggered_at,
+            "checked_at": checked_at,
+            "env_index_snapshot_hash": env_index_snapshot_hash,
+            "params_json": params_json,
+        }
+        columns = list(payload.keys())
+        update_clause = """
+            `triggered_at` = COALESCE(`triggered_at`, VALUES(`triggered_at`)),
+            `checked_at` = VALUES(`checked_at`),
+            `env_index_snapshot_hash` = COALESCE(VALUES(`env_index_snapshot_hash`), `env_index_snapshot_hash`),
+            `params_json` = COALESCE(VALUES(`params_json`), `params_json`)
+        """
+        stmt = text(
+            f"""
+            INSERT INTO `{table}` ({", ".join(f"`{c}`" for c in columns)})
+            VALUES ({", ".join(f":{c}" for c in columns)})
+            ON DUPLICATE KEY UPDATE {update_clause}
+            """
+        )
+        try:
+            with self.engine.begin() as conn:
+                conn.execute(stmt, payload)
+        except Exception as exc:  # noqa: BLE001
+            self.logger.warning("写入开盘监测运行记录失败：%s", exc)
+            return None
+
+        try:
+            with self.engine.begin() as conn:
+                row = conn.execute(
+                    text(
+                        f"""
+                        SELECT `run_pk`
+                        FROM `{table}`
+                        WHERE `monitor_date` = :d AND `run_id` = :r
+                        LIMIT 1
+                        """
+                    ),
+                    {"d": monitor_date, "r": run_id},
+                ).fetchone()
+            if row:
+                return int(row[0])
+        except Exception as exc:  # noqa: BLE001
+            self.logger.debug("读取 run_pk 失败：%s", exc)
+        return None
+
     def env_snapshot_exists(self, monitor_date: str, run_id: str) -> bool:
         table = self.params.env_snapshot_table
         if not (table and monitor_date and run_id and self._table_exists(table)):
@@ -982,6 +1047,8 @@ class OpenMonitorRepository:
         run_id: str,
         checked_at: dt.datetime,
         env_weekly_gate_policy: str | None,
+        *,
+        run_pk: int | None = None,
     ) -> None:
         if not env_context:
             return
@@ -1005,6 +1072,7 @@ class OpenMonitorRepository:
 
         payload["monitor_date"] = monitor_date_val
         payload["run_id"] = run_id
+        payload["run_pk"] = run_pk
         payload["checked_at"] = checked_at
         env_weekly_asof = _get_env("weekly_asof_trade_date")
         if env_weekly_asof is not None:
@@ -1160,6 +1228,7 @@ class OpenMonitorRepository:
         keep_cols = [
             "monitor_date",
             "run_id",
+            "run_pk",
             "code",
             "live_trade_date",
             "live_open",
@@ -1180,6 +1249,8 @@ class OpenMonitorRepository:
         quotes["run_id"] = quotes["run_id"].fillna(
             calc_run_id(dt.datetime.now(), self.params.run_id_minutes)
         )
+        if "run_pk" not in quotes.columns:
+            quotes["run_pk"] = None
         quotes["code"] = quotes["code"].astype(str)
 
         monitor_dates = quotes["monitor_date"].dropna().astype(str).unique().tolist()
@@ -1233,6 +1304,8 @@ class OpenMonitorRepository:
         df["run_id"] = df["run_id"].fillna(
             calc_run_id(dt.datetime.now(), self.params.run_id_minutes)
         )
+        if "run_pk" not in df.columns:
+            df["run_pk"] = None
 
         for col in ["monitor_date", "sig_date", "asof_trade_date", "live_trade_date"]:
             if col in df.columns:

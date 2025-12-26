@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import logging
 import math
 from dataclasses import dataclass
@@ -46,6 +47,7 @@ from .schema_manager import (
     TABLE_STRATEGY_OPEN_MONITOR_ENV,
     TABLE_STRATEGY_OPEN_MONITOR_EVAL,
     TABLE_STRATEGY_OPEN_MONITOR_QUOTE,
+    TABLE_STRATEGY_OPEN_MONITOR_RUN,
     STRATEGY_CODE_MA5_MA20_TREND,
     VIEW_STRATEGY_OPEN_MONITOR,
     VIEW_STRATEGY_OPEN_MONITOR_WIDE,
@@ -72,6 +74,7 @@ class OpenMonitorParams:
 
     # 输出表：开盘检查结果
     output_table: str = TABLE_STRATEGY_OPEN_MONITOR_EVAL
+    run_table: str = TABLE_STRATEGY_OPEN_MONITOR_RUN
     open_monitor_view: str = VIEW_STRATEGY_OPEN_MONITOR
     open_monitor_wide_view: str = VIEW_STRATEGY_OPEN_MONITOR_WIDE
 
@@ -179,6 +182,7 @@ class OpenMonitorParams:
             strategy_code=str(sec.get("strategy_code", default_strategy_code)).strip()
             or default_strategy_code,
             output_table=str(sec.get("output_table", cls.output_table)).strip() or cls.output_table,
+            run_table=str(sec.get("run_table", cls.run_table)).strip() or cls.run_table,
             open_monitor_view=str(
                 sec.get("open_monitor_view", cls.open_monitor_view)
             ).strip()
@@ -278,18 +282,35 @@ class MA5MA20OpenMonitorRunner:
     def _calc_run_id(self, ts: dt.datetime) -> str:
         return calc_run_id(ts, self.params.run_id_minutes)
 
+    def _build_run_params_json(self) -> str:
+        payload = {
+            "signal_lookback_days": self.params.signal_lookback_days,
+            "cross_valid_days": self.params.cross_valid_days,
+            "pullback_valid_days": self.params.pullback_valid_days,
+            "index_code": self.params.index_code,
+            "index_hist_lookback_days": self.params.index_hist_lookback_days,
+            "quote_source": self.params.quote_source,
+            "interval_minutes": self.params.interval_minutes,
+            "run_id_minutes": self.params.run_id_minutes,
+            "strategy_code": self.params.strategy_code,
+            "ready_signals_view": self.params.ready_signals_view,
+        }
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
     def build_and_persist_env_snapshot(
         self,
         latest_trade_date: str,
         *,
         monitor_date: str | None = None,
         run_id: str | None = None,
+        run_pk: int | None = None,
         checked_at: dt.datetime | None = None,
     ) -> dict[str, Any] | None:
         return self.env_service.build_and_persist_env_snapshot(
             latest_trade_date,
             monitor_date=monitor_date,
             run_id=run_id,
+            run_pk=run_pk,
             checked_at=checked_at,
             fetch_index_live_quote=self.market_data.fetch_index_live_quote,
         )
@@ -318,6 +339,14 @@ class MA5MA20OpenMonitorRunner:
         checked_at = dt.datetime.now()
         monitor_date = checked_at.date().isoformat()
         run_id = self._calc_run_id(checked_at)
+        run_params_json = self._build_run_params_json()
+        run_pk = self.repo.ensure_run_context(
+            monitor_date,
+            run_id,
+            checked_at=checked_at,
+            triggered_at=checked_at,
+            params_json=run_params_json,
+        )
 
         latest_trade_date, signal_dates, signals = self.repo.load_recent_buy_signals()
         if not latest_trade_date or signals.empty:
@@ -332,6 +361,7 @@ class MA5MA20OpenMonitorRunner:
                     latest_trade_date,
                     monitor_date=monitor_date,
                     run_id=run_id,
+                    run_pk=run_pk,
                     checked_at=checked_at,
                 )
                 self.logger.info(
@@ -377,6 +407,17 @@ class MA5MA20OpenMonitorRunner:
             env_final_gate_action,
         )
         self.env_service.log_weekly_scenario(env_context)
+        env_index_snapshot_hash = (
+            env_context.get("env_index_snapshot_hash") if isinstance(env_context, dict) else None
+        )
+        if env_index_snapshot_hash:
+            run_pk = self.repo.ensure_run_context(
+                monitor_date,
+                run_id,
+                checked_at=checked_at,
+                env_index_snapshot_hash=str(env_index_snapshot_hash),
+                params_json=run_params_json,
+            )
 
         result = self.evaluator.evaluate(
             signals,
@@ -392,6 +433,8 @@ class MA5MA20OpenMonitorRunner:
 
         if result.empty:
             return
+        if run_pk is not None:
+            result["run_pk"] = run_pk
 
         rank_env_context = env_context
         if isinstance(env_context, dict) and "boards" not in env_context:

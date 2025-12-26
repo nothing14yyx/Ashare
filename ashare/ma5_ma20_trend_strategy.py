@@ -11,7 +11,7 @@
       - signals_write_scope=latest：仅写入最新交易日（默认）
       - signals_write_scope=window：写入本次计算窗口内的全部交易日（用于回填历史/回测）
   - 默认通过 VIEW 列出全部 BUY 信号（历史）
-    （v_strategy_signal_candidates；如需物理表可关闭 candidates_as_view）
+    （v_strategy_signal_candidates_active；如需物理表可关闭 candidates_as_view）
 
 说明：
   - 本实现先做“日线低频版本”作为选股/清单层。
@@ -40,7 +40,7 @@ from .schema_manager import (
     TABLE_STRATEGY_INDICATOR_DAILY,
     TABLE_STRATEGY_SIGNAL_CANDIDATES,
     TABLE_STRATEGY_SIGNAL_EVENTS,
-    VIEW_STRATEGY_SIGNAL_CANDIDATES,
+    VIEW_STRATEGY_SIGNAL_CANDIDATES_ACTIVE,
 )
 from .utils import setup_logger
 
@@ -80,7 +80,7 @@ class MA5MA20Params:
 
     # 可选：用视图替代 candidates 表（更简洁；候选清单实时从 signals 最新日筛选）
     candidates_as_view: bool = True
-    candidates_view: str = VIEW_STRATEGY_SIGNAL_CANDIDATES
+    candidates_view: str = VIEW_STRATEGY_SIGNAL_CANDIDATES_ACTIVE
 
     # signals 写入范围：
     # - latest：仅写入最新交易日（默认，低开销）

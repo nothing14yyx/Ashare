@@ -177,6 +177,7 @@ class OpenMonitorEnvService:
                 row.get("env_weekly_gate_policy") or row.get("env_weekly_gate_action")
             ),
             "run_id": row.get("run_id"),
+            "run_pk": row.get("run_pk"),
             "env_index_snapshot_hash": index_snapshot_hash,
             "env_final_gate_action": row.get("env_final_gate_action"),
             "env_final_cap_pct": row.get("env_final_cap_pct"),
@@ -275,6 +276,7 @@ class OpenMonitorEnvService:
         *,
         monitor_date: str | None = None,
         run_id: str | None = None,
+        run_pk: int | None = None,
         checked_at: dt.datetime | None = None,
         fetch_index_live_quote: Callable[[], dict[str, Any]] | None = None,
     ) -> dict[str, Any] | None:
@@ -311,6 +313,7 @@ class OpenMonitorEnvService:
             run_id,
             checked_at,
             weekly_gate_policy,
+            run_pk=run_pk,
         )
 
         return env_context
