@@ -1120,6 +1120,20 @@ class OpenMonitorRepository:
         if not isinstance(weekly_scenario, dict):
             weekly_scenario = {}
 
+        index_score = _to_float(env_context.get("index_score"))
+        regime = env_context.get("regime")
+        position_hint = _to_float(env_context.get("position_hint"))
+        if regime is not None:
+            regime = str(regime).strip() or None
+        if index_score is None or regime is None or position_hint is None:
+            self.logger.error(
+                "环境快照缺少指数环境字段：index_score=%s regime=%s position_hint=%s",
+                index_score,
+                regime,
+                position_hint,
+            )
+            raise ValueError("环境快照缺少指数环境字段（index_score/regime/position_hint）")
+
         def _get_env(key: str) -> Any:  # noqa: ANN401
             if isinstance(env_context, dict) and env_context.get(key) not in (None, ""):
                 return env_context.get(key)
@@ -1144,6 +1158,9 @@ class OpenMonitorRepository:
             or env_weekly_gate_policy
         )
         payload["env_weekly_gate_action"] = weekly_gate_action
+        payload["env_index_score"] = index_score
+        payload["env_regime"] = regime
+        payload["env_position_hint"] = position_hint
         index_snapshot = {}
         if isinstance(env_context, dict):
             raw_index_snapshot = env_context.get("index_intraday")

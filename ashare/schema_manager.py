@@ -1480,6 +1480,9 @@ class SchemaManager:
             "env_final_cap_pct": "DOUBLE NULL",
             "env_final_reason_json": "VARCHAR(2000) NULL",
             "env_index_snapshot_hash": "VARCHAR(32) NULL",
+            "env_index_score": "DOUBLE NULL",
+            "env_regime": "VARCHAR(32) NULL",
+            "env_position_hint": "VARCHAR(32) NULL",
         }
         if not self._table_exists(table):
             self._create_table(table, columns, primary_key=("monitor_date", "run_id"))

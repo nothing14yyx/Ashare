@@ -553,6 +553,7 @@ class WeeklyEnvironmentBuilder:
             "weekly_windows_by_code": weekly_channel.get("weekly_windows_by_code"),
             "boards": board_map,
             "regime": index_trend.get("regime"),
+            "index_score": to_float(index_trend.get("score")),
             "position_hint": effective_position_hint,
             "position_hint_raw": position_hint_raw,
             "effective_position_hint": effective_position_hint,

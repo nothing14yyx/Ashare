@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import datetime as dt
 import json
-import re
 from typing import Any, Callable
 
 import pandas as pd
@@ -207,45 +206,6 @@ class OpenMonitorEnvService:
             "env_index_snapshot_hash": index_snapshot_hash,
         }
         env_context["index_intraday"] = index_snapshot
-        if env_context.get("position_hint") is None:
-            env_context["position_hint"] = index_snapshot.get("env_index_position_cap")
-            env_context["effective_position_hint"] = env_context["position_hint"]
-
-        # feat: 宽表需要 env_regime/env_index_score 等结构化字段；若库里缺失则从 gate_reason 或 index_trend 回填
-        gate_reason = index_snapshot.get("env_index_gate_reason") or ""
-        if env_context.get("regime") is None:
-            m = re.search(r"regime=([A-Z_]+)", gate_reason)
-            if m:
-                env_context["regime"] = m.group(1)
-
-        if env_context.get("position_hint") is None:
-            m = re.search(r"pos_hint=([0-9.]+)", gate_reason)
-            if m:
-                try:
-                    env_context["position_hint"] = float(m.group(1))
-                except ValueError:
-                    pass
-            env_context["effective_position_hint"] = env_context.get("position_hint")
-
-        if env_context.get("index_score") is None:
-            trend_trade_date = (
-                row.get("env_index_asof_trade_date")
-                or index_snapshot.get("env_index_asof_trade_date")
-                or index_snapshot.get("asof_trade_date")
-                or row.get("sig_date")
-                or row.get("monitor_date")
-            )
-            if trend_trade_date:
-                try:
-                    idx_trend = self.env_builder.load_index_trend(str(trend_trade_date))
-                    if isinstance(idx_trend, dict):
-                        env_context["index_score"] = idx_trend.get("env_index_score")
-                        env_context["regime"] = env_context.get("regime") or idx_trend.get("env_regime")
-                        if env_context.get("position_hint") is None:
-                            env_context["position_hint"] = idx_trend.get("env_position_hint")
-                        env_context["effective_position_hint"] = env_context.get("position_hint")
-                except Exception as e:
-                    logger.warning("load_index_trend fallback failed: %s", e)
 
         return env_context
 
@@ -372,15 +332,15 @@ class OpenMonitorEnvService:
 
         snapshot["env_index_dev_ma20_atr"] = dev_ma20_atr
 
-        env_index_score = None
+        index_score = None
         regime = None
         position_hint = None
         if env_context and isinstance(env_context, dict):
-            env_index_score = _to_float(env_context.get("env_index_score"))
-            regime = env_context.get("env_regime")
-            position_hint = env_context.get("env_position_hint")
-        snapshot["env_index_score"] = env_index_score
-        gate_action = derive_index_gate_action(regime, position_hint) or "ALLOW"
+            index_score = _to_float(env_context.get("index_score"))
+            regime = env_context.get("regime")
+            position_hint = env_context.get("position_hint")
+        snapshot["env_index_score"] = index_score
+        gate_action = derive_index_gate_action(regime, position_hint)
         gate_reason = f"regime={regime} pos_hint={position_hint}"
         snapshot["env_index_gate_action"] = gate_action
         snapshot["env_index_gate_reason"] = gate_reason
@@ -410,6 +370,24 @@ class OpenMonitorEnvService:
         env_index_snapshot_hash: str | None = None
 
         if latest_trade_date:
+            idx = ctx.get("index") if isinstance(ctx, dict) else {}
+            if not isinstance(idx, dict):
+                idx = {}
+            index_score = _to_float(idx.get("score"))
+            regime = ctx.get("regime") or idx.get("regime")
+            position_hint = _to_float(ctx.get("position_hint") or idx.get("position_hint"))
+            if regime is not None:
+                regime = str(regime).strip() or None
+
+            ctx["index_score"] = index_score
+            ctx["regime"] = regime
+            ctx["position_hint"] = position_hint
+
+            if index_score is None or regime is None or position_hint is None:
+                raise ValueError(
+                    "指数环境缺失（index_score/regime/position_hint），无法构建指数快照。"
+                )
+
             asof_indicators = self.repo.load_index_history(latest_trade_date)
             live_quote = fetch_index_live_quote() if fetch_index_live_quote else {}
             index_env_snapshot = self._build_index_env_snapshot(
@@ -420,8 +398,16 @@ class OpenMonitorEnvService:
 
         if index_env_snapshot:
             # 兜底：实时价存在但 live_trade_date 缺失时，用 monitor_date 标记
-            if (not index_env_snapshot.get("env_index_live_trade_date")) and (index_env_snapshot.get("env_index_live_latest") is not None):
-                index_env_snapshot["env_index_live_trade_date"] = monitor_date
+            if (
+                index_env_snapshot.get("env_index_live_latest") is not None
+                and not index_env_snapshot.get("env_index_live_trade_date")
+            ):
+                monitor_date_str = (
+                    monitor_date.isoformat()
+                    if isinstance(monitor_date, dt.date)
+                    else str(monitor_date)
+                )
+                index_env_snapshot["env_index_live_trade_date"] = monitor_date_str
 
             index_snapshot_payload = {
                 "monitor_date": monitor_date,

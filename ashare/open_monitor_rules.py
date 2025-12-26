@@ -43,10 +43,10 @@ class MarketEnvironment:
 
         约定快照 key：
         - env_final_gate_action / env_final_cap_pct / env_final_reason_json
-        - env_index_snapshot_hash / env_index_score / index_score / regime / position_hint
+        - env_index_snapshot_hash / index_score / regime / position_hint
         - weekly_asof_trade_date / weekly_risk_level / weekly_scene_code
 
-        如果 snapshot 非 dict 或字段缺失，则返回尽可能完整的对象，缺失字段保持 None。
+        如果 snapshot 非 dict，则返回空对象；关键字段缺失时直接抛错。
         """
 
         if not isinstance(snapshot, dict):
@@ -87,19 +87,26 @@ class MarketEnvironment:
         if weekly_scene is None:
             weekly_scene = snapshot.get("weekly_scene")
 
-        score_val = snapshot.get("env_index_score")
-        if score_val is None:
-            score_val = snapshot.get("index_score")
-        if score_val is None:
-            score_val = snapshot.get("score")
+        if "index_score" not in snapshot:
+            raise KeyError("缺少 index_score")
+        if "regime" not in snapshot:
+            raise KeyError("缺少 regime")
+        if "position_hint" not in snapshot:
+            raise KeyError("缺少 position_hint")
+
+        score_val = snapshot.get("index_score")
+        regime = snapshot.get("regime")
+        position_hint = snapshot.get("position_hint")
+        if score_val is None or regime is None or position_hint is None:
+            raise ValueError("环境快照字段缺失（index_score/regime/position_hint）")
 
         return cls(
             gate_action=gate_action,
             position_cap_pct=_to_float(position_cap),
             reason_json=snapshot.get("env_final_reason_json", snapshot.get("reason_json")),
             index_snapshot_hash=snapshot.get("env_index_snapshot_hash", snapshot.get("index_snapshot_hash")),
-            regime=snapshot.get("regime"),
-            position_hint=_to_float(snapshot.get("position_hint")),
+            regime=regime,
+            position_hint=_to_float(position_hint),
             score=_to_float(score_val),
             weekly_asof_trade_date=snapshot.get("weekly_asof_trade_date"),
             weekly_risk_level=snapshot.get("weekly_risk_level"),
