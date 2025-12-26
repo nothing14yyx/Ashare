@@ -1247,7 +1247,7 @@ class OpenMonitorRepository:
                     monitor_date=snapshot.get("monitor_date"),
                     run_id=str(snapshot.get("run_id")),
                     checked_at=snapshot.get("checked_at"),
-                    params_json={"phase": "ENV_INDEX_SNAPSHOT"},
+                    params_json=json.dumps({"phase":"ENV_INDEX_SNAPSHOT"}, ensure_ascii=False, separators=(",", ":")),
                 )
             except Exception as exc:  # noqa: BLE001
                 self.logger.debug("确保 run 记录存在时失败（可忽略）：%s", exc)
