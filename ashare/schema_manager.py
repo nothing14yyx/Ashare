@@ -1482,7 +1482,7 @@ class SchemaManager:
             "env_index_snapshot_hash": "VARCHAR(32) NULL",
             "env_index_score": "DOUBLE NULL",
             "env_regime": "VARCHAR(32) NULL",
-            "env_position_hint": "VARCHAR(32) NULL",
+            "env_position_hint": "DOUBLE NULL",
         }
         if not self._table_exists(table):
             self._create_table(table, columns, primary_key=("monitor_date", "run_id"))
@@ -1493,6 +1493,28 @@ class SchemaManager:
         self._ensure_date_column(table, "env_weekly_asof_trade_date", not_null=False)
         self._ensure_varchar_length(table, "run_id", 64)
         self._ensure_numeric_column(table, "env_final_cap_pct", "DOUBLE NULL")
+        env_hint_type = self._column_meta(table).get("env_position_hint", {}).get("data_type")
+        self._ensure_numeric_column(table, "env_position_hint", "DOUBLE NULL")
+        if env_hint_type and env_hint_type not in {
+            "double",
+            "float",
+            "decimal",
+            "int",
+            "bigint",
+            "smallint",
+            "tinyint",
+        }:
+            with self.engine.begin() as conn:
+                conn.execute(
+                    text(
+                        f"""
+                        UPDATE `{table}`
+                        SET `env_position_hint` = CAST(`env_position_hint` AS DOUBLE)
+                        WHERE `env_position_hint` IS NOT NULL
+                        """
+                    )
+                )
+            self.logger.info("环境快照表 %s 已回填 env_position_hint 数值。", table)
         self._ensure_varchar_length(table, "env_final_reason_json", 2000)
 
         unique_name = "ux_env_snapshot_run"
@@ -1586,7 +1608,16 @@ class SchemaManager:
 
         join_on_run_pk = "run_pk" in eval_cols and "run_pk" in env_cols
         env_join = (
-            "ON e.`run_pk` = env.`run_pk`"
+            """
+            ON (
+              (e.`run_pk` IS NOT NULL AND env.`run_pk` IS NOT NULL AND e.`run_pk` = env.`run_pk`)
+              OR (
+                (e.`run_pk` IS NULL OR env.`run_pk` IS NULL)
+                AND e.`monitor_date` = env.`monitor_date`
+                AND e.`run_id` = env.`run_id`
+              )
+            )
+            """
             if join_on_run_pk
             else "ON e.`monitor_date` = env.`monitor_date` AND e.`run_id` = env.`run_id`"
         )

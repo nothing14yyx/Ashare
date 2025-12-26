@@ -247,6 +247,16 @@ class OpenMonitorEnvService:
         if run_id is None:
             run_id = calc_run_id(checked_at, self.params.run_id_minutes)
 
+        if run_pk is not None and monitor_date and run_id:
+            updated = self.repo.update_env_snapshot_run_pk(monitor_date, run_id, run_pk)
+            if updated:
+                self.logger.info(
+                    "已回填环境快照 run_pk（monitor_date=%s, run_id=%s, run_pk=%s）。",
+                    monitor_date,
+                    run_id,
+                    run_pk,
+                )
+
         env_context = self.build_environment_context(
             latest_trade_date, checked_at=checked_at
         )
@@ -452,7 +462,7 @@ class OpenMonitorEnvService:
                 index_env_snapshot.get("env_index_code"),
                 index_env_snapshot.get("env_index_asof_trade_date"),
                 index_env_snapshot.get("env_index_live_trade_date"),
-                live_pct * 100 if live_pct is not None else 0.0,
+                live_pct if live_pct is not None else 0.0,
                 dev_ma20_atr if dev_ma20_atr is not None else 0.0,
                 gate_action,
                 gate_reason,

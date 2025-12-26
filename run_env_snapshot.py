@@ -15,11 +15,19 @@ def main() -> None:
     checked_at = dt.datetime.now()
     monitor_date = checked_at.date().isoformat()
     run_id = runner._calc_run_id(checked_at)  # noqa: SLF001
+    run_pk = runner.repo.ensure_run_context(
+        monitor_date,
+        run_id,
+        checked_at=checked_at,
+        triggered_at=checked_at,
+        params_json=runner._build_run_params_json(),  # noqa: SLF001
+    )
 
     runner.build_and_persist_env_snapshot(
         latest_trade_date=monitor_date,
         monitor_date=monitor_date,
         run_id=run_id,
+        run_pk=run_pk,
         checked_at=checked_at,
     )
 

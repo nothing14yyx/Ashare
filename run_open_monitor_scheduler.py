@@ -173,12 +173,21 @@ def main() -> None:
 
         # open_monitor 严格按 run_id 匹配，因此这里必须用当前触发点计算 run_id
         run_id = runner._calc_run_id(trigger_at)  # noqa: SLF001
+        run_pk = runner.repo.ensure_run_context(
+            monitor_date,
+            run_id,
+            checked_at=trigger_at,
+            triggered_at=trigger_at,
+            params_json=runner._build_run_params_json(),  # noqa: SLF001
+        )
         key = (monitor_date, run_id)
 
         if ensured_key == key and ensured_ready:
             return monitor_date, run_id
 
         if _env_snapshot_exists(runner, monitor_date=monitor_date, run_id=run_id):
+            if run_pk is not None:
+                runner.repo.update_env_snapshot_run_pk(monitor_date, run_id, run_pk)
             ensured_key = key
             ensured_ready = True
             return monitor_date, run_id
@@ -204,13 +213,23 @@ def main() -> None:
             rid = runner._calc_run_id(ts)  # noqa: SLF001
             if not rid:
                 continue
+            run_pk = runner.repo.ensure_run_context(
+                monitor_date,
+                rid,
+                checked_at=ts,
+                triggered_at=ts,
+                params_json=runner._build_run_params_json(),  # noqa: SLF001
+            )
             if _env_snapshot_exists(runner, monitor_date=monitor_date, run_id=rid):
+                if run_pk is not None:
+                    runner.repo.update_env_snapshot_run_pk(monitor_date, rid, run_pk)
                 continue
             try:
                 runner.build_and_persist_env_snapshot(
                     latest_trade_date,
                     monitor_date=monitor_date,
                     run_id=rid,
+                    run_pk=run_pk,
                     checked_at=ts,
                 )
                 logger.info(

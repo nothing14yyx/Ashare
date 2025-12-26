@@ -1014,6 +1014,33 @@ class OpenMonitorRepository:
             self.logger.debug("检查环境快照是否存在失败：%s", exc)
             return False
 
+    def update_env_snapshot_run_pk(
+        self,
+        monitor_date: str,
+        run_id: str,
+        run_pk: int,
+    ) -> int:
+        table = self.params.env_snapshot_table
+        if not (table and monitor_date and run_id and run_pk and self._table_exists(table)):
+            return 0
+
+        stmt = text(
+            f"""
+            UPDATE `{table}`
+            SET `run_pk` = :run_pk
+            WHERE `monitor_date` = :d
+              AND `run_id` = :r
+              AND `run_pk` IS NULL
+            """
+        )
+        try:
+            with self.engine.begin() as conn:
+                result = conn.execute(stmt, {"d": monitor_date, "r": run_id, "run_pk": run_pk})
+                return int(getattr(result, "rowcount", 0) or 0)
+        except Exception as exc:  # noqa: BLE001
+            self.logger.debug("回填 env_snapshot.run_pk 失败：%s", exc)
+            return 0
+
     def load_env_snapshot_row(
         self, monitor_date: str, run_id: str | None
     ) -> pd.DataFrame | None:
