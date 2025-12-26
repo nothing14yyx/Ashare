@@ -21,9 +21,6 @@ TABLE_A_SHARE_UNIVERSE = "a_share_universe"
 # 统一策略信号体系表命名：按单一职责拆分
 TABLE_STRATEGY_INDICATOR_DAILY = "strategy_indicator_daily"
 TABLE_STRATEGY_SIGNAL_EVENTS = "strategy_signal_events"
-TABLE_STRATEGY_SIGNAL_CANDIDATES = "strategy_signal_candidates"
-VIEW_STRATEGY_SIGNAL_CANDIDATES_RAW = "v_strategy_signal_candidates_raw"
-VIEW_STRATEGY_SIGNAL_CANDIDATES_ACTIVE = "v_strategy_signal_candidates_active"
 # 策略准备就绪信号（含筹码）
 VIEW_STRATEGY_READY_SIGNALS = "v_strategy_ready_signals"
 TABLE_STRATEGY_CHIP_FILTER = "strategy_chip_filter"
@@ -37,6 +34,8 @@ TABLE_STRATEGY_OPEN_MONITOR_ENV = "strategy_open_monitor_env"
 TABLE_STRATEGY_OPEN_MONITOR_QUOTE = "strategy_open_monitor_quote"
 TABLE_STRATEGY_OPEN_MONITOR_RUN = "strategy_open_monitor_run"
 VIEW_STRATEGY_OPEN_MONITOR_WIDE = "v_strategy_open_monitor_wide"
+# 开盘监测环境视图（env + index snapshot）
+VIEW_STRATEGY_OPEN_MONITOR_ENV = "v_strategy_open_monitor_env"
 # 开盘监测默认查询视图（精简字段；完整字段请查 v_strategy_open_monitor_wide）
 VIEW_STRATEGY_OPEN_MONITOR = "v_strategy_open_monitor"
 # 大盘/指数环境快照
@@ -47,15 +46,12 @@ TABLE_ENV_INDEX_SNAPSHOT = "strategy_env_index_snapshot"
 class TableNames:
     indicator_table: str
     signal_events_table: str
-    candidates_table: str
-    candidates_view: str
-    candidates_raw_view: str
-    candidates_as_view: bool
     ready_signals_view: str
     open_monitor_eval_table: str
     env_snapshot_table: str
     env_index_snapshot_table: str
     open_monitor_run_table: str
+    open_monitor_env_view: str
     open_monitor_view: str
     open_monitor_wide_view: str
     open_monitor_quote_table: str
@@ -95,25 +91,20 @@ class SchemaManager:
 
         self._ensure_indicator_table(tables.indicator_table)
         self._ensure_signal_events_table(tables.signal_events_table)
-        # candidates：统一以 candidates_view 作为下游入口；是否保留物化表由 candidates_as_view 控制
-        self._ensure_candidates_views(
-            tables.candidates_raw_view,
-            tables.candidates_view,
-            tables.signal_events_table,
-            tables.indicator_table,
-        )
         # feat: 移除旧兼容视图逻辑，启动时清理遗留对象并强制使用新命名
         legacy_objects = (
+            "strategy_signal_candidates",
+            "v_strategy_signal_candidates_raw",
+            "v_strategy_signal_candidates_active",
+            "v_strategy_signal_candidates",
             "v_strategy_ma5_ma20_candidates",
             "open_monitor_compat_view",
-            "v_strategy_signal_candidates",
             "strategy_open_monitor",
         )
         protected_objects = {
-            tables.candidates_view,
-            tables.candidates_raw_view,
             tables.open_monitor_view,
             tables.open_monitor_wide_view,
+            tables.open_monitor_env_view,
         }
         for legacy_name in legacy_objects:
             if legacy_name in protected_objects:
@@ -121,11 +112,6 @@ class SchemaManager:
             if self._view_exists(legacy_name) or self._table_exists(legacy_name):
                 self._drop_relation_any(legacy_name)
                 self.logger.info("已清理遗留兼容对象 %s。", legacy_name)
-
-        if tables.candidates_as_view:
-            self._drop_relation_any(tables.candidates_table)
-        else:
-            self._ensure_candidates_table(tables.candidates_table)
         self._ensure_trade_metrics_table()
         self._ensure_backtest_view()
         self._ensure_chip_filter_table()
@@ -142,14 +128,19 @@ class SchemaManager:
         self._ensure_open_monitor_quote_table(tables.open_monitor_quote_table)
         self._ensure_env_snapshot_table(tables.env_snapshot_table)
         self._ensure_env_index_snapshot_table(tables.env_index_snapshot_table)
+        self._ensure_open_monitor_env_view(
+            tables.open_monitor_env_view,
+            tables.env_snapshot_table,
+            tables.env_index_snapshot_table,
+        )
 
         self._ensure_open_monitor_view(
             tables.open_monitor_view,
             tables.open_monitor_wide_view,
             tables.open_monitor_eval_table,
-            tables.env_snapshot_table,
-            tables.env_index_snapshot_table,
+            tables.open_monitor_env_view,
             tables.open_monitor_quote_table,
+            tables.open_monitor_run_table,
         )
 
     def get_table_names(self) -> TableNames:
@@ -177,28 +168,6 @@ class SchemaManager:
             str(open_monitor_cfg.get("ready_signals_view", VIEW_STRATEGY_READY_SIGNALS)).strip()
             or VIEW_STRATEGY_READY_SIGNALS
         )
-        candidates_table = (
-            str(strat_cfg.get("candidates_table", TABLE_STRATEGY_SIGNAL_CANDIDATES)).strip()
-            or TABLE_STRATEGY_SIGNAL_CANDIDATES
-        )
-        candidates_view = (
-            str(strat_cfg.get("candidates_view", VIEW_STRATEGY_SIGNAL_CANDIDATES_ACTIVE)).strip()
-            or VIEW_STRATEGY_SIGNAL_CANDIDATES_ACTIVE
-        )
-        candidates_raw_view = VIEW_STRATEGY_SIGNAL_CANDIDATES_RAW
-        # 默认使用视图候选池（不落地表），避免 candidates 表冗余与维护成本
-        raw_candidates_as_view = strat_cfg.get("candidates_as_view", True)
-        if isinstance(raw_candidates_as_view, str):
-            lowered = raw_candidates_as_view.strip().lower()
-            if lowered in {"1", "true", "yes", "y", "on"}:
-                candidates_as_view = True
-            elif lowered in {"0", "false", "no", "n", "off"}:
-                candidates_as_view = False
-            else:
-                candidates_as_view = False
-        else:
-            candidates_as_view = bool(raw_candidates_as_view)
-
         open_monitor_eval_table = (
             str(open_monitor_cfg.get("output_table", TABLE_STRATEGY_OPEN_MONITOR_EVAL)).strip()
             or TABLE_STRATEGY_OPEN_MONITOR_EVAL
@@ -219,6 +188,15 @@ class SchemaManager:
                 )
             ).strip()
             or TABLE_ENV_INDEX_SNAPSHOT
+        )
+        open_monitor_env_view = (
+            str(
+                open_monitor_cfg.get(
+                    "open_monitor_env_view",
+                    VIEW_STRATEGY_OPEN_MONITOR_ENV,
+                )
+            ).strip()
+            or VIEW_STRATEGY_OPEN_MONITOR_ENV
         )
         open_monitor_view = (
             str(
@@ -251,15 +229,12 @@ class SchemaManager:
         return TableNames(
             indicator_table=indicator_table,
             signal_events_table=signal_events_table,
-            candidates_table=candidates_table,
-            candidates_view=candidates_view,
-            candidates_raw_view=candidates_raw_view,
-            candidates_as_view=candidates_as_view,
             ready_signals_view=ready_signals_view,
             open_monitor_eval_table=open_monitor_eval_table,
             env_snapshot_table=env_snapshot_table,
             env_index_snapshot_table=env_index_snapshot_table,
             open_monitor_run_table=open_monitor_run_table,
+            open_monitor_env_view=open_monitor_env_view,
             open_monitor_view=open_monitor_view,
             open_monitor_wide_view=open_monitor_wide_view,
             open_monitor_quote_table=open_monitor_quote_table,
@@ -335,6 +310,16 @@ class SchemaManager:
             for col, ddl in to_add:
                 conn.execute(text(f"ALTER TABLE `{table}` ADD COLUMN `{col}` {ddl}"))
                 self.logger.info("表 %s 已新增列 %s。", table, col)
+
+    def _drop_columns(self, table: str, columns: Iterable[str]) -> None:
+        existing = set(self._column_meta(table).keys())
+        to_drop = [col for col in columns if col in existing]
+        if not to_drop:
+            return
+        with self.engine.begin() as conn:
+            for col in to_drop:
+                conn.execute(text(f"ALTER TABLE `{table}` DROP COLUMN `{col}`"))
+                self.logger.info("表 %s 已删除旧列 %s。", table, col)
 
     def _ensure_varchar_length(self, table: str, column: str, length: int) -> None:
         meta = self._column_meta(table)
@@ -548,13 +533,13 @@ class SchemaManager:
                   CAST(NULL AS CHAR(20)) AS `code`,
                   CAST(NULL AS DATE) AS `date`,
                   CAST(NULL AS DATE) AS `trade_date`,
-                  CAST(NULL AS DOUBLE) AS `open`,
-                  CAST(NULL AS DOUBLE) AS `high`,
-                  CAST(NULL AS DOUBLE) AS `low`,
-                  CAST(NULL AS DOUBLE) AS `close`,
-                  CAST(NULL AS DOUBLE) AS `volume`,
-                  CAST(NULL AS DOUBLE) AS `amount`,
-                  CAST(NULL AS DOUBLE) AS `preclose`,
+                  CAST(NULL AS DECIMAL(18,6)) AS `open`,
+                  CAST(NULL AS DECIMAL(18,6)) AS `high`,
+                  CAST(NULL AS DECIMAL(18,6)) AS `low`,
+                  CAST(NULL AS DECIMAL(18,6)) AS `close`,
+                  CAST(NULL AS DECIMAL(18,6)) AS `volume`,
+                  CAST(NULL AS DECIMAL(18,6)) AS `amount`,
+                  CAST(NULL AS DECIMAL(18,6)) AS `preclose`,
                   CAST(NULL AS CHAR(8)) AS `tradestatus`
                 WHERE 1 = 0
                 """
@@ -600,13 +585,13 @@ class SchemaManager:
                   CAST(NULL AS CHAR(20)) AS `code`,
                   CAST(NULL AS DATE) AS `date`,
                   CAST(NULL AS DATE) AS `trade_date`,
-                  CAST(NULL AS DOUBLE) AS `open`,
-                  CAST(NULL AS DOUBLE) AS `high`,
-                  CAST(NULL AS DOUBLE) AS `low`,
-                  CAST(NULL AS DOUBLE) AS `close`,
-                  CAST(NULL AS DOUBLE) AS `volume`,
-                  CAST(NULL AS DOUBLE) AS `amount`,
-                  CAST(NULL AS DOUBLE) AS `preclose`,
+                  CAST(NULL AS DECIMAL(18,6)) AS `open`,
+                  CAST(NULL AS DECIMAL(18,6)) AS `high`,
+                  CAST(NULL AS DECIMAL(18,6)) AS `low`,
+                  CAST(NULL AS DECIMAL(18,6)) AS `close`,
+                  CAST(NULL AS DECIMAL(18,6)) AS `volume`,
+                  CAST(NULL AS DECIMAL(18,6)) AS `amount`,
+                  CAST(NULL AS DECIMAL(18,6)) AS `preclose`,
                   CAST(NULL AS CHAR(8)) AS `tradestatus`
                 WHERE 1 = 0
                 """
@@ -836,91 +821,6 @@ class SchemaManager:
                     )
                 )
             self.logger.info("信号事件表 %s 已新增唯一索引 %s。", table, unique_name)
-
-    def _ensure_candidates_table(self, table: str) -> None:
-        columns = {
-            "sig_date": "DATE NOT NULL",
-            "code": "VARCHAR(20) NOT NULL",
-            "close": "DOUBLE NULL",
-            "ma5": "DOUBLE NULL",
-            "ma20": "DOUBLE NULL",
-            "ma60": "DOUBLE NULL",
-            "ma250": "DOUBLE NULL",
-            "vol_ratio": "DOUBLE NULL",
-            "macd_hist": "DOUBLE NULL",
-            "kdj_k": "DOUBLE NULL",
-            "kdj_d": "DOUBLE NULL",
-            "atr14": "DOUBLE NULL",
-            "stop_ref": "DOUBLE NULL",
-            "yearline_state": "VARCHAR(50) NULL",
-            "risk_tag": "VARCHAR(255) NULL",
-            "risk_note": "VARCHAR(255) NULL",
-            "reason": "VARCHAR(255) NULL",
-            "final_action": "VARCHAR(16) NULL",
-            "final_reason": "VARCHAR(255) NULL",
-            "final_cap": "DOUBLE NULL",
-        }
-        if not self._table_exists(table):
-            self._create_table(table, columns, primary_key=("sig_date", "code"))
-            return
-        self._add_missing_columns(table, columns)
-        self._ensure_varchar_length(table, "final_action", 16)
-        self._ensure_varchar_length(table, "final_reason", 255)
-        self._ensure_numeric_column(table, "final_cap", "DOUBLE NULL")
-
-    def _ensure_candidates_views(
-        self,
-        raw_view: str,
-        active_view: str,
-        events_table: str,
-        indicator_table: str,
-    ) -> None:
-        if not (raw_view and active_view and events_table and indicator_table):
-            return
-
-        raw_stmt = text(
-            f"""
-            CREATE OR REPLACE VIEW `{raw_view}` AS
-            SELECT
-              e.`sig_date`,
-              e.`code`,
-              e.`strategy_code`,
-              COALESCE(e.`final_action`, e.`signal`) AS `sig_signal`,
-              COALESCE(e.`final_reason`, e.`reason`) AS `sig_reason`,
-              COALESCE(e.`final_reason`, e.`reason`) AS `reason`,
-              DATEDIFF(CURDATE(), e.`sig_date`) AS `signal_age`,
-              CASE
-                WHEN e.`reason` LIKE '%回踩%' THEN 5
-                ELSE 3
-              END AS `valid_days`,
-              ind.`close`,
-              ind.`ma5`,ind.`ma20`,ind.`ma60`,ind.`ma250`,
-              ind.`vol_ratio`,ind.`macd_hist`,ind.`kdj_k`,ind.`kdj_d`,ind.`atr14`,
-              e.`stop_ref`,
-              ind.`yearline_state`,e.`risk_tag`,e.`risk_note`,
-              e.`final_action`,e.`final_reason`,e.`final_cap`,
-              e.`extra_json`
-            FROM `{events_table}` e
-            LEFT JOIN `{indicator_table}` ind
-              ON e.`sig_date` = ind.`trade_date` AND e.`code` = ind.`code`
-            WHERE COALESCE(e.`final_action`, e.`signal`) IN ('BUY','BUY_CONFIRM')
-            """
-        )
-        with self.engine.begin() as conn:
-            conn.execute(raw_stmt)
-        self.logger.info("已创建/更新候选视图 %s。", raw_view)
-
-        active_stmt = text(
-            f"""
-            CREATE OR REPLACE VIEW `{active_view}` AS
-            SELECT *
-            FROM `{raw_view}`
-            WHERE `signal_age` <= `valid_days`
-            """
-        )
-        with self.engine.begin() as conn:
-            conn.execute(active_stmt)
-        self.logger.info("已创建/更新候选视图 %s。", active_view)
 
     def _ensure_ready_signals_view(
         self,
@@ -1270,18 +1170,20 @@ class SchemaManager:
             "run_id": "VARCHAR(64) NOT NULL",
             "triggered_at": "DATETIME(6) NULL",
             "checked_at": "DATETIME(6) NULL",
-            "env_index_snapshot_hash": "VARCHAR(32) NULL",
-            "params_json": "VARCHAR(2000) NULL",
+            "status": "VARCHAR(32) NOT NULL DEFAULT 'RUNNING'",
+            "error_msg": "TEXT NULL",
+            "params_json": "TEXT NULL",
         }
         if not self._table_exists(table):
             self._create_table(table, columns, primary_key=("run_pk",))
         else:
             self._add_missing_columns(table, columns)
+            self._drop_columns(table, ["env_index_snapshot_hash"])
         self._ensure_date_column(table, "monitor_date", not_null=True)
         self._ensure_datetime_column(table, "triggered_at")
         self._ensure_datetime_column(table, "checked_at")
         self._ensure_varchar_length(table, "run_id", 64)
-        self._ensure_varchar_length(table, "params_json", 2000)
+        self._ensure_varchar_length(table, "status", 32)
 
         unique_name = "ux_open_monitor_run"
         if not self._index_exists(table, unique_name):
@@ -1300,7 +1202,6 @@ class SchemaManager:
         columns = {
             "monitor_date": "DATE NOT NULL",
             "run_id": "VARCHAR(64) NOT NULL",
-            "run_pk": "BIGINT NULL",
             "code": "VARCHAR(20) NOT NULL",
             "live_trade_date": "DATE NULL",
             "live_open": "DOUBLE NULL",
@@ -1318,6 +1219,7 @@ class SchemaManager:
             )
             return
         self._add_missing_columns(table, columns)
+        self._drop_columns(table, ["run_pk"])
         self._ensure_varchar_length(table, "run_id", 64)
         self._ensure_date_column(table, "monitor_date", not_null=True)
         self._ensure_date_column(table, "live_trade_date", not_null=False)
@@ -1340,7 +1242,6 @@ class SchemaManager:
             "monitor_date": "DATE NOT NULL",
             "sig_date": "DATE NOT NULL",
             "run_id": "VARCHAR(64) NOT NULL",
-            "run_pk": "BIGINT NULL",
             "asof_trade_date": "DATE NULL",
             "live_trade_date": "DATE NULL",
             "signal_age": "INT NULL",
@@ -1358,11 +1259,6 @@ class SchemaManager:
             "runup_ref_price": "DOUBLE NULL",
             "runup_ref_source": "VARCHAR(32) NULL",
             "entry_exposure_cap": "DOUBLE NULL",
-            "env_index_score": "DOUBLE NULL",
-            "env_regime": "VARCHAR(32) NULL",
-            "env_position_hint": "DOUBLE NULL",
-            "env_final_gate_action": "VARCHAR(16) NULL",
-            "env_index_snapshot_hash": "VARCHAR(32) NULL",
             "signal_strength": "DOUBLE NULL",
             "strength_delta": "DOUBLE NULL",
             "strength_trend": "VARCHAR(16) NULL",
@@ -1378,7 +1274,6 @@ class SchemaManager:
             "summary_line": "VARCHAR(512) NULL",
             "risk_tag": "VARCHAR(255) NULL",
             "risk_note": "VARCHAR(255) NULL",
-            "checked_at": "DATETIME(6) NULL",
             "snapshot_hash": "VARCHAR(64) NULL",
         }
         if not self._table_exists(table):
@@ -1389,49 +1284,42 @@ class SchemaManager:
             )
         else:
             self._add_missing_columns(table, columns)
+            self._drop_columns(
+                table,
+                [
+                    "run_pk",
+                    "checked_at",
+                    "env_index_score",
+                    "env_regime",
+                    "env_position_hint",
+                    "env_final_gate_action",
+                    "env_index_snapshot_hash",
+                    "env_weekly_asof_trade_date",
+                    "env_weekly_risk_level",
+                    "env_weekly_scene",
+                    "env_weekly_structure_status",
+                    "env_weekly_pattern_status",
+                    "env_weekly_gate_action",
+                    "env_weekly_gate_policy",
+                ],
+            )
 
-        for col in ["code", "snapshot_hash", "run_id", "env_index_snapshot_hash"]:
+        for col in ["code", "snapshot_hash", "run_id"]:
             self._ensure_varchar_length(table, col, 64 if col == "snapshot_hash" else 64)
         self._ensure_date_column(table, "monitor_date", not_null=True)
         self._ensure_date_column(table, "sig_date", not_null=True)
         self._ensure_date_column(table, "asof_trade_date", not_null=False)
         self._ensure_date_column(table, "live_trade_date", not_null=False)
 
-        self._ensure_datetime_column(table, "checked_at")
         self._ensure_numeric_column(table, "live_intraday_vol_ratio", "DOUBLE NULL")
         self._ensure_numeric_column(table, "signal_strength", "DOUBLE NULL")
         self._ensure_numeric_column(table, "strength_delta", "DOUBLE NULL")
 
         self._ensure_open_monitor_indexes(table)
 
-    def _cleanup_duplicate_snapshots(self, table: str) -> None:
-        dedupe_cols = {"monitor_date", "sig_date", "code", "run_id", "checked_at"}
-        if not dedupe_cols.issubset(set(self._column_meta(table).keys())):
-            return
-        stmt = text(
-            f"""
-            DELETE t1
-            FROM `{table}` t1
-            JOIN `{table}` t2
-              ON t1.`monitor_date` = t2.`monitor_date`
-             AND t1.`sig_date` = t2.`sig_date`
-             AND t1.`code` = t2.`code`
-             AND t1.`run_id` = t2.`run_id`
-             AND (
-                  (t1.`checked_at` < t2.`checked_at`)
-                  OR (t1.`checked_at` IS NULL AND t2.`checked_at` IS NOT NULL)
-             )
-            """
-        )
-        with self.engine.begin() as conn:
-            res = conn.execute(stmt)
-        if getattr(res, "rowcount", 0) and res.rowcount > 0:
-            self.logger.info("表 %s 已清理 %s 条重复快照。", table, res.rowcount)
-
     def _ensure_open_monitor_indexes(self, table: str) -> None:
         unique_index = "ux_open_monitor_run"
         if not self._index_exists(table, unique_index):
-            self._cleanup_duplicate_snapshots(table)
             with self.engine.begin() as conn:
                 try:
                     conn.execute(
@@ -1446,21 +1334,21 @@ class SchemaManager:
                 except Exception as exc:  # noqa: BLE001
                     self.logger.warning("创建唯一索引 %s 失败：%s", unique_index, exc)
 
-        index_name = "idx_open_monitor_strength_time"
+        index_name = "idx_open_monitor_strength_run"
         if not self._index_exists(table, index_name):
             with self.engine.begin() as conn:
                 conn.execute(
                     text(
-                        f"CREATE INDEX `{index_name}` ON `{table}` (`monitor_date`, `code`, `checked_at`)"
+                        f"CREATE INDEX `{index_name}` ON `{table}` (`monitor_date`, `code`, `run_id`)"
                     )
                 )
             self.logger.info("表 %s 已新增索引 %s。", table, index_name)
 
-        code_time_index = "idx_open_monitor_code_time"
+        code_time_index = "idx_open_monitor_code_run"
         if not self._index_exists(table, code_time_index):
             with self.engine.begin() as conn:
                 conn.execute(
-                    text(f"CREATE INDEX `{code_time_index}` ON `{table}` (`code`, `checked_at`)")
+                    text(f"CREATE INDEX `{code_time_index}` ON `{table}` (`code`, `run_id`)")
                 )
             self.logger.info("表 %s 已新增索引 %s。", table, code_time_index)
 
@@ -1469,18 +1357,16 @@ class SchemaManager:
         columns = {
             "monitor_date": "DATE NOT NULL",
             "run_id": "VARCHAR(64) NOT NULL",
-            "run_pk": "BIGINT NULL",
-            "checked_at": "DATETIME(6) NULL",
             "env_weekly_asof_trade_date": "DATE NULL",
+            "env_weekly_gate_policy": "VARCHAR(16) NULL",
+            "env_weekly_gate_action": "VARCHAR(16) NULL",
             "env_weekly_risk_level": "VARCHAR(16) NULL",
             "env_weekly_scene": "VARCHAR(32) NULL",
-            "env_weekly_gate_action": "VARCHAR(16) NULL",
-            "env_weekly_gate_policy": "VARCHAR(16) NULL",
             "env_final_gate_action": "VARCHAR(16) NULL",
             "env_final_cap_pct": "DOUBLE NULL",
-            "env_final_reason_json": "VARCHAR(2000) NULL",
-            "env_index_snapshot_hash": "VARCHAR(32) NULL",
-            "env_index_score": "DOUBLE NULL",
+            "env_final_reason_json": "TEXT NULL",
+            "env_index_snapshot_hash": "CHAR(32) NULL",
+            "env_index_score": "INT NULL",
             "env_regime": "VARCHAR(32) NULL",
             "env_position_hint": "DOUBLE NULL",
         }
@@ -1488,34 +1374,51 @@ class SchemaManager:
             self._create_table(table, columns, primary_key=("monitor_date", "run_id"))
         else:
             self._add_missing_columns(table, columns)
-        self._ensure_datetime_column(table, "checked_at")
+            self._drop_columns(
+                table,
+                [
+                    "run_pk",
+                    "checked_at",
+                    "env_weekly_plan_json",
+                    "env_weekly_plan_a",
+                    "env_weekly_plan_b",
+                    "env_weekly_plan_a_exposure_cap",
+                    "env_weekly_bias",
+                    "env_weekly_status",
+                    "env_weekly_structure_status",
+                    "env_weekly_pattern_status",
+                    "env_weekly_gating_enabled",
+                    "env_weekly_tags",
+                    "env_weekly_money_proxy",
+                    "env_weekly_note",
+                    "env_position_hint_raw",
+                    "env_index_code",
+                    "env_index_asof_trade_date",
+                    "env_index_asof_close",
+                    "env_index_asof_ma20",
+                    "env_index_asof_ma60",
+                    "env_index_asof_macd_hist",
+                    "env_index_asof_atr14",
+                    "env_index_live_trade_date",
+                    "env_index_live_open",
+                    "env_index_live_high",
+                    "env_index_live_low",
+                    "env_index_live_latest",
+                    "env_index_live_pct_change",
+                    "env_index_live_volume",
+                    "env_index_live_amount",
+                    "env_index_dev_ma20_atr",
+                    "env_index_gate_action",
+                    "env_index_gate_reason",
+                    "env_index_position_cap",
+                ],
+            )
         self._ensure_date_column(table, "monitor_date", not_null=True)
         self._ensure_date_column(table, "env_weekly_asof_trade_date", not_null=False)
         self._ensure_varchar_length(table, "run_id", 64)
         self._ensure_numeric_column(table, "env_final_cap_pct", "DOUBLE NULL")
-        env_hint_type = self._column_meta(table).get("env_position_hint", {}).get("data_type")
         self._ensure_numeric_column(table, "env_position_hint", "DOUBLE NULL")
-        if env_hint_type and env_hint_type not in {
-            "double",
-            "float",
-            "decimal",
-            "int",
-            "bigint",
-            "smallint",
-            "tinyint",
-        }:
-            with self.engine.begin() as conn:
-                conn.execute(
-                    text(
-                        f"""
-                        UPDATE `{table}`
-                        SET `env_position_hint` = CAST(`env_position_hint` AS DOUBLE)
-                        WHERE `env_position_hint` IS NOT NULL
-                        """
-                    )
-                )
-            self.logger.info("环境快照表 %s 已回填 env_position_hint 数值。", table)
-        self._ensure_varchar_length(table, "env_final_reason_json", 2000)
+        self._ensure_numeric_column(table, "env_index_score", "INT NULL")
 
         unique_name = "ux_env_snapshot_run"
         if not self._index_exists(table, unique_name):
@@ -1529,6 +1432,19 @@ class SchemaManager:
                     )
                 )
             self.logger.info("环境快照表 %s 已新增唯一索引 %s。", table, unique_name)
+
+        hash_index = "idx_env_snapshot_hash"
+        if not self._index_exists(table, hash_index):
+            with self.engine.begin() as conn:
+                conn.execute(
+                    text(
+                        f"""
+                        CREATE INDEX `{hash_index}`
+                        ON `{table}` (`env_index_snapshot_hash`)
+                        """
+                    )
+                )
+            self.logger.info("环境快照表 %s 已新增索引 %s。", table, hash_index)
 
     def _ensure_env_index_snapshot_table(self, table: str) -> None:
         columns = {
@@ -1590,37 +1506,78 @@ class SchemaManager:
                 )
             self.logger.info("指数环境快照表 %s 已新增索引 %s。", table, run_idx)
 
+    def _ensure_open_monitor_env_view(
+        self,
+        view: str,
+        env_table: str,
+        env_index_table: str,
+    ) -> None:
+        if not view:
+            return
+        if not (env_table and env_index_table):
+            self._drop_relation(view)
+            return
+        if not self._table_exists(env_table):
+            self._drop_relation(view)
+            return
+
+        stmt = text(
+            f"""
+            CREATE OR REPLACE VIEW `{view}` AS
+            SELECT
+              env.`monitor_date`,
+              env.`run_id`,
+              env.`env_index_snapshot_hash`,
+              env.`env_final_gate_action`,
+              env.`env_final_cap_pct`,
+              env.`env_regime`,
+              env.`env_position_hint`,
+              env.`env_index_score`,
+              env.`env_weekly_asof_trade_date`,
+              env.`env_weekly_gate_policy`,
+              env.`env_weekly_gate_action`,
+              env.`env_weekly_risk_level`,
+              env.`env_weekly_scene`,
+              env.`env_final_reason_json`,
+              idx.`index_code` AS `env_index_code`,
+              idx.`asof_trade_date` AS `env_index_asof_trade_date`,
+              idx.`live_trade_date` AS `env_index_live_trade_date`,
+              idx.`asof_close` AS `env_index_asof_close`,
+              idx.`asof_ma20` AS `env_index_asof_ma20`,
+              idx.`asof_ma60` AS `env_index_asof_ma60`,
+              idx.`asof_macd_hist` AS `env_index_asof_macd_hist`,
+              idx.`asof_atr14` AS `env_index_asof_atr14`,
+              idx.`live_open` AS `env_index_live_open`,
+              idx.`live_high` AS `env_index_live_high`,
+              idx.`live_low` AS `env_index_live_low`,
+              idx.`live_latest` AS `env_index_live_latest`,
+              idx.`live_pct_change` AS `env_index_live_pct_change`,
+              idx.`live_volume` AS `env_index_live_volume`,
+              idx.`live_amount` AS `env_index_live_amount`,
+              idx.`dev_ma20_atr` AS `env_index_dev_ma20_atr`,
+              idx.`gate_action` AS `env_index_gate_action`,
+              idx.`gate_reason` AS `env_index_gate_reason`,
+              idx.`position_cap` AS `env_index_position_cap`
+            FROM `{env_table}` env
+            LEFT JOIN `{env_index_table}` idx
+              ON env.`env_index_snapshot_hash` = idx.`snapshot_hash`
+            """
+        )
+        with self.engine.begin() as conn:
+            conn.execute(stmt)
+        self.logger.info("已创建/更新开盘监测环境视图 %s。", view)
+
     def _ensure_open_monitor_view(
         self,
         view: str,
         wide_view: str,
         eval_table: str,
-        env_table: str,
-        env_index_table: str,
+        env_view: str,
         quote_table: str,
+        run_table: str,
     ) -> None:
-        if not (wide_view and eval_table and env_table and env_index_table):
+        if not (wide_view and eval_table and env_view and run_table):
             return
-
-        eval_cols = set(self._column_meta(eval_table).keys())
-        env_cols = set(self._column_meta(env_table).keys())
-        quote_cols = set(self._column_meta(quote_table).keys()) if quote_table else set()
-
-        join_on_run_pk = "run_pk" in eval_cols and "run_pk" in env_cols
-        env_join = (
-            """
-            ON (
-              (e.`run_pk` IS NOT NULL AND env.`run_pk` IS NOT NULL AND e.`run_pk` = env.`run_pk`)
-              OR (
-                (e.`run_pk` IS NULL OR env.`run_pk` IS NULL)
-                AND e.`monitor_date` = env.`monitor_date`
-                AND e.`run_id` = env.`run_id`
-              )
-            )
-            """
-            if join_on_run_pk
-            else "ON e.`monitor_date` = env.`monitor_date` AND e.`run_id` = env.`run_id`"
-        )
 
         dim_stock_exists = self._table_exists("dim_stock_industry")
         board_dim_exists = self._table_exists("dim_stock_board_industry")
@@ -1651,16 +1608,11 @@ class SchemaManager:
         live_gap_expr = "e.`live_gap_pct`"
         live_intraday_expr = "e.`live_intraday_vol_ratio`"
         if quote_table and self._table_exists(quote_table):
-            quote_join_on_run_pk = "run_pk" in eval_cols and "run_pk" in quote_cols
-            quote_join_cond = (
-                "e.`run_pk` = q.`run_pk`"
-                if quote_join_on_run_pk
-                else "e.`monitor_date` = q.`monitor_date` AND e.`run_id` = q.`run_id`"
-            )
             quote_join = (
                 f"""
                 LEFT JOIN `{quote_table}` q
-                  ON {quote_join_cond}
+                  ON e.`monitor_date` = q.`monitor_date`
+                 AND e.`run_id` = q.`run_id`
                  AND e.`code` = q.`code`
                 """
             )
@@ -1679,7 +1631,6 @@ class SchemaManager:
               e.`monitor_date`,
               e.`sig_date`,
               e.`run_id`,
-              e.`run_pk`,
               e.`code`,
               {name_expr} AS `name`,
               {industry_expr} AS `industry`,
@@ -1701,11 +1652,11 @@ class SchemaManager:
               e.`runup_ref_price`,
               e.`runup_ref_source`,
               e.`entry_exposure_cap`,
-              e.`env_index_score`,
-              e.`env_regime`,
-              e.`env_position_hint`,
-              COALESCE(e.`env_final_gate_action`, env.`env_final_gate_action`) AS `env_final_gate_action`,
-              e.`env_index_snapshot_hash`,
+              env.`env_index_score`,
+              env.`env_regime`,
+              env.`env_position_hint`,
+              env.`env_final_gate_action`,
+              env.`env_index_snapshot_hash`,
               e.`signal_strength`,
               e.`strength_delta`,
               e.`strength_trend`,
@@ -1721,8 +1672,10 @@ class SchemaManager:
               e.`summary_line`,
               e.`risk_tag`,
               e.`risk_note`,
-              e.`checked_at`,
               e.`snapshot_hash`,
+              r.`run_pk`,
+              r.`checked_at`,
+              r.`status`,
               {live_open_expr} AS `live_open`,
               {live_high_expr} AS `live_high`,
               {live_low_expr} AS `live_low`,
@@ -1734,29 +1687,34 @@ class SchemaManager:
               env.`env_weekly_scene`,
               env.`env_weekly_gate_action`,
               env.`env_weekly_gate_policy`,
-              idx.`asof_trade_date` AS `env_index_asof_trade_date`,
-              idx.`live_trade_date` AS `env_index_live_trade_date`,
-              idx.`asof_close` AS `env_index_asof_close`,
-              idx.`asof_ma20` AS `env_index_asof_ma20`,
-              idx.`asof_ma60` AS `env_index_asof_ma60`,
-              idx.`asof_macd_hist` AS `env_index_asof_macd_hist`,
-              idx.`asof_atr14` AS `env_index_asof_atr14`,
-              idx.`live_open` AS `env_index_live_open`,
-              idx.`live_high` AS `env_index_live_high`,
-              idx.`live_low` AS `env_index_live_low`,
-              idx.`live_latest` AS `env_index_live_latest`,
-              idx.`live_pct_change` AS `env_index_live_pct_change`,
-              idx.`live_volume` AS `env_index_live_volume`,
-              idx.`live_amount` AS `env_index_live_amount`,
-              idx.`dev_ma20_atr` AS `env_index_dev_ma20_atr`,
-              idx.`gate_action` AS `env_index_gate_action`,
-              idx.`gate_reason` AS `env_index_gate_reason`,
-              idx.`position_cap` AS `env_index_position_cap`
+              env.`env_final_cap_pct`,
+              env.`env_final_reason_json`,
+              env.`env_index_code`,
+              env.`env_index_asof_trade_date`,
+              env.`env_index_live_trade_date`,
+              env.`env_index_asof_close`,
+              env.`env_index_asof_ma20`,
+              env.`env_index_asof_ma60`,
+              env.`env_index_asof_macd_hist`,
+              env.`env_index_asof_atr14`,
+              env.`env_index_live_open`,
+              env.`env_index_live_high`,
+              env.`env_index_live_low`,
+              env.`env_index_live_latest`,
+              env.`env_index_live_pct_change`,
+              env.`env_index_live_volume`,
+              env.`env_index_live_amount`,
+              env.`env_index_dev_ma20_atr`,
+              env.`env_index_gate_action`,
+              env.`env_index_gate_reason`,
+              env.`env_index_position_cap`
             FROM `{eval_table}` e
-            LEFT JOIN `{env_table}` env
-              {env_join}
-            LEFT JOIN `{env_index_table}` idx
-              ON e.`env_index_snapshot_hash` = idx.`snapshot_hash`
+            LEFT JOIN `{env_view}` env
+              ON e.`monitor_date` = env.`monitor_date`
+             AND e.`run_id` = env.`run_id`
+            LEFT JOIN `{run_table}` r
+              ON e.`monitor_date` = r.`monitor_date`
+             AND e.`run_id` = r.`run_id`
             {quote_join}
             {stock_join}
             {board_join}
@@ -1800,6 +1758,7 @@ class SchemaManager:
                 "rule_hits_json",
                 "summary_line",
                 "checked_at",
+                "status",
             ]
             compact_select = ", ".join(f"`{col}`" for col in compact_columns)
             compact_stmt = text(

@@ -15,7 +15,7 @@ def main() -> None:
     checked_at = dt.datetime.now()
     monitor_date = checked_at.date().isoformat()
     run_id = runner._calc_run_id(checked_at)  # noqa: SLF001
-    run_pk = runner.repo.ensure_run_context(
+    runner.repo.ensure_run_context(
         monitor_date,
         run_id,
         checked_at=checked_at,
@@ -27,7 +27,6 @@ def main() -> None:
         latest_trade_date=monitor_date,
         monitor_date=monitor_date,
         run_id=run_id,
-        run_pk=run_pk,
         checked_at=checked_at,
     )
 

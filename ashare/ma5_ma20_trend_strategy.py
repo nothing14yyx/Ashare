@@ -10,12 +10,11 @@
   - strategy_signal_events：信号事件（signal/reason/risk/stop 等）
       - signals_write_scope=latest：仅写入最新交易日（默认）
       - signals_write_scope=window：写入本次计算窗口内的全部交易日（用于回填历史/回测）
-  - 默认通过 VIEW 列出全部 BUY 信号（历史）
-    （v_strategy_signal_candidates_active；如需物理表可关闭 candidates_as_view）
+  - 信号落表 strategy_signal_events；候选过滤由 open_monitor 在 Python 中完成
 
 说明：
   - 本实现先做“日线低频版本”作为选股/清单层。
-  - 若要更严格的“分钟线执行层”（例如 60 分钟入场 / 30 分钟离场），建议只对 candidates 按需拉分钟线。
+  - 若要更严格的“分钟线执行层”（例如 60 分钟入场 / 30 分钟离场），建议按需拉分钟线。
 """
 
 from __future__ import annotations
@@ -38,9 +37,7 @@ from .schema_manager import (
     STRATEGY_CODE_MA5_MA20_TREND,
     TABLE_STRATEGY_CHIP_FILTER,
     TABLE_STRATEGY_INDICATOR_DAILY,
-    TABLE_STRATEGY_SIGNAL_CANDIDATES,
     TABLE_STRATEGY_SIGNAL_EVENTS,
-    VIEW_STRATEGY_SIGNAL_CANDIDATES_ACTIVE,
 )
 from .utils import setup_logger
 
@@ -74,13 +71,6 @@ class MA5MA20Params:
     # 输出表/视图
     indicator_table: str = TABLE_STRATEGY_INDICATOR_DAILY
     signal_events_table: str = TABLE_STRATEGY_SIGNAL_EVENTS
-    candidates_table: str = (
-        TABLE_STRATEGY_SIGNAL_CANDIDATES
-    )  # 仅在 candidates_as_view=False 时写表
-
-    # 可选：用视图替代 candidates 表（更简洁；候选清单实时从 signals 最新日筛选）
-    candidates_as_view: bool = True
-    candidates_view: str = VIEW_STRATEGY_SIGNAL_CANDIDATES_ACTIVE
 
     # signals 写入范围：
     # - latest：仅写入最新交易日（默认，低开销）
@@ -1350,7 +1340,7 @@ class MA5MA20StrategyRunner:
             degrade_wait = buy_confirm_raw & entry_mask & (
                 outlier_risk | (disperse_risk & (structure_weak | vol_guard))
             )
-            # 筹码/数据异常：避免把 BUY_CONFIRM “硬拦”成 WAIT（会直接从 candidates 池消失）
+            # 筹码/数据异常：避免把 BUY_CONFIRM “硬拦”成 WAIT（会直接从信号池消失）
             # 改为降级为 BUY + 小仓位，让信号还能进入候选池，但仓位明显受控
             final_action = final_action.mask(degrade_wait, "BUY")
             wait_reason = chip_reason.fillna("CHIP_WEAK") if isinstance(chip_reason, pd.Series) else "CHIP_WEAK"
@@ -1665,52 +1655,6 @@ class MA5MA20StrategyRunner:
 
         self.db_writer.write_dataframe(events_df, table, if_exists="append")
 
-    def _write_candidates(self, latest_date: dt.date, signals: pd.DataFrame) -> None:
-        tbl = self.params.candidates_table
-
-        latest = signals[signals["date"].dt.date == latest_date].copy()
-        if latest.empty:
-            self.logger.warning("最新交易日 %s 无任何信号行，已跳过 candidates。", latest_date)
-            return
-
-        action_col = "final_action" if "final_action" in latest.columns else "signal"
-        cands = latest[latest[action_col].isin(["BUY", "BUY_CONFIRM"])].copy()
-        if cands.empty:
-            self._clear_table(tbl)
-            self.logger.info("最新交易日 %s 未筛出 BUY 候选（低频策略：空仓等待）。", latest_date)
-            return
-
-        cands = cands.sort_values(["vol_ratio", "macd_hist"], ascending=False)
-        keep_cols = [
-            "date",
-            "code",
-            "close",
-            "ma5",
-            "ma20",
-            "ma60",
-            "ma250",
-            "vol_ratio",
-            "macd_hist",
-            "kdj_k",
-            "kdj_d",
-            "atr14",
-            "stop_ref",
-            "yearline_state",
-            "risk_tag",
-            "risk_note",
-            "reason",
-            "final_action",
-            "final_reason",
-            "final_cap",
-        ]
-        cands = cands[keep_cols].copy()
-        cands = cands.rename(columns={"date": "sig_date"})
-        cands["sig_date"] = pd.to_datetime(cands["sig_date"]).dt.date
-        cands["code"] = cands["code"].astype(str)
-
-        self._clear_table(tbl)
-        self.db_writer.write_dataframe(cands, tbl, if_exists="append")
-
     def _precompute_chip_filter(self, signals: pd.DataFrame) -> None:
         """策略运行结束后触发筹码预计算，盘前准备 ready signals。"""
 
@@ -1806,14 +1750,9 @@ class MA5MA20StrategyRunner:
             .drop_duplicates(subset=["code", "date"], keep="last")
             .reset_index(drop=True)
         )
-        sig_for_candidates = sig.copy()
-        sig_for_candidates["code"] = sig_for_candidates["code"].astype(str)
-
         sig["code"] = sig["code"].astype(str)
-        snapshot_only_codes = calc_codes_set - set(signal_codes) if calc_codes_set else set()
-        if snapshot_only_codes:
-            sig_for_candidates = sig_for_candidates[~sig_for_candidates["code"].isin(snapshot_only_codes)]
         sig_for_write = sig.copy()
+        snapshot_only_codes = calc_codes_set - set(signal_codes) if calc_codes_set else set()
         if snapshot_only_codes:
             snapshot_mask = sig_for_write["code"].isin(snapshot_only_codes)
             latest_mask = sig_for_write["date"].dt.date == latest_date
@@ -1828,8 +1767,6 @@ class MA5MA20StrategyRunner:
 
         self._write_indicator_daily(latest_date, sig, calc_codes)
         self._write_signal_events(latest_date, sig_for_write, calc_codes)
-        if not bool(getattr(self.params, "candidates_as_view", False)):
-            self._write_candidates(latest_date, sig_for_candidates)
 
         self._precompute_chip_filter(sig_for_write)
 

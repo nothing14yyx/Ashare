@@ -68,81 +68,9 @@ class OpenMonitorEnvService:
             "weekly_asof_trade_date": row.get("env_weekly_asof_trade_date"),
             "weekly_risk_level": row.get("env_weekly_risk_level"),
             "weekly_scene_code": row.get("env_weekly_scene"),
-            "weekly_plan_json": row.get("env_weekly_plan_json"),
-            "weekly_plan_a": row.get("env_weekly_plan_a"),
-            "weekly_plan_b": row.get("env_weekly_plan_b"),
-            "weekly_plan_a_exposure_cap": row.get("env_weekly_plan_a_exposure_cap"),
-            "weekly_bias": row.get("env_weekly_bias"),
-            "weekly_status": row.get("env_weekly_status"),
-            "weekly_structure_status": row.get("env_weekly_structure_status"),
-            "weekly_pattern_status": row.get("env_weekly_pattern_status"),
-            "weekly_gating_enabled": row.get("env_weekly_gating_enabled"),
-            "weekly_tags": row.get("env_weekly_tags"),
-            "weekly_money_proxy": row.get("env_weekly_money_proxy"),
-            "weekly_note": row.get("env_weekly_note"),
+            "weekly_gate_policy": row.get("env_weekly_gate_policy"),
+            "weekly_gate_action": row.get("env_weekly_gate_action"),
         }
-
-        def _is_empty_env_value(value: Any) -> bool:
-            if value is None:
-                return True
-            if isinstance(value, str):
-                return value.strip() == ""
-            if isinstance(value, dict):
-                return len(value) == 0
-            if isinstance(value, (list, tuple, set)):
-                return len(value) == 0
-
-            size = getattr(value, "size", None)
-            if isinstance(size, int):
-                return size == 0
-
-            try:
-                return len(value) == 0  # type: ignore[arg-type]
-            except Exception:
-                return False
-
-        raw_plan_json = row.get("env_weekly_plan_json")
-        plan_dict: dict[str, Any] = {}
-        if isinstance(raw_plan_json, str):
-            plan_text = raw_plan_json.strip()
-            if plan_text:
-                try:
-                    parsed = json.loads(plan_text)
-                    if isinstance(parsed, dict):
-                        plan_dict = parsed
-                except Exception as exc:  # noqa: BLE001
-                    self.logger.debug("解析 env_weekly_plan_json 失败：%s", exc)
-        elif isinstance(raw_plan_json, dict):
-            plan_dict = raw_plan_json
-
-        def _backfill(target_key: str, source_key: str | None = None) -> None:
-            if not isinstance(plan_dict, dict):
-                return
-            if not _is_empty_env_value(weekly_scenario.get(target_key)):
-                return
-            plan_key = source_key or target_key
-            value = plan_dict.get(plan_key)
-            if _is_empty_env_value(value):
-                return
-            weekly_scenario[target_key] = value
-
-        _backfill("weekly_current_week_closed")
-        _backfill("weekly_risk_score")
-        _backfill("weekly_key_levels_str")
-        _backfill("weekly_plan_a_if")
-        _backfill("weekly_plan_a_then")
-        _backfill("weekly_plan_a_confirm")
-        _backfill("weekly_plan_b_if")
-        _backfill("weekly_plan_b_then")
-        _backfill("weekly_plan_b_recover_if")
-        _backfill("weekly_structure_tags")
-        _backfill("weekly_confirm_tags")
-        _backfill("weekly_money_tags")
-        _backfill("weekly_direction_confirmed")
-        _backfill("weekly_key_levels")
-        _backfill("weekly_structure_status")
-        _backfill("weekly_pattern_status")
-        _backfill("weekly_status", "weekly_structure_status")
 
         index_snapshot_hash = row.get("env_index_snapshot_hash")
         loaded_index_snapshot = self.repo.load_index_snapshot_by_hash(index_snapshot_hash)
@@ -152,57 +80,19 @@ class OpenMonitorEnvService:
             "weekly_asof_trade_date": weekly_scenario.get("weekly_asof_trade_date"),
             "weekly_risk_level": weekly_scenario.get("weekly_risk_level"),
             "weekly_scene_code": weekly_scenario.get("weekly_scene_code"),
-            "weekly_plan_json": weekly_scenario.get("weekly_plan_json"),
-            "weekly_plan_a": weekly_scenario.get("weekly_plan_a"),
-            "weekly_plan_b": weekly_scenario.get("weekly_plan_b"),
-            "weekly_plan_a_exposure_cap": weekly_scenario.get("weekly_plan_a_exposure_cap"),
-            "weekly_bias": weekly_scenario.get("weekly_bias"),
-            "weekly_status": weekly_scenario.get("weekly_status"),
-            "weekly_structure_status": weekly_scenario.get("weekly_structure_status")
-            or weekly_scenario.get("weekly_status"),
-            "weekly_pattern_status": weekly_scenario.get("weekly_pattern_status"),
-            "weekly_direction_confirmed": weekly_scenario.get("weekly_direction_confirmed"),
-            "weekly_money_tags": weekly_scenario.get("weekly_money_tags"),
-            "weekly_gating_enabled": bool(weekly_scenario.get("weekly_gating_enabled", False)),
-            "weekly_tags": weekly_scenario.get("weekly_tags"),
-            "weekly_money_proxy": weekly_scenario.get("weekly_money_proxy"),
-            "weekly_note": weekly_scenario.get("weekly_note"),
+            "weekly_gate_policy": weekly_scenario.get("weekly_gate_policy"),
+            "weekly_gate_action": weekly_scenario.get("weekly_gate_action"),
             "regime": row.get("env_regime"),
             "index_score": row.get("env_index_score"),
             "position_hint": row.get("env_position_hint"),
-            "position_hint_raw": row.get("env_position_hint_raw"),
             "effective_position_hint": row.get("env_position_hint"),
-            "weekly_gate_policy": (
-                row.get("env_weekly_gate_policy") or row.get("env_weekly_gate_action")
-            ),
             "run_id": row.get("run_id"),
-            "run_pk": row.get("run_pk"),
             "env_index_snapshot_hash": index_snapshot_hash,
             "env_final_gate_action": row.get("env_final_gate_action"),
             "env_final_cap_pct": row.get("env_final_cap_pct"),
             "env_final_reason_json": row.get("env_final_reason_json"),
         }
         index_snapshot = loaded_index_snapshot or {
-            "env_index_code": row.get("env_index_code"),
-            "env_index_asof_trade_date": row.get("env_index_asof_trade_date"),
-            "env_index_asof_close": row.get("env_index_asof_close"),
-            "env_index_asof_ma20": row.get("env_index_asof_ma20"),
-            "env_index_asof_ma60": row.get("env_index_asof_ma60"),
-            "env_index_asof_macd_hist": row.get("env_index_asof_macd_hist"),
-            "env_index_asof_atr14": row.get("env_index_asof_atr14"),
-            "env_index_live_trade_date": row.get("env_index_live_trade_date"),
-            "env_index_live_open": row.get("env_index_live_open"),
-            "env_index_live_high": row.get("env_index_live_high"),
-            "env_index_live_low": row.get("env_index_live_low"),
-            "env_index_live_latest": row.get("env_index_live_latest"),
-            "env_index_live_pct_change": row.get("env_index_live_pct_change"),
-            "env_index_live_volume": row.get("env_index_live_volume"),
-            "env_index_live_amount": row.get("env_index_live_amount"),
-            "env_index_dev_ma20_atr": row.get("env_index_dev_ma20_atr"),
-            "env_index_gate_action": row.get("env_index_gate_action"),
-            "env_index_gate_reason": row.get("env_index_gate_reason"),
-            "env_index_position_cap": row.get("env_index_position_cap"),
-            "env_final_gate_action": row.get("env_final_gate_action"),
             "env_index_snapshot_hash": index_snapshot_hash,
         }
         env_context["index_intraday"] = index_snapshot
@@ -236,7 +126,6 @@ class OpenMonitorEnvService:
         *,
         monitor_date: str | None = None,
         run_id: str | None = None,
-        run_pk: int | None = None,
         checked_at: dt.datetime | None = None,
         fetch_index_live_quote: Callable[[], dict[str, Any]] | None = None,
     ) -> dict[str, Any] | None:
@@ -246,16 +135,6 @@ class OpenMonitorEnvService:
             monitor_date = checked_at.date().isoformat()
         if run_id is None:
             run_id = calc_run_id(checked_at, self.params.run_id_minutes)
-
-        if run_pk is not None and monitor_date and run_id:
-            updated = self.repo.update_env_snapshot_run_pk(monitor_date, run_id, run_pk)
-            if updated:
-                self.logger.info(
-                    "已回填环境快照 run_pk（monitor_date=%s, run_id=%s, run_pk=%s）。",
-                    monitor_date,
-                    run_id,
-                    run_pk,
-                )
 
         env_context = self.build_environment_context(
             latest_trade_date, checked_at=checked_at
@@ -281,9 +160,7 @@ class OpenMonitorEnvService:
             env_context,
             monitor_date,
             run_id,
-            checked_at,
             weekly_gate_policy,
-            run_pk=run_pk,
         )
 
         return env_context

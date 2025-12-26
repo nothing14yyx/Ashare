@@ -23,7 +23,6 @@ from .utils.convert import to_float as _to_float
 SNAPSHOT_HASH_EXCLUDE = {
     "checked_at",
     "run_id",
-    "run_pk",
 }
 
 READY_SIGNALS_REQUIRED_COLS = (
@@ -383,7 +382,9 @@ class OpenMonitorRepository:
 
         self._ready_signals_used = True
 
-        monitor_date = dt.date.today().isoformat()
+        monitor_date = str(getattr(self.params, "monitor_date", "") or "").strip()
+        if not monitor_date:
+            monitor_date = dt.date.today().isoformat()
         lookback = max(int(self.params.signal_lookback_days or 0), 1)
 
         cache_key = (monitor_date, view, lookback, str(self.params.strategy_code))
@@ -799,11 +800,17 @@ class OpenMonitorRepository:
         self, codes: List[str], as_of: dt.datetime | None = None
     ) -> Dict[str, float]:
         table = self.params.output_table
-        if not codes or not self._table_exists(table):
+        run_table = self.params.run_table
+        if (
+            not codes
+            or not run_table
+            or not self._table_exists(table)
+            or not self._table_exists(run_table)
+        ):
             return {}
 
         if not self._column_exists(table, "signal_strength") or not self._column_exists(
-            table, "checked_at"
+            run_table, "checked_at"
         ):
             return {}
 
@@ -811,14 +818,24 @@ class OpenMonitorRepository:
             f"""
             SELECT t1.`code`, t1.`signal_strength`
             FROM `{table}` t1
+            JOIN `{run_table}` r1
+              ON t1.`monitor_date` = r1.`monitor_date`
+             AND t1.`run_id` = r1.`run_id`
             JOIN (
-                SELECT `code`, MAX(`checked_at`) AS latest_checked
-                FROM `{table}`
-                WHERE `code` IN :codes AND `signal_strength` IS NOT NULL {"AND `checked_at` < :as_of" if as_of else ""}
-                GROUP BY `code`
+                SELECT e.`code`, MAX(r.`checked_at`) AS latest_checked
+                FROM `{table}` e
+                JOIN `{run_table}` r
+                  ON e.`monitor_date` = r.`monitor_date`
+                 AND e.`run_id` = r.`run_id`
+                WHERE e.`code` IN :codes
+                  AND e.`signal_strength` IS NOT NULL
+                  {"AND r.`checked_at` < :as_of" if as_of else ""}
+                GROUP BY e.`code`
             ) t2
-              ON t1.`code` = t2.`code` AND t1.`checked_at` = t2.`latest_checked`
-            WHERE t1.`code` IN :codes AND t1.`signal_strength` IS NOT NULL {"AND t1.`checked_at` < :as_of" if as_of else ""}
+              ON t1.`code` = t2.`code` AND r1.`checked_at` = t2.`latest_checked`
+            WHERE t1.`code` IN :codes
+              AND t1.`signal_strength` IS NOT NULL
+              {"AND r1.`checked_at` < :as_of" if as_of else ""}
             """
         ).bindparams(bindparam("codes", expanding=True))
 
@@ -882,8 +899,7 @@ class OpenMonitorRepository:
         *,
         checked_at: dt.datetime | None,
         triggered_at: dt.datetime | None = None,
-        env_index_snapshot_hash: str | None = None,
-        params_json: str | None = None,
+        params_json: str | dict[str, Any] | None = None,
     ) -> int | None:
         table = getattr(self.params, "run_table", None)
         if not (table and monitor_date and run_id and self._table_exists(table)):
@@ -891,19 +907,20 @@ class OpenMonitorRepository:
 
         parsed_monitor = pd.to_datetime(monitor_date, errors="coerce")
         monitor_date_val = parsed_monitor.date() if not pd.isna(parsed_monitor) else monitor_date
+        params_payload = params_json
+        if isinstance(params_json, dict):
+            params_payload = json.dumps(params_json, ensure_ascii=False, separators=(",", ":"))
         payload = {
             "monitor_date": monitor_date_val,
             "run_id": run_id,
             "triggered_at": triggered_at,
             "checked_at": checked_at,
-            "env_index_snapshot_hash": env_index_snapshot_hash,
-            "params_json": params_json,
+            "params_json": params_payload,
         }
         columns = list(payload.keys())
         update_clause = """
             `triggered_at` = COALESCE(`triggered_at`, VALUES(`triggered_at`)),
             `checked_at` = VALUES(`checked_at`),
-            `env_index_snapshot_hash` = COALESCE(VALUES(`env_index_snapshot_hash`), `env_index_snapshot_hash`),
             `params_json` = COALESCE(VALUES(`params_json`), `params_json`)
         """
         stmt = text(
@@ -939,61 +956,6 @@ class OpenMonitorRepository:
             self.logger.debug("读取 run_pk 失败：%s", exc)
         return None
 
-
-    def _ensure_run_pk_inplace(self, df: pd.DataFrame) -> None:
-        """Ensure df has non-null run_pk derived from (monitor_date, run_id).
-
-        Some upstream steps only carry (monitor_date, run_id) and forget to attach run_pk.
-        This helper backfills run_pk via strategy_open_monitor_run so downstream joins are stable.
-        """
-
-        if df is None or df.empty:
-            return
-
-        if "run_id" not in df.columns or "monitor_date" not in df.columns:
-            return
-
-        if "run_pk" not in df.columns:
-            df["run_pk"] = None
-
-
-        need_mask = df["run_pk"].isna()
-        if not need_mask.any():
-            return
-
-        def _norm_monitor_date(v):
-            if v is None:
-                return None
-            # pandas Timestamp
-            if isinstance(v, pd.Timestamp):
-                if pd.isna(v):
-                    return None
-                return v.date().isoformat()
-            # datetime/date
-            if isinstance(v, dt.datetime):
-                return v.date().isoformat()
-            if isinstance(v, dt.date):
-                return v.isoformat()
-            s = str(v).strip()
-            if not s or s.lower() == "nat":
-                return None
-            return s
-
-        # Only iterate unique (monitor_date, run_id) that need backfill
-        pairs = df.loc[need_mask, ["monitor_date", "run_id"]].drop_duplicates()
-        for md, rid in pairs.itertuples(index=False, name=None):
-            md2 = _norm_monitor_date(md)
-            rid2 = str(rid).strip() if rid is not None else ""
-            if not (md2 and rid2):
-                continue
-
-            run_pk = self.ensure_run_context(monitor_date=md2, run_id=rid2, checked_at=None)
-            if run_pk is None:
-                continue
-
-            # assign into the rows still missing
-            df.loc[(df["monitor_date"] == md) & (df["run_id"] == rid) & (df["run_pk"].isna()), "run_pk"] = int(run_pk)
-
     def env_snapshot_exists(self, monitor_date: str, run_id: str) -> bool:
         table = self.params.env_snapshot_table
         if not (table and monitor_date and run_id and self._table_exists(table)):
@@ -1014,33 +976,6 @@ class OpenMonitorRepository:
             self.logger.debug("检查环境快照是否存在失败：%s", exc)
             return False
 
-    def update_env_snapshot_run_pk(
-        self,
-        monitor_date: str,
-        run_id: str,
-        run_pk: int,
-    ) -> int:
-        table = self.params.env_snapshot_table
-        if not (table and monitor_date and run_id and run_pk and self._table_exists(table)):
-            return 0
-
-        stmt = text(
-            f"""
-            UPDATE `{table}`
-            SET `run_pk` = :run_pk
-            WHERE `monitor_date` = :d
-              AND `run_id` = :r
-              AND `run_pk` IS NULL
-            """
-        )
-        try:
-            with self.engine.begin() as conn:
-                result = conn.execute(stmt, {"d": monitor_date, "r": run_id, "run_pk": run_pk})
-                return int(getattr(result, "rowcount", 0) or 0)
-        except Exception as exc:  # noqa: BLE001
-            self.logger.debug("回填 env_snapshot.run_pk 失败：%s", exc)
-            return 0
-
     def load_env_snapshot_row(
         self, monitor_date: str, run_id: str | None
     ) -> pd.DataFrame | None:
@@ -1055,7 +990,6 @@ class OpenMonitorRepository:
             f"""
             SELECT * FROM `{table}`
             WHERE `run_id` = :b AND `monitor_date` = :d
-            ORDER BY `checked_at` DESC
             LIMIT 1
             """
         )
@@ -1127,10 +1061,7 @@ class OpenMonitorRepository:
         env_context: dict[str, Any] | None,
         monitor_date: str,
         run_id: str,
-        checked_at: dt.datetime,
         env_weekly_gate_policy: str | None,
-        *,
-        run_pk: int | None = None,
     ) -> None:
         if not env_context:
             return
@@ -1148,11 +1079,12 @@ class OpenMonitorRepository:
             weekly_scenario = {}
 
         index_score = _to_float(env_context.get("index_score"))
+        index_score_val = int(round(index_score)) if index_score is not None else None
         regime = env_context.get("regime")
         position_hint = _to_float(env_context.get("position_hint"))
         if regime is not None:
             regime = str(regime).strip() or None
-        if index_score is None or regime is None or position_hint is None:
+        if index_score_val is None or regime is None or position_hint is None:
             self.logger.error(
                 "环境快照缺少指数环境字段：index_score=%s regime=%s position_hint=%s",
                 index_score,
@@ -1168,8 +1100,6 @@ class OpenMonitorRepository:
 
         payload["monitor_date"] = monitor_date_val
         payload["run_id"] = run_id
-        payload["run_pk"] = run_pk
-        payload["checked_at"] = checked_at
         env_weekly_asof = _get_env("weekly_asof_trade_date")
         if env_weekly_asof is not None:
             parsed_weekly = pd.to_datetime(env_weekly_asof, errors="coerce")
@@ -1185,7 +1115,7 @@ class OpenMonitorRepository:
             or env_weekly_gate_policy
         )
         payload["env_weekly_gate_action"] = weekly_gate_action
-        payload["env_index_score"] = index_score
+        payload["env_index_score"] = index_score_val
         payload["env_regime"] = regime
         payload["env_position_hint"] = position_hint
         index_snapshot = {}
@@ -1345,7 +1275,6 @@ class OpenMonitorRepository:
         keep_cols = [
             "monitor_date",
             "run_id",
-            "run_pk",
             "code",
             "live_trade_date",
             "live_open",
@@ -1366,10 +1295,6 @@ class OpenMonitorRepository:
         quotes["run_id"] = quotes["run_id"].fillna(
             calc_run_id(dt.datetime.now(), self.params.run_id_minutes)
         )
-        if "run_pk" not in quotes.columns:
-            quotes["run_pk"] = None
-
-        self._ensure_run_pk_inplace(quotes)
         quotes["code"] = quotes["code"].astype(str)
 
         monitor_dates = quotes["monitor_date"].dropna().astype(str).unique().tolist()
@@ -1423,8 +1348,6 @@ class OpenMonitorRepository:
         df["run_id"] = df["run_id"].fillna(
             calc_run_id(dt.datetime.now(), self.params.run_id_minutes)
         )
-        if "run_pk" not in df.columns:
-            df["run_pk"] = None
 
         for col in ["monitor_date", "sig_date", "asof_trade_date", "live_trade_date"]:
             if col in df.columns:

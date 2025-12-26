@@ -392,15 +392,6 @@ class OpenMonitorEvaluator:
         effective_stop_refs: List[float | None] = []
         rule_hits_json_list: List[str | None] = []
         summary_lines: List[str | None] = []
-        env_index_snapshot_hashes: List[str | None] = []
-        env_final_gate_action_list: List[str | None] = []
-        env_regimes: List[str | None] = []
-        # feat: 补齐环境侧结构化字段（避免只剩 reason 文本）
-        env_index_scores: List[float | None] = []
-        env_position_hints: List[float | None] = []
-        env_weekly_asof_trade_dates: List[str | None] = []
-        env_weekly_risk_levels: List[str | None] = []
-        env_weekly_scene_list: List[str | None] = []
 
         max_up = self.rule_config.max_gap_up_pct
         max_up_atr_mult = self.rule_config.max_gap_up_atr_mult
@@ -606,14 +597,6 @@ class OpenMonitorEvaluator:
             signal_kinds.append("PULLBACK" if is_pullback else "CROSS")
             rule_hits_json_list.append(rule_hits_json)
             summary_lines.append(summary_line)
-            env_index_snapshot_hashes.append(env.index_snapshot_hash)
-            env_final_gate_action_list.append(result.env_gate_action or env.gate_action)
-            env_regimes.append(env.regime)
-            env_index_scores.append(env.score)
-            env_position_hints.append(env.position_hint)
-            env_weekly_asof_trade_dates.append(env.weekly_asof_trade_date)
-            env_weekly_risk_levels.append(env.weekly_risk_level)
-            env_weekly_scene_list.append(env.weekly_scene)
 
         merged["monitor_date"] = monitor_date
         if "live_trade_date" not in merged.columns:
@@ -631,19 +614,7 @@ class OpenMonitorEvaluator:
         merged["trade_stop_ref"] = trade_stop_refs
         merged["effective_stop_ref"] = effective_stop_refs
         merged["entry_exposure_cap"] = entry_exposure_caps
-        merged["checked_at"] = checked_at_ts
         merged["run_id"] = run_id_val
-        merged["env_regime"] = env_regimes
-        merged["env_index_score"] = env_index_scores
-        merged["env_position_hint"] = env_position_hints
-        merged["env_weekly_asof_trade_date"] = env_weekly_asof_trade_dates
-        merged["env_weekly_risk_level"] = env_weekly_risk_levels
-        merged["env_weekly_scene"] = env_weekly_scene_list
-        merged["env_weekly_structure_status"] = None
-        merged["env_weekly_pattern_status"] = None
-        merged["env_weekly_gate_action"] = None
-        merged["env_final_gate_action"] = env_final_gate_action_list
-        merged["env_index_snapshot_hash"] = env_index_snapshot_hashes
         merged["runup_from_sigclose"] = runup_from_sigclose_list
         merged["runup_from_sigclose_atr"] = runup_from_sigclose_atr_list
         merged["runup_ref_price"] = runup_ref_price_list
@@ -728,17 +699,6 @@ class OpenMonitorEvaluator:
             "runup_ref_price",
             "runup_ref_source",
             "entry_exposure_cap",
-            "env_index_score",
-            "env_regime",
-            "env_position_hint",
-            "env_index_snapshot_hash",
-            "env_final_gate_action",
-            "env_weekly_asof_trade_date",
-            "env_weekly_risk_level",
-            "env_weekly_scene",
-            "env_weekly_structure_status",
-            "env_weekly_pattern_status",
-            "env_weekly_gate_action",
             "industry",
             "board_name",
             "board_code",
@@ -760,9 +720,7 @@ class OpenMonitorEvaluator:
             "status_reason",
             "action",
             "action_reason",
-            "checked_at",
             "run_id",
-            "run_pk",
             "snapshot_hash",
         ]
 
@@ -800,14 +758,6 @@ class OpenMonitorEvaluator:
             "runup_ref_price",
             "runup_ref_source",
             "effective_stop_ref",
-            "env_regime",
-            "env_position_hint",
-            "env_index_score",
-            "env_index_snapshot_hash",
-            "env_final_gate_action",
-            "env_weekly_asof_trade_date",
-            "env_weekly_risk_level",
-            "env_weekly_scene",
             "board_name",
             "board_code",
             "board_status",
@@ -828,9 +778,7 @@ class OpenMonitorEvaluator:
             "status_reason",
             "action",
             "action_reason",
-            "checked_at",
             "run_id",
-            "run_pk",
             "snapshot_hash",
         ]
 
@@ -1028,6 +976,12 @@ class OpenMonitorEvaluator:
                 time_part = checked_at.split(" ", 1)[1].replace(":", "").replace(".", "")
                 if time_part:
                     suffix = f"_{time_part}"
+            if not suffix:
+                run_id = str(df.iloc[0].get("run_id") or "").strip()
+                if run_id and " " in run_id:
+                    time_part = run_id.split(" ", 1)[1].replace(":", "").replace(".", "")
+                    if time_part:
+                        suffix = f"_{time_part}"
 
         path = outdir / f"open_monitor_{monitor_date}{suffix}.csv"
 

@@ -307,14 +307,12 @@ class MA5MA20OpenMonitorRunner:
         *,
         monitor_date: str | None = None,
         run_id: str | None = None,
-        run_pk: int | None = None,
         checked_at: dt.datetime | None = None,
     ) -> dict[str, Any] | None:
         return self.env_service.build_and_persist_env_snapshot(
             latest_trade_date,
             monitor_date=monitor_date,
             run_id=run_id,
-            run_pk=run_pk,
             checked_at=checked_at,
             fetch_index_live_quote=self.market_data.fetch_index_live_quote,
         )
@@ -349,7 +347,7 @@ class MA5MA20OpenMonitorRunner:
         self.market_data.params = self.params
         run_id = self._calc_run_id(checked_at)
         run_params_json = self._build_run_params_json()
-        run_pk = self.repo.ensure_run_context(
+        self.repo.ensure_run_context(
             monitor_date,
             run_id,
             checked_at=checked_at,
@@ -370,7 +368,6 @@ class MA5MA20OpenMonitorRunner:
                     latest_trade_date,
                     monitor_date=monitor_date,
                     run_id=run_id,
-                    run_pk=run_pk,
                     checked_at=checked_at,
                 )
                 self.logger.info(
@@ -416,18 +413,6 @@ class MA5MA20OpenMonitorRunner:
             env_final_gate_action,
         )
         self.env_service.log_weekly_scenario(env_context)
-        env_index_snapshot_hash = (
-            env_context.get("env_index_snapshot_hash") if isinstance(env_context, dict) else None
-        )
-        if env_index_snapshot_hash:
-            run_pk = self.repo.ensure_run_context(
-                monitor_date,
-                run_id,
-                checked_at=checked_at,
-                env_index_snapshot_hash=str(env_index_snapshot_hash),
-                params_json=run_params_json,
-            )
-
         result = self.evaluator.evaluate(
             signals,
             quotes,
@@ -442,9 +427,6 @@ class MA5MA20OpenMonitorRunner:
 
         if result.empty:
             return
-        if run_pk is not None:
-            result["run_pk"] = run_pk
-
         rank_env_context = env_context
         if isinstance(env_context, dict) and "boards" not in env_context:
             try:
