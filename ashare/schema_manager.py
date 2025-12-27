@@ -41,10 +41,6 @@ VIEW_STRATEGY_OPEN_MONITOR = "v_strategy_open_monitor"
 # 实时市场快照
 TABLE_STRATEGY_REALTIME_MARKET_SNAPSHOT = "strategy_realtime_market_snapshot"
 
-# 旧命名（仅用于自动迁移）
-LEGACY_TABLE_STRATEGY_OPEN_MONITOR_ENV = "strategy_open_monitor_env"
-LEGACY_TABLE_ENV_INDEX_SNAPSHOT = "strategy_env_index_snapshot"
-
 
 @dataclass(frozen=True)
 class TableNames:
@@ -59,8 +55,6 @@ class TableNames:
     open_monitor_view: str
     open_monitor_wide_view: str
     open_monitor_quote_table: str
-
-
 
 
 def _to_bool(value: object, default: bool = False) -> bool:
@@ -127,7 +121,6 @@ class SchemaManager:
         )
         self._ensure_v_pnl_view()
 
-        self._rename_legacy_tables(tables)
         self._ensure_open_monitor_eval_table(tables.open_monitor_eval_table)
         self._ensure_open_monitor_run_table(tables.open_monitor_run_table)
         self._ensure_open_monitor_quote_table(tables.open_monitor_quote_table)
@@ -157,78 +150,78 @@ class SchemaManager:
 
         default_indicator = strat_cfg.get("indicator_table", TABLE_STRATEGY_INDICATOR_DAILY)
         indicator_table = (
-            str(open_monitor_cfg.get("indicator_table", default_indicator)).strip()
-            or TABLE_STRATEGY_INDICATOR_DAILY
+                str(open_monitor_cfg.get("indicator_table", default_indicator)).strip()
+                or TABLE_STRATEGY_INDICATOR_DAILY
         )
         default_events = (
-            strat_cfg.get("signal_events_table")
-            or strat_cfg.get("signals_table")
-            or TABLE_STRATEGY_SIGNAL_EVENTS
+                strat_cfg.get("signal_events_table")
+                or strat_cfg.get("signals_table")
+                or TABLE_STRATEGY_SIGNAL_EVENTS
         )
         signal_events_table = (
-            str(open_monitor_cfg.get("signal_events_table", default_events)).strip()
-            or TABLE_STRATEGY_SIGNAL_EVENTS
+                str(open_monitor_cfg.get("signal_events_table", default_events)).strip()
+                or TABLE_STRATEGY_SIGNAL_EVENTS
         )
         ready_signals_view = (
-            str(open_monitor_cfg.get("ready_signals_view", VIEW_STRATEGY_READY_SIGNALS)).strip()
-            or VIEW_STRATEGY_READY_SIGNALS
+                str(open_monitor_cfg.get("ready_signals_view", VIEW_STRATEGY_READY_SIGNALS)).strip()
+                or VIEW_STRATEGY_READY_SIGNALS
         )
         open_monitor_eval_table = (
-            str(open_monitor_cfg.get("output_table", TABLE_STRATEGY_OPEN_MONITOR_EVAL)).strip()
-            or TABLE_STRATEGY_OPEN_MONITOR_EVAL
+                str(open_monitor_cfg.get("output_table", TABLE_STRATEGY_OPEN_MONITOR_EVAL)).strip()
+                or TABLE_STRATEGY_OPEN_MONITOR_EVAL
         )
         open_monitor_run_table = (
-            str(open_monitor_cfg.get("run_table", TABLE_STRATEGY_OPEN_MONITOR_RUN)).strip()
-            or TABLE_STRATEGY_OPEN_MONITOR_RUN
+                str(open_monitor_cfg.get("run_table", TABLE_STRATEGY_OPEN_MONITOR_RUN)).strip()
+                or TABLE_STRATEGY_OPEN_MONITOR_RUN
         )
         env_snapshot_table = (
-            str(open_monitor_cfg.get("env_snapshot_table", TABLE_STRATEGY_WEEKLY_MARKET_ENV)).strip()
-            or TABLE_STRATEGY_WEEKLY_MARKET_ENV
+                str(open_monitor_cfg.get("env_snapshot_table", TABLE_STRATEGY_WEEKLY_MARKET_ENV)).strip()
+                or TABLE_STRATEGY_WEEKLY_MARKET_ENV
         )
         env_index_snapshot_table = (
-            str(
-                open_monitor_cfg.get(
-                    "env_index_snapshot_table",
-                    TABLE_STRATEGY_REALTIME_MARKET_SNAPSHOT,
-                )
-            ).strip()
-            or TABLE_STRATEGY_REALTIME_MARKET_SNAPSHOT
+                str(
+                    open_monitor_cfg.get(
+                        "env_index_snapshot_table",
+                        TABLE_STRATEGY_REALTIME_MARKET_SNAPSHOT,
+                    )
+                ).strip()
+                or TABLE_STRATEGY_REALTIME_MARKET_SNAPSHOT
         )
         open_monitor_env_view = (
-            str(
-                open_monitor_cfg.get(
-                    "open_monitor_env_view",
-                    VIEW_STRATEGY_OPEN_MONITOR_ENV,
-                )
-            ).strip()
-            or VIEW_STRATEGY_OPEN_MONITOR_ENV
+                str(
+                    open_monitor_cfg.get(
+                        "open_monitor_env_view",
+                        VIEW_STRATEGY_OPEN_MONITOR_ENV,
+                    )
+                ).strip()
+                or VIEW_STRATEGY_OPEN_MONITOR_ENV
         )
         open_monitor_view = (
-            str(
-                open_monitor_cfg.get(
-                    "open_monitor_view",
-                    VIEW_STRATEGY_OPEN_MONITOR,
-                )
-            ).strip()
-            or VIEW_STRATEGY_OPEN_MONITOR
+                str(
+                    open_monitor_cfg.get(
+                        "open_monitor_view",
+                        VIEW_STRATEGY_OPEN_MONITOR,
+                    )
+                ).strip()
+                or VIEW_STRATEGY_OPEN_MONITOR
         )
         open_monitor_wide_view = (
-            str(
-                open_monitor_cfg.get(
-                    "open_monitor_wide_view",
-                    VIEW_STRATEGY_OPEN_MONITOR_WIDE,
-                )
-            ).strip()
-            or VIEW_STRATEGY_OPEN_MONITOR_WIDE
+                str(
+                    open_monitor_cfg.get(
+                        "open_monitor_wide_view",
+                        VIEW_STRATEGY_OPEN_MONITOR_WIDE,
+                    )
+                ).strip()
+                or VIEW_STRATEGY_OPEN_MONITOR_WIDE
         )
         open_monitor_quote_table = (
-            str(
-                open_monitor_cfg.get(
-                    "quote_table",
-                    TABLE_STRATEGY_OPEN_MONITOR_QUOTE,
-                )
-            ).strip()
-            or TABLE_STRATEGY_OPEN_MONITOR_QUOTE
+                str(
+                    open_monitor_cfg.get(
+                        "quote_table",
+                        TABLE_STRATEGY_OPEN_MONITOR_QUOTE,
+                    )
+                ).strip()
+                or TABLE_STRATEGY_OPEN_MONITOR_QUOTE
         )
 
         return TableNames(
@@ -244,18 +237,6 @@ class SchemaManager:
             open_monitor_wide_view=open_monitor_wide_view,
             open_monitor_quote_table=open_monitor_quote_table,
         )
-
-    def _rename_legacy_tables(self, tables: TableNames) -> None:
-        if tables.env_snapshot_table == TABLE_STRATEGY_WEEKLY_MARKET_ENV:
-            self._rename_table_if_needed(
-                LEGACY_TABLE_STRATEGY_OPEN_MONITOR_ENV,
-                TABLE_STRATEGY_WEEKLY_MARKET_ENV,
-            )
-        if tables.env_index_snapshot_table == TABLE_STRATEGY_REALTIME_MARKET_SNAPSHOT:
-            self._rename_table_if_needed(
-                LEGACY_TABLE_ENV_INDEX_SNAPSHOT,
-                TABLE_STRATEGY_REALTIME_MARKET_SNAPSHOT,
-            )
 
     def _rename_table_if_needed(self, old_name: str, new_name: str) -> None:
         if not old_name or not new_name or old_name == new_name:
@@ -436,11 +417,11 @@ class SchemaManager:
             self.logger.info("表 %s.%s 已调整为 DATE。", table, column)
 
     def _create_table(
-        self,
-        table: str,
-        columns: Dict[str, str],
-        *,
-        primary_key: Iterable[str] | None = None,
+            self,
+            table: str,
+            columns: Dict[str, str],
+            *,
+            primary_key: Iterable[str] | None = None,
     ) -> None:
         cols_clause = ",\n".join(f"  `{name}` {ddl}" for name, ddl in columns.items())
         pk_clause = ""
@@ -856,11 +837,11 @@ class SchemaManager:
             self.logger.info("信号事件表 %s 已新增唯一索引 %s。", table, unique_name)
 
     def _ensure_ready_signals_view(
-        self,
-        view: str,
-        events_table: str,
-        indicator_table: str,
-        chip_table: str,
+            self,
+            view: str,
+            events_table: str,
+            indicator_table: str,
+            chip_table: str,
     ) -> None:
         if not view or not events_table:
             return
@@ -902,7 +883,6 @@ class SchemaManager:
             """
         elif indicator_table:
             self.logger.warning("指标表 %s 不存在，ready_signals_view 将以 NULL 补齐指标列。", indicator_table)
-
 
         chip_join = ""
         chip_enabled = False
@@ -1540,10 +1520,10 @@ class SchemaManager:
             self.logger.info("指数环境快照表 %s 已新增索引 %s。", table, run_idx)
 
     def _ensure_open_monitor_env_view(
-        self,
-        view: str,
-        env_table: str,
-        env_index_table: str,
+            self,
+            view: str,
+            env_table: str,
+            env_index_table: str,
     ) -> None:
         if not view:
             return
@@ -1601,13 +1581,13 @@ class SchemaManager:
         self.logger.info("已创建/更新开盘监测环境视图 %s。", view)
 
     def _ensure_open_monitor_view(
-        self,
-        view: str,
-        wide_view: str,
-        eval_table: str,
-        env_view: str,
-        quote_table: str,
-        run_table: str,
+            self,
+            view: str,
+            wide_view: str,
+            eval_table: str,
+            env_view: str,
+            quote_table: str,
+            run_table: str,
     ) -> None:
         if not (wide_view and eval_table and env_view and run_table):
             return

@@ -67,7 +67,6 @@ class OpenMonitorParams:
     checked_at: dt.datetime | None = None
     monitor_date: str | None = None
 
-
     # 信号输入：只接受 ready_signals_view（由 SchemaManager 负责生成/维护）
     ready_signals_view: str = VIEW_STRATEGY_READY_SIGNALS
     # 契约与 fail-fast（默认开启）
@@ -177,24 +176,24 @@ class OpenMonitorParams:
             ready_signals_view=str(
                 sec.get("ready_signals_view", cls.ready_signals_view)
             ).strip()
-            or cls.ready_signals_view,
+                               or cls.ready_signals_view,
             strict_ready_signals_required=_get_bool(
                 "strict_ready_signals_required", cls.strict_ready_signals_required
             ),
             strict_quotes=_get_bool("strict_quotes", cls.strict_quotes),
             quote_table=str(sec.get("quote_table", cls.quote_table)).strip() or cls.quote_table,
             strategy_code=str(sec.get("strategy_code", default_strategy_code)).strip()
-            or default_strategy_code,
+                          or default_strategy_code,
             output_table=str(sec.get("output_table", cls.output_table)).strip() or cls.output_table,
             run_table=str(sec.get("run_table", cls.run_table)).strip() or cls.run_table,
             open_monitor_view=str(
                 sec.get("open_monitor_view", cls.open_monitor_view)
             ).strip()
-            or cls.open_monitor_view,
+                              or cls.open_monitor_view,
             open_monitor_wide_view=str(
                 sec.get("open_monitor_wide_view", cls.open_monitor_wide_view)
             ).strip()
-            or cls.open_monitor_wide_view,
+                                   or cls.open_monitor_wide_view,
             signal_lookback_days=_get_int("signal_lookback_days", cls.signal_lookback_days),
             quote_source=quote_source,
             cross_valid_days=_get_int("cross_valid_days", cls.cross_valid_days),
@@ -211,7 +210,7 @@ class OpenMonitorParams:
             export_csv=_get_bool("export_csv", cls.export_csv),
             export_top_n=_get_int("export_top_n", cls.export_top_n),
             output_subdir=str(sec.get("output_subdir", cls.output_subdir)).strip()
-            or cls.output_subdir,
+                          or cls.output_subdir,
             interval_minutes=interval_minutes,
             run_id_minutes=run_id_minutes,
             unique_code_latest_date_only=_get_bool(
@@ -220,13 +219,13 @@ class OpenMonitorParams:
             env_snapshot_table=str(
                 sec.get("env_snapshot_table", cls.env_snapshot_table)
             ).strip()
-            or cls.env_snapshot_table,
+                               or cls.env_snapshot_table,
             env_index_snapshot_table=str(
                 sec.get("env_index_snapshot_table", cls.env_index_snapshot_table)
             ).strip()
-            or cls.env_index_snapshot_table,
+                                     or cls.env_index_snapshot_table,
             output_mode=str(sec.get("output_mode", cls.output_mode)).strip().upper()
-            or cls.output_mode,
+                        or cls.output_mode,
             persist_env_snapshot=_get_bool("persist_env_snapshot", cls.persist_env_snapshot),
         )
 
@@ -302,12 +301,12 @@ class MA5MA20OpenMonitorRunner:
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
     def build_and_persist_env_snapshot(
-        self,
-        latest_trade_date: str,
-        *,
-        monitor_date: str | None = None,
-        run_id: str | None = None,
-        checked_at: dt.datetime | None = None,
+            self,
+            latest_trade_date: str,
+            *,
+            monitor_date: str | None = None,
+            run_id: str | None = None,
+            checked_at: dt.datetime | None = None,
     ) -> dict[str, Any] | None:
         return self.env_service.build_and_persist_env_snapshot(
             latest_trade_date,
@@ -318,9 +317,9 @@ class MA5MA20OpenMonitorRunner:
         )
 
     def load_env_snapshot_context(
-        self,
-        monitor_date: str,
-        run_id: str | None = None,
+            self,
+            monitor_date: str,
+            run_id: str | None = None,
     ) -> dict[str, Any] | None:
         return self.env_service.load_env_snapshot_context(monitor_date, run_id)
 
