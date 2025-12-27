@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import datetime as dt
 from typing import Any, List
 
 import pandas as pd
@@ -21,9 +20,8 @@ class OpenMonitorMarketData:
         """获取实时行情。
 
         A 修复点：
-        - 行情源常不提供可用的交易日字段，导致宽表里 live_trade_date 全为 null；
-        - 这里仅在“确实拿到了实时价”的行上，用本次 monitor_date（或 checked_at 的日期）回填 live_trade_date；
-        - 若既无 monitor_date 也无 checked_at，则保持为空，让数据问题暴露出来（不回填 today）。
+        - live_trade_date 仅来自行情源字段（trade_date/date/原始 live_trade_date）。
+        - 若行情源未提供交易日字段，保持为空，让数据问题暴露出来。
         """
         if not codes:
             return pd.DataFrame(columns=["code"])
@@ -34,28 +32,17 @@ class OpenMonitorMarketData:
         else:
             df = self._fetch_quotes_eastmoney(codes)
 
-        # ---- A: 补齐 live_trade_date（仅对有实时价的记录回填）----
+        # ---- A: 补齐 live_trade_date（仅使用行情源字段）----
         if "live_trade_date" not in df.columns:
             df["live_trade_date"] = pd.NA
+        for cand in ("trade_date", "date"):
+            if cand in df.columns:
+                df["live_trade_date"] = df["live_trade_date"].fillna(df[cand])
 
-        monitor_date = getattr(self.params, "monitor_date", None)
-        if not monitor_date:
-            checked_at = getattr(self.params, "checked_at", None)
-            if checked_at is not None:
-                try:
-                    monitor_date = checked_at.date().isoformat()
-                except Exception:
-                    monitor_date = None
-
-        if monitor_date:
-            has_live_price = pd.Series(False, index=df.index)
-            for col in ("live_latest", "live_open", "live_high", "live_low"):
-                if col in df.columns:
-                    has_live_price = has_live_price | df[col].notna()
-
-            need_fill = df["live_trade_date"].isna() & has_live_price
-            if need_fill.any():
-                df.loc[need_fill, "live_trade_date"] = monitor_date
+        checked_at = getattr(self.params, "checked_at", None)
+        if checked_at is not None:
+            df["quote_fetched_at"] = checked_at
+            df["quote_fetched_date"] = checked_at.date().isoformat()
 
         return df
 

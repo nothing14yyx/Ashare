@@ -745,21 +745,47 @@ class OpenMonitorRepository:
         }
 
     def load_avg_volume(
-        self, latest_trade_date: str, codes: List[str], window: int = 20
+        self,
+        latest_trade_date: str,
+        codes: List[str],
+        window: int = 20,
+        *,
+        asof_trade_date_map: Dict[str, str] | None = None,
     ) -> Dict[str, float]:
-        if not latest_trade_date or not codes:
+        if not codes:
             return {}
 
         table = self._daily_table()
         if not self._table_exists(table):
             return {}
 
-        try:
-            end_date = pd.to_datetime(latest_trade_date).date()
-        except Exception:
+        parsed_asof_map: Dict[str, dt.date] = {}
+        if isinstance(asof_trade_date_map, dict):
+            for code, raw_date in asof_trade_date_map.items():
+                try:
+                    parsed = pd.to_datetime(raw_date).date()
+                except Exception:
+                    parsed = None
+                if parsed is not None:
+                    parsed_asof_map[str(code)] = parsed
+
+        default_end_date = None
+        if latest_trade_date:
+            try:
+                default_end_date = pd.to_datetime(latest_trade_date).date()
+            except Exception:
+                default_end_date = None
+
+        end_dates = [default_end_date] if default_end_date else []
+        end_dates.extend(parsed_asof_map.values())
+        if not end_dates:
             return {}
 
-        start_date = end_date - dt.timedelta(days=max(window * 4, 60))
+        max_end_date = max(end_dates)
+        min_start_date = min(
+            [d - dt.timedelta(days=max(window * 4, 60)) for d in end_dates]
+        )
+
         stmt = text(
             f"""
             SELECT `date`,`code`,`volume`
@@ -775,8 +801,8 @@ class OpenMonitorRepository:
                     conn,
                     params={
                         "codes": codes,
-                        "start_date": start_date.isoformat(),
-                        "end_date": end_date.isoformat(),
+                        "start_date": min_start_date.isoformat(),
+                        "end_date": max_end_date.isoformat(),
                     },
                 )
         except Exception as exc:  # noqa: BLE001
@@ -787,10 +813,17 @@ class OpenMonitorRepository:
             return {}
 
         df["code"] = df["code"].astype(str)
+        df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
         df["volume"] = df["volume"].apply(_to_float)
         avg_map: Dict[str, float] = {}
         for code, grp in df.groupby("code", sort=False):
-            top = grp.sort_values("date", ascending=False).head(window)
+            end_date = parsed_asof_map.get(code, default_end_date)
+            if end_date is None:
+                continue
+            recent = grp[grp["date"] <= end_date]
+            if recent.empty:
+                continue
+            top = recent.sort_values("date", ascending=False).head(window)
             volumes = top["volume"].dropna()
             if not volumes.empty:
                 avg_map[code] = float(volumes.mean())

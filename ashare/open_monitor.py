@@ -63,7 +63,7 @@ class OpenMonitorParams:
     """开盘监测参数（支持从 config.yaml 的 open_monitor 覆盖）。"""
 
     enabled: bool = True
-    # 运行时上下文（由 Runner 填充；用于行情侧回填 live_trade_date）
+    # 运行时上下文（由 Runner 填充；用于记录行情抓取时间）
     checked_at: dt.datetime | None = None
     monitor_date: str | None = None
 
@@ -401,7 +401,18 @@ class MA5MA20OpenMonitorRunner:
             self.logger.info("实时行情已获取：%s 条", len(quotes))
 
         latest_snapshots = self.repo.load_latest_snapshots(latest_trade_date, codes)
-        avg_volume_map = self.repo.load_avg_volume(latest_trade_date, codes)
+        asof_trade_date_map: dict[str, str] = {}
+        if not latest_snapshots.empty and "trade_date" in latest_snapshots.columns:
+            snap_codes = latest_snapshots["code"].astype(str)
+            snap_dates = latest_snapshots["trade_date"].astype(str)
+            asof_trade_date_map = dict(zip(snap_codes, snap_dates))
+
+        avg_volume_map = self.repo.load_avg_volume(
+            latest_trade_date,
+            codes,
+            asof_trade_date_map=asof_trade_date_map,
+        )
+        previous_strength_map = self.repo.load_previous_strength(codes, as_of=checked_at)
 
         env_final_gate_action = (
             env_context.get("env_final_gate_action") if isinstance(env_context, dict) else None
@@ -423,6 +434,7 @@ class MA5MA20OpenMonitorRunner:
             run_id=run_id,
             ready_signals_used=self.repo.ready_signals_used,
             avg_volume_map=avg_volume_map,
+            previous_strength_map=previous_strength_map,
         )
 
         if result.empty:

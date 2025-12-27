@@ -134,30 +134,6 @@ class OpenMonitorEvaluator:
         self.rules = rules
 
     @staticmethod
-    def _calc_minutes_elapsed(now: dt.datetime) -> int:
-        start_am = dt.time(9, 30)
-        end_am = dt.time(11, 30)
-        start_pm = dt.time(13, 0)
-        end_pm = dt.time(15, 0)
-
-        t = now.time()
-        if t < start_am:
-            return 0
-        if t <= end_am:
-            delta = dt.datetime.combine(now.date(), t) - dt.datetime.combine(
-                now.date(), start_am
-            )
-            return int(delta.total_seconds() // 60)
-        if t < start_pm:
-            return 120
-        if t <= end_pm:
-            delta = dt.datetime.combine(now.date(), t) - dt.datetime.combine(
-                now.date(), start_pm
-            )
-            return 120 + int(delta.total_seconds() // 60)
-        return 240
-
-    @staticmethod
     def _is_pullback_signal(signal_reason: str) -> bool:
         reason_text = str(signal_reason or "")
         lower = reason_text.lower()
@@ -175,7 +151,7 @@ class OpenMonitorEvaluator:
         checked_at_ts: dt.datetime,
         *,
         avg_volume_map: dict[str, float] | None = None,
-    ) -> tuple[pd.DataFrame, dict[str, float] | None, int, int]:
+    ) -> tuple[pd.DataFrame, dict[str, float] | None]:
         strict_quotes = bool(getattr(self.params, "strict_quotes", True))
         if quotes is None or getattr(quotes, "empty", True):
             q = pd.DataFrame(
@@ -252,8 +228,6 @@ class OpenMonitorEvaluator:
             if col not in merged.columns:
                 merged[col] = None
 
-        minutes_elapsed = self._calc_minutes_elapsed(checked_at_ts)
-        total_minutes = 240
         merged["avg_volume_20"] = merged["code"].map(avg_volume_map) if avg_volume_map else None
 
         float_cols = [
@@ -306,7 +280,7 @@ class OpenMonitorEvaluator:
                 lambda x: None if x is None else x * live_vol_scale
             )
 
-        return merged, avg_volume_map, minutes_elapsed, total_minutes
+        return merged, avg_volume_map
 
     def evaluate(
         self,
@@ -320,6 +294,7 @@ class OpenMonitorEvaluator:
         run_id: str | None = None,
         ready_signals_used: bool = False,
         avg_volume_map: dict[str, float] | None = None,
+        previous_strength_map: dict[str, float] | None = None,
     ) -> pd.DataFrame:
         if signals.empty:
             return pd.DataFrame()
@@ -353,7 +328,7 @@ class OpenMonitorEvaluator:
             )
             return pd.DataFrame()
 
-        merged, avg_volume_map, minutes_elapsed, total_minutes = self.prepare_monitor_frame(
+        merged, avg_volume_map = self.prepare_monitor_frame(
             signals,
             quotes,
             latest_snapshots,
@@ -392,6 +367,10 @@ class OpenMonitorEvaluator:
         effective_stop_refs: List[float | None] = []
         rule_hits_json_list: List[str | None] = []
         summary_lines: List[str | None] = []
+        signal_strength_list: List[float | None] = []
+        strength_delta_list: List[float | None] = []
+        strength_trend_list: List[str | None] = []
+        strength_note_list: List[str | None] = []
 
         max_up = self.rule_config.max_gap_up_pct
         max_up_atr_mult = self.rule_config.max_gap_up_atr_mult
@@ -406,6 +385,7 @@ class OpenMonitorEvaluator:
         runup_atr_tol = self.rule_config.runup_atr_tol
         cross_valid_days = self.params.cross_valid_days
         pullback_valid_days = self.params.pullback_valid_days
+        previous_strength_map = previous_strength_map or {}
 
         for _, row in merged.iterrows():
             sig_reason_text = str(row.get("sig_reason") or row.get("reason") or "")
@@ -446,10 +426,8 @@ class OpenMonitorEvaluator:
                 and avg_vol_20 > 0
                 and live_vol is not None
                 and live_vol > 0
-                and minutes_elapsed > 0
             ):
-                scaled = (live_vol / max(minutes_elapsed, 1)) * total_minutes
-                live_intraday = scaled / avg_vol_20
+                live_intraday = live_vol / avg_vol_20
             live_intraday_vol_list.append(live_intraday)
 
             sig_ma5 = _to_float(row.get("sig_ma5"))
@@ -590,6 +568,27 @@ class OpenMonitorEvaluator:
                 hits.append({"rule": reason, "severity": 100, "reason": reason})
                 rule_hits_json = json.dumps(hits, ensure_ascii=False)
 
+            strength, strength_note = self._calc_signal_strength(
+                row,
+                rule_hits_json=rule_hits_json,
+                state=state,
+                status_reason=status_reason,
+            )
+            previous_strength = _to_float(previous_strength_map.get(str(row.get("code"))))
+            strength_delta = (
+                strength - previous_strength
+                if strength is not None and previous_strength is not None
+                else None
+            )
+            strength_trend = None
+            if strength_delta is not None:
+                if strength_delta > 0.5:
+                    strength_trend = "UP"
+                elif strength_delta < -0.5:
+                    strength_trend = "DOWN"
+                else:
+                    strength_trend = "FLAT"
+
             states.append(state)
             status_reasons.append(status_reason)
             actions.append(action)
@@ -597,6 +596,10 @@ class OpenMonitorEvaluator:
             signal_kinds.append("PULLBACK" if is_pullback else "CROSS")
             rule_hits_json_list.append(rule_hits_json)
             summary_lines.append(summary_line)
+            signal_strength_list.append(strength)
+            strength_delta_list.append(strength_delta)
+            strength_trend_list.append(strength_trend)
+            strength_note_list.append(strength_note)
 
         merged["monitor_date"] = monitor_date
         if "live_trade_date" not in merged.columns:
@@ -625,6 +628,10 @@ class OpenMonitorEvaluator:
         merged["dev_ma20_atr"] = dev_ma20_atr_list
         merged["rule_hits_json"] = rule_hits_json_list
         merged["summary_line"] = summary_lines
+        merged["signal_strength"] = signal_strength_list
+        merged["strength_delta"] = strength_delta_list
+        merged["strength_trend"] = strength_trend_list
+        merged["strength_note"] = strength_note_list
 
         def _coalesce_numeric_into(target: str, fallback: str) -> None:
             if target not in merged.columns:
@@ -805,6 +812,102 @@ class OpenMonitorEvaluator:
         if fv != fv:
             return 0.0
         return 0.0 if fv < 0.0 else 1.0 if fv > 1.0 else fv
+
+    @staticmethod
+    def _scale_range(val: float | None, low: float, high: float) -> float | None:
+        if val is None:
+            return None
+        if high <= low:
+            return None
+        if val <= low:
+            return 0.0
+        if val >= high:
+            return 1.0
+        return (val - low) / (high - low)
+
+    @staticmethod
+    def _extract_rule_hit_names(rule_hits_json: str | None) -> set[str]:
+        if not rule_hits_json:
+            return set()
+        try:
+            hits = json.loads(rule_hits_json)
+        except Exception:  # noqa: BLE001
+            return set()
+        if not isinstance(hits, list):
+            return set()
+        names: set[str] = set()
+        for hit in hits:
+            if not isinstance(hit, dict):
+                continue
+            name = hit.get("name") or hit.get("rule") or hit.get("id")
+            name = str(name or "").strip().upper()
+            if name:
+                names.add(name)
+        return names
+
+    def _calc_signal_strength(
+        self,
+        row: pd.Series,
+        *,
+        rule_hits_json: str | None,
+        state: str | None,
+        status_reason: str | None,
+    ) -> tuple[float | None, str | None]:
+        note_parts: List[str] = []
+        weights: List[tuple[float, float]] = []
+
+        def _add_component(
+            label: str,
+            raw_val: Any,
+            low: float,
+            high: float,
+            weight: float,
+        ) -> None:
+            val = _to_float(raw_val)
+            if val is None:
+                return
+            scaled = self._scale_range(val, low, high)
+            if scaled is None:
+                return
+            weights.append((weight, scaled))
+            note_parts.append(f"{label}={val:.2f}")
+
+        _add_component("dev_ma5_atr", row.get("dev_ma5_atr"), -1.0, 2.0, 0.25)
+        _add_component("dev_ma20_atr", row.get("dev_ma20_atr"), -1.0, 2.0, 0.35)
+        _add_component("runup_atr", row.get("runup_from_sigclose_atr"), -0.5, 3.0, 0.25)
+        _add_component("vol_ratio", row.get("live_intraday_vol_ratio"), 0.5, 2.5, 0.15)
+
+        rule_names = self._extract_rule_hit_names(rule_hits_json)
+        state_norm = str(state or "").strip().upper()
+
+        if state_norm == "INVALID":
+            reason = str(status_reason or "").strip() or "INVALID"
+            return 0.0, f"INVALID:{reason}"
+
+        if "LIMIT_UP" in rule_names:
+            return 0.0, "INVALID:LIMIT_UP"
+
+        if not weights:
+            return None, None
+
+        total_weight = sum(weight for weight, _ in weights)
+        strength = (
+            100.0 * sum(weight * value for weight, value in weights) / total_weight
+            if total_weight > 0
+            else None
+        )
+        if strength is None:
+            return None, None
+
+        if "RUNUP_BREACH" in rule_names:
+            strength = min(strength, 20.0)
+            note_parts.append("CAP=RUNUP_BREACH")
+        if "BELOW_MA20_REQ" in rule_names:
+            strength = min(strength, 35.0)
+            note_parts.append("CAP=BELOW_MA20_REQ")
+
+        note = " ".join(note_parts) if note_parts else None
+        return strength, note
 
     def _calc_market_weight(self, env_context: dict[str, Any] | None) -> tuple[float, str]:
         env = MarketEnvironment.from_snapshot(env_context)

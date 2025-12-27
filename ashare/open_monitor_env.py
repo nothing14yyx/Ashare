@@ -284,18 +284,6 @@ class OpenMonitorEnvService:
             )
 
         if index_env_snapshot:
-            # 兜底：实时价存在但 live_trade_date 缺失时，用 monitor_date 标记
-            if (
-                index_env_snapshot.get("env_index_live_latest") is not None
-                and not index_env_snapshot.get("env_index_live_trade_date")
-            ):
-                monitor_date_str = (
-                    monitor_date.isoformat()
-                    if isinstance(monitor_date, dt.date)
-                    else str(monitor_date)
-                )
-                index_env_snapshot["env_index_live_trade_date"] = monitor_date_str
-
             index_snapshot_payload = {
                 "monitor_date": monitor_date,
                 "checked_at": checked_at,
