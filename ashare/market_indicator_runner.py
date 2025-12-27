@@ -5,7 +5,7 @@ import logging
 from typing import Any, Optional
 
 import pandas as pd
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 
 from .market_indicator_builder import MarketIndicatorBuilder
 from .open_monitor_repo import OpenMonitorRepository
@@ -45,7 +45,11 @@ class MarketIndicatorRunner:
         )
         weekly_dates = self.builder.resolve_weekly_asof_dates(start_dt, end_dt)
         if not weekly_dates:
-            return {"written": 0, "start_date": start_dt.isoformat(), "end_date": end_dt.isoformat()}
+            return {
+                "written": 0,
+                "start_date": start_dt.isoformat(),
+                "end_date": end_dt.isoformat(),
+            }
 
         written = 0
         for asof_date in weekly_dates:
@@ -78,6 +82,7 @@ class MarketIndicatorRunner:
             latest_date=self.repo.get_latest_daily_indicator_date(index_code),
         )
         rows = self.builder.compute_daily_indicators(start_dt, end_dt)
+        rows = self._attach_cycle_phase_from_weekly(rows)
         written = self.repo.upsert_daily_indicator(rows)
         return {
             "written": written,
@@ -135,3 +140,124 @@ class MarketIndicatorRunner:
             return latest_date + dt.timedelta(days=1)
         default_days = 365
         return end_dt - dt.timedelta(days=default_days)
+
+    def _attach_cycle_phase_from_weekly(
+        self, rows: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        if not rows:
+            return rows
+        table = self.repo.params.weekly_indicator_table
+        if not table:
+            return rows
+
+        df_daily = pd.DataFrame(rows)
+        if df_daily.empty:
+            return rows
+        if (
+            "asof_trade_date" not in df_daily.columns
+            or "index_code" not in df_daily.columns
+        ):
+            return rows
+
+        df_daily = df_daily.copy()
+        df_daily["__order"] = range(len(df_daily))
+        df_daily["__asof_trade_date"] = pd.to_datetime(
+            df_daily["asof_trade_date"], errors="coerce"
+        )
+        parsed_dates = df_daily["__asof_trade_date"].dropna()
+        if parsed_dates.empty:
+            df_daily = df_daily.sort_values("__order")
+            df_daily = df_daily.drop(columns=["__order", "__asof_trade_date"])
+            return df_daily.to_dict(orient="records")
+
+        min_date = parsed_dates.min()
+        max_date = parsed_dates.max()
+        min_date_floor = (min_date - pd.Timedelta(days=14)).date()
+        max_date_val = max_date.date()
+
+        codes = (
+            df_daily["index_code"]
+            .dropna()
+            .astype(str)
+            .map(str.strip)
+            .loc[lambda s: s != ""]
+            .unique()
+            .tolist()
+        )
+        if not codes:
+            df_daily = df_daily.sort_values("__order")
+            df_daily = df_daily.drop(columns=["__order", "__asof_trade_date"])
+            return df_daily.to_dict(orient="records")
+
+        stmt = (
+            text(
+                f"""
+                SELECT weekly_asof_trade_date, index_code, weekly_scene_code
+                FROM `{table}`
+                WHERE index_code IN :codes
+                  AND weekly_asof_trade_date <= :max_date
+                  AND weekly_asof_trade_date >= :min_date
+                """
+            )
+            .bindparams(bindparam("codes", expanding=True))
+        )
+        try:
+            with self.repo.engine.begin() as conn:
+                df_weekly = pd.read_sql_query(
+                    stmt,
+                    conn,
+                    params={
+                        "codes": codes,
+                        "max_date": max_date_val,
+                        "min_date": min_date_floor,
+                    },
+                )
+        except Exception as exc:  # noqa: BLE001
+            self.logger.warning("读取周线场景失败：%s", exc)
+            df_daily = df_daily.sort_values("__order")
+            df_daily = df_daily.drop(columns=["__order", "__asof_trade_date"])
+            return df_daily.to_dict(orient="records")
+
+        if df_weekly.empty:
+            df_daily = df_daily.sort_values("__order")
+            df_daily = df_daily.drop(columns=["__order", "__asof_trade_date"])
+            return df_daily.to_dict(orient="records")
+
+        df_weekly = df_weekly.copy()
+        df_weekly["weekly_asof_trade_date"] = pd.to_datetime(
+            df_weekly["weekly_asof_trade_date"], errors="coerce"
+        )
+        df_weekly = df_weekly.dropna(subset=["weekly_asof_trade_date", "index_code"])
+        if df_weekly.empty:
+            df_daily = df_daily.sort_values("__order")
+            df_daily = df_daily.drop(columns=["__order", "__asof_trade_date"])
+            return df_daily.to_dict(orient="records")
+
+        df_daily_valid = df_daily.dropna(subset=["__asof_trade_date", "index_code"]).copy()
+        if df_daily_valid.empty:
+            df_daily = df_daily.sort_values("__order")
+            df_daily = df_daily.drop(columns=["__order", "__asof_trade_date"])
+            return df_daily.to_dict(orient="records")
+
+        df_daily_valid["index_code"] = df_daily_valid["index_code"].astype(str)
+        df_weekly["index_code"] = df_weekly["index_code"].astype(str)
+
+        df_daily_valid = df_daily_valid.sort_values(["index_code", "__asof_trade_date"])
+        df_weekly = df_weekly.sort_values(["index_code", "weekly_asof_trade_date"])
+
+        merged = pd.merge_asof(
+            df_daily_valid,
+            df_weekly,
+            left_on="__asof_trade_date",
+            right_on="weekly_asof_trade_date",
+            by="index_code",
+            direction="backward",
+        )
+        df_daily.loc[df_daily_valid.index, "cycle_phase"] = merged["weekly_scene_code"].values
+        df_daily["cycle_phase"] = df_daily["cycle_phase"].where(
+            pd.notna(df_daily["cycle_phase"]), None
+        )
+
+        df_daily = df_daily.sort_values("__order")
+        df_daily = df_daily.drop(columns=["__order", "__asof_trade_date"])
+        return df_daily.to_dict(orient="records")
