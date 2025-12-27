@@ -338,13 +338,14 @@ class MA5MA20OpenMonitorRunner:
             self.logger.info("open_monitor.enabled=false，但 force=True，仍将执行开盘监测。")
 
         checked_at = dt.datetime.now()
-        monitor_date = checked_at.date().isoformat()
+        monitor_date = self.repo.resolve_monitor_trade_date(checked_at)
+        biz_ts = dt.datetime.combine(dt.date.fromisoformat(monitor_date), checked_at.time())
 
         # 将本次运行时上下文透传给行情层（用于补齐 live_trade_date）
         self.params = replace(self.params, checked_at=checked_at, monitor_date=monitor_date)
         self.repo.params = self.params
         self.market_data.params = self.params
-        run_id = self._calc_run_id(checked_at)
+        run_id = self._calc_run_id(biz_ts)
         run_params_json = self._build_run_params_json()
         self.repo.ensure_run_context(
             monitor_date,

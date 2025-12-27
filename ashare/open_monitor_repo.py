@@ -304,6 +304,18 @@ class OpenMonitorRepository:
 
         return None
 
+    def resolve_monitor_trade_date(self, checked_at: dt.datetime) -> str:
+        candidate = checked_at.date().isoformat()
+        view = str(getattr(self.params, "ready_signals_view", "") or "").strip() or None
+        latest_trade_date = self._resolve_latest_trade_date(ready_view=view)
+
+        if not latest_trade_date:
+            return candidate
+
+        if self._is_trading_day(candidate, latest_trade_date):
+            return candidate
+        return latest_trade_date
+
     def _load_signal_day_pct_change(
         self, signal_date: str, codes: List[str]
     ) -> Dict[str, float]:
