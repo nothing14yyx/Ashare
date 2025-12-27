@@ -30,7 +30,7 @@ VIEW_STRATEGY_PNL = "v_pnl"
 
 # 开盘监测输出
 TABLE_STRATEGY_OPEN_MONITOR_EVAL = "strategy_open_monitor_eval"
-TABLE_STRATEGY_OPEN_MONITOR_ENV = "strategy_open_monitor_env"
+TABLE_STRATEGY_WEEKLY_MARKET_ENV = "strategy_weekly_market_env"
 TABLE_STRATEGY_OPEN_MONITOR_QUOTE = "strategy_open_monitor_quote"
 TABLE_STRATEGY_OPEN_MONITOR_RUN = "strategy_open_monitor_run"
 VIEW_STRATEGY_OPEN_MONITOR_WIDE = "v_strategy_open_monitor_wide"
@@ -38,8 +38,12 @@ VIEW_STRATEGY_OPEN_MONITOR_WIDE = "v_strategy_open_monitor_wide"
 VIEW_STRATEGY_OPEN_MONITOR_ENV = "v_strategy_open_monitor_env"
 # 开盘监测默认查询视图（精简字段；完整字段请查 v_strategy_open_monitor_wide）
 VIEW_STRATEGY_OPEN_MONITOR = "v_strategy_open_monitor"
-# 大盘/指数环境快照
-TABLE_ENV_INDEX_SNAPSHOT = "strategy_env_index_snapshot"
+# 实时市场快照
+TABLE_STRATEGY_REALTIME_MARKET_SNAPSHOT = "strategy_realtime_market_snapshot"
+
+# 旧命名（仅用于自动迁移）
+LEGACY_TABLE_STRATEGY_OPEN_MONITOR_ENV = "strategy_open_monitor_env"
+LEGACY_TABLE_ENV_INDEX_SNAPSHOT = "strategy_env_index_snapshot"
 
 
 @dataclass(frozen=True)
@@ -123,6 +127,7 @@ class SchemaManager:
         )
         self._ensure_v_pnl_view()
 
+        self._rename_legacy_tables(tables)
         self._ensure_open_monitor_eval_table(tables.open_monitor_eval_table)
         self._ensure_open_monitor_run_table(tables.open_monitor_run_table)
         self._ensure_open_monitor_quote_table(tables.open_monitor_quote_table)
@@ -177,17 +182,17 @@ class SchemaManager:
             or TABLE_STRATEGY_OPEN_MONITOR_RUN
         )
         env_snapshot_table = (
-            str(open_monitor_cfg.get("env_snapshot_table", TABLE_STRATEGY_OPEN_MONITOR_ENV)).strip()
-            or TABLE_STRATEGY_OPEN_MONITOR_ENV
+            str(open_monitor_cfg.get("env_snapshot_table", TABLE_STRATEGY_WEEKLY_MARKET_ENV)).strip()
+            or TABLE_STRATEGY_WEEKLY_MARKET_ENV
         )
         env_index_snapshot_table = (
             str(
                 open_monitor_cfg.get(
                     "env_index_snapshot_table",
-                    TABLE_ENV_INDEX_SNAPSHOT,
+                    TABLE_STRATEGY_REALTIME_MARKET_SNAPSHOT,
                 )
             ).strip()
-            or TABLE_ENV_INDEX_SNAPSHOT
+            or TABLE_STRATEGY_REALTIME_MARKET_SNAPSHOT
         )
         open_monitor_env_view = (
             str(
@@ -239,6 +244,34 @@ class SchemaManager:
             open_monitor_wide_view=open_monitor_wide_view,
             open_monitor_quote_table=open_monitor_quote_table,
         )
+
+    def _rename_legacy_tables(self, tables: TableNames) -> None:
+        if tables.env_snapshot_table == TABLE_STRATEGY_WEEKLY_MARKET_ENV:
+            self._rename_table_if_needed(
+                LEGACY_TABLE_STRATEGY_OPEN_MONITOR_ENV,
+                TABLE_STRATEGY_WEEKLY_MARKET_ENV,
+            )
+        if tables.env_index_snapshot_table == TABLE_STRATEGY_REALTIME_MARKET_SNAPSHOT:
+            self._rename_table_if_needed(
+                LEGACY_TABLE_ENV_INDEX_SNAPSHOT,
+                TABLE_STRATEGY_REALTIME_MARKET_SNAPSHOT,
+            )
+
+    def _rename_table_if_needed(self, old_name: str, new_name: str) -> None:
+        if not old_name or not new_name or old_name == new_name:
+            return
+        if not self._table_exists(old_name):
+            return
+        if self._table_exists(new_name):
+            self.logger.warning(
+                "检测到旧表 %s 但新表 %s 已存在，跳过重命名。",
+                old_name,
+                new_name,
+            )
+            return
+        with self.engine.begin() as conn:
+            conn.execute(text(f"RENAME TABLE `{old_name}` TO `{new_name}`"))
+        self.logger.info("已将旧表 %s 重命名为 %s。", old_name, new_name)
 
     # ---------- generic helpers ----------
     def _table_exists(self, table: str) -> bool:
