@@ -249,7 +249,7 @@ class MarketIndicatorBuilder:
         )
         breadth_summary = (
             merged.groupby("trade_date")
-            .apply(self._resolve_breadth_metrics)
+            .apply(self._resolve_breadth_metrics, include_groups=False)
             .reset_index()
         )
         merged = merged.merge(day_summary, on="trade_date", how="left")
