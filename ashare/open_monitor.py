@@ -46,7 +46,7 @@ from .market_indicator_builder import MarketIndicatorBuilder
 from .schema_manager import (
     STRATEGY_CODE_MA5_MA20_TREND,
     TABLE_STRATEGY_DAILY_MARKET_INDICATOR,
-    TABLE_STRATEGY_MARKET_ENV_SNAPSHOT,
+    TABLE_STRATEGY_OPEN_MOTOR_ENV,
     TABLE_STRATEGY_OPEN_MONITOR_EVAL,
     TABLE_STRATEGY_OPEN_MONITOR_QUOTE,
     TABLE_STRATEGY_OPEN_MONITOR_RUN,
@@ -116,7 +116,7 @@ class OpenMonitorParams:
     run_id_minutes: int = 5
 
     # 环境快照表：存储周线计划等“批次级别”信息，避免在每条标的记录里重复。
-    env_snapshot_table: str = TABLE_STRATEGY_MARKET_ENV_SNAPSHOT
+    env_snapshot_table: str = TABLE_STRATEGY_OPEN_MOTOR_ENV
 
     # 指数环境快照表：按哈希去重存储单份指数环境，避免在事实表重复写入。
     env_index_snapshot_table: str = TABLE_STRATEGY_REALTIME_MARKET_SNAPSHOT

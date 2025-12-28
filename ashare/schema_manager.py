@@ -30,7 +30,7 @@ VIEW_STRATEGY_PNL = "v_pnl"
 
 # 开盘监测输出
 TABLE_STRATEGY_OPEN_MONITOR_EVAL = "strategy_open_monitor_eval"
-TABLE_STRATEGY_MARKET_ENV_SNAPSHOT = "strategy_market_env_snapshot"
+TABLE_STRATEGY_OPEN_MOTOR_ENV = "strategy_open_motor_env"
 TABLE_STRATEGY_WEEKLY_MARKET_INDICATOR = "strategy_weekly_market_indicator"
 TABLE_STRATEGY_DAILY_MARKET_INDICATOR = "strategy_daily_market_indicator"
 TABLE_STRATEGY_OPEN_MONITOR_QUOTE = "strategy_open_monitor_quote"
@@ -93,27 +93,6 @@ class SchemaManager:
 
         self._ensure_indicator_table(tables.indicator_table)
         self._ensure_signal_events_table(tables.signal_events_table)
-        # feat: 移除旧兼容视图逻辑，启动时清理遗留对象并强制使用新命名
-        legacy_objects = (
-            "strategy_signal_candidates",
-            "v_strategy_signal_candidates_raw",
-            "v_strategy_signal_candidates_active",
-            "v_strategy_signal_candidates",
-            "v_strategy_ma5_ma20_candidates",
-            "open_monitor_compat_view",
-            "strategy_open_monitor",
-        )
-        protected_objects = {
-            tables.open_monitor_view,
-            tables.open_monitor_wide_view,
-            tables.open_monitor_env_view,
-        }
-        for legacy_name in legacy_objects:
-            if legacy_name in protected_objects:
-                continue
-            if self._view_exists(legacy_name) or self._table_exists(legacy_name):
-                self._drop_relation_any(legacy_name)
-                self.logger.info("已清理遗留兼容对象 %s。", legacy_name)
         self._ensure_trade_metrics_table()
         self._ensure_backtest_view()
         self._ensure_chip_filter_table()
@@ -187,10 +166,10 @@ class SchemaManager:
                 str(
                     open_monitor_cfg.get(
                         "env_snapshot_table",
-                        TABLE_STRATEGY_MARKET_ENV_SNAPSHOT,
+                        TABLE_STRATEGY_OPEN_MOTOR_ENV,
                     )
                 ).strip()
-                or TABLE_STRATEGY_MARKET_ENV_SNAPSHOT
+                or TABLE_STRATEGY_OPEN_MOTOR_ENV
         )
         env_index_snapshot_table = (
                 str(
