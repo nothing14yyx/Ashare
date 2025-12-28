@@ -31,15 +31,13 @@ VIEW_STRATEGY_PNL = "v_pnl"
 # 开盘监测输出
 TABLE_STRATEGY_OPEN_MONITOR_EVAL = "strategy_open_monitor_eval"
 TABLE_STRATEGY_OPEN_MOTOR_ENV = "strategy_open_motor_env"
-TABLE_STRATEGY_ENV_INDEX_SNAPSHOT = "strategy_env_index_snapshot"
 TABLE_STRATEGY_WEEKLY_MARKET_ENV = "strategy_weekly_market_env"
 WEEKLY_MARKET_BENCHMARK_CODE = "sh.000001"
 TABLE_STRATEGY_DAILY_MARKET_ENV = "strategy_daily_market_env"
-DAILY_MARKET_BENCHMARK_CODE = "sh.000001"
 TABLE_STRATEGY_OPEN_MONITOR_QUOTE = "strategy_open_monitor_quote"
 TABLE_STRATEGY_OPEN_MONITOR_RUN = "strategy_open_monitor_run"
 VIEW_STRATEGY_OPEN_MONITOR_WIDE = "v_strategy_open_monitor_wide"
-# 开盘监测环境视图（env + index snapshot）
+# 开盘监测环境视图（env 快照）
 VIEW_STRATEGY_OPEN_MONITOR_ENV = "v_strategy_open_monitor_env"
 # 开盘监测默认查询视图（精简字段；完整字段请查 v_strategy_open_monitor_wide）
 VIEW_STRATEGY_OPEN_MONITOR = "v_strategy_open_monitor"
@@ -106,16 +104,13 @@ class SchemaManager:
         self._ensure_open_monitor_eval_table(tables.open_monitor_eval_table)
         self._ensure_open_monitor_run_table(tables.open_monitor_run_table)
         self._ensure_open_monitor_quote_table(tables.open_monitor_quote_table)
-        self._ensure_env_index_snapshot_table(TABLE_STRATEGY_ENV_INDEX_SNAPSHOT)
         self._ensure_weekly_indicator_table(tables.weekly_indicator_table)
         self._ensure_daily_market_env_table(tables.daily_indicator_table)
         self._ensure_env_snapshot_table(tables.env_snapshot_table)
         self._ensure_open_monitor_env_view(
             tables.open_monitor_env_view,
             tables.env_snapshot_table,
-            TABLE_STRATEGY_ENV_INDEX_SNAPSHOT,
             tables.weekly_indicator_table,
-            tables.daily_indicator_table,
             tables.open_monitor_run_table,
         )
 
@@ -1489,9 +1484,7 @@ class SchemaManager:
         self,
         view: str,
         env_table: str,
-        index_snapshot_table: str,
         weekly_table: str,
-        daily_table: str,
         run_table: str,
     ) -> None:
         if not view:
@@ -1502,13 +1495,10 @@ class SchemaManager:
         if not self._table_exists(env_table):
             self._drop_relation(view)
             return
-        if not index_snapshot_table or not weekly_table or not daily_table:
+        if not weekly_table:
             self._drop_relation(view)
             return
-        if not self._table_exists(weekly_table) or not self._table_exists(daily_table):
-            self._drop_relation(view)
-            return
-        if not self._table_exists(index_snapshot_table):
+        if not self._table_exists(weekly_table):
             self._drop_relation(view)
             return
         if not self._table_exists(run_table):
@@ -1528,9 +1518,9 @@ class SchemaManager:
               env.`env_weekly_asof_trade_date`,
               env.`env_daily_asof_trade_date`,
               env.`env_final_reason_json`,
-              daily.`score` AS `env_index_score`,
-              daily.`regime` AS `env_regime`,
-              daily.`position_hint` AS `env_position_hint`,
+              env.`env_index_score`,
+              env.`env_regime`,
+              env.`env_position_hint`,
               weekly.`weekly_gate_policy` AS `env_weekly_gate_policy`,
               weekly.`weekly_risk_level` AS `env_weekly_risk_level`,
               weekly.`weekly_scene_code` AS `env_weekly_scene`,
@@ -1542,75 +1532,36 @@ class SchemaManager:
               weekly.`weekly_tags` AS `env_weekly_tags`,
               weekly.`weekly_note` AS `env_weekly_note`,
               weekly.`weekly_gate_policy` AS `env_weekly_gate_action`,
-              idx.`index_code` AS `env_index_code`,
-              idx.`asof_trade_date` AS `env_index_asof_trade_date`,
-              idx.`live_trade_date` AS `env_index_live_trade_date`,
-              idx.`asof_close` AS `env_index_asof_close`,
-              idx.`asof_ma20` AS `env_index_asof_ma20`,
-              idx.`asof_ma60` AS `env_index_asof_ma60`,
-              idx.`asof_macd_hist` AS `env_index_asof_macd_hist`,
-              idx.`asof_atr14` AS `env_index_asof_atr14`,
-              idx.`live_open` AS `env_index_live_open`,
-              idx.`live_high` AS `env_index_live_high`,
-              idx.`live_low` AS `env_index_live_low`,
-              idx.`live_latest` AS `env_index_live_latest`,
-              idx.`live_pct_change` AS `env_index_live_pct_change`,
-              idx.`live_volume` AS `env_index_live_volume`,
-              idx.`live_amount` AS `env_index_live_amount`,
-              idx.`dev_ma20_atr` AS `env_index_dev_ma20_atr`,
-              idx.`gate_action` AS `env_index_gate_action`,
-              idx.`gate_reason` AS `env_index_gate_reason`,
-              idx.`position_cap` AS `env_index_position_cap`
+              env.`env_index_code`,
+              env.`env_index_asof_trade_date`,
+              env.`env_index_live_trade_date`,
+              env.`env_index_asof_close`,
+              env.`env_index_asof_ma20`,
+              env.`env_index_asof_ma60`,
+              env.`env_index_asof_macd_hist`,
+              env.`env_index_asof_atr14`,
+              env.`env_index_live_open`,
+              env.`env_index_live_high`,
+              env.`env_index_live_low`,
+              env.`env_index_live_latest`,
+              env.`env_index_live_pct_change`,
+              env.`env_index_live_volume`,
+              env.`env_index_live_amount`,
+              env.`env_index_dev_ma20_atr`,
+              env.`env_index_gate_action`,
+              env.`env_index_gate_reason`,
+              env.`env_index_position_cap`
             FROM `{env_table}` env
-            LEFT JOIN `{index_snapshot_table}` idx
-              ON env.`env_index_snapshot_hash` = idx.`snapshot_hash`
             LEFT JOIN `{run_table}` r
               ON env.`run_pk` = r.`run_pk`
             LEFT JOIN `{weekly_table}` weekly
               ON env.`env_weekly_asof_trade_date` = weekly.`weekly_asof_trade_date`
              AND weekly.`benchmark_code` = '{WEEKLY_MARKET_BENCHMARK_CODE}'
-            LEFT JOIN `{daily_table}` daily
-              ON env.`env_daily_asof_trade_date` = daily.`asof_trade_date`
-             AND daily.`benchmark_code` = '{DAILY_MARKET_BENCHMARK_CODE}'
             """
         )
         with self.engine.begin() as conn:
             conn.execute(stmt)
         self.logger.info("已创建/更新开盘监测环境视图 %s。", view)
-
-    def _ensure_env_index_snapshot_table(self, table: str) -> None:
-        columns = {
-            "snapshot_hash": "CHAR(32) NOT NULL",
-            "monitor_date": "DATE NOT NULL",
-            "checked_at": "DATETIME(6) NULL",
-            "run_id": "VARCHAR(64) NULL",
-            "index_code": "VARCHAR(16) NULL",
-            "asof_trade_date": "DATE NULL",
-            "live_trade_date": "DATE NULL",
-            "asof_close": "DOUBLE NULL",
-            "asof_ma20": "DOUBLE NULL",
-            "asof_ma60": "DOUBLE NULL",
-            "asof_macd_hist": "DOUBLE NULL",
-            "asof_atr14": "DOUBLE NULL",
-            "live_open": "DOUBLE NULL",
-            "live_high": "DOUBLE NULL",
-            "live_low": "DOUBLE NULL",
-            "live_latest": "DOUBLE NULL",
-            "live_pct_change": "DOUBLE NULL",
-            "live_volume": "DOUBLE NULL",
-            "live_amount": "DOUBLE NULL",
-            "dev_ma20_atr": "DOUBLE NULL",
-            "gate_action": "VARCHAR(16) NULL",
-            "gate_reason": "VARCHAR(255) NULL",
-            "position_cap": "DOUBLE NULL",
-        }
-        if not self._table_exists(table):
-            self._create_table(table, columns, primary_key=("snapshot_hash",))
-            return
-        self._add_missing_columns(table, columns)
-        self._ensure_date_column(table, "monitor_date", not_null=True)
-        self._ensure_varchar_length(table, "run_id", 64)
-        self._ensure_varchar_length(table, "index_code", 16)
 
     def _ensure_weekly_indicator_table(self, table: str) -> None:
         columns = {

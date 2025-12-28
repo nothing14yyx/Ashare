@@ -96,28 +96,27 @@ class OpenMonitorEnvService:
         }
 
         index_snapshot_hash = row.get("env_index_snapshot_hash")
-        index_snapshot_row = self.repo.load_index_snapshot(str(index_snapshot_hash))
         index_snapshot = {
             "env_index_snapshot_hash": index_snapshot_hash,
-            "env_index_code": index_snapshot_row.get("index_code"),
-            "env_index_asof_trade_date": index_snapshot_row.get("asof_trade_date"),
-            "env_index_live_trade_date": index_snapshot_row.get("live_trade_date"),
-            "env_index_asof_close": index_snapshot_row.get("asof_close"),
-            "env_index_asof_ma20": index_snapshot_row.get("asof_ma20"),
-            "env_index_asof_ma60": index_snapshot_row.get("asof_ma60"),
-            "env_index_asof_macd_hist": index_snapshot_row.get("asof_macd_hist"),
-            "env_index_asof_atr14": index_snapshot_row.get("asof_atr14"),
-            "env_index_live_open": index_snapshot_row.get("live_open"),
-            "env_index_live_high": index_snapshot_row.get("live_high"),
-            "env_index_live_low": index_snapshot_row.get("live_low"),
-            "env_index_live_latest": index_snapshot_row.get("live_latest"),
-            "env_index_live_pct_change": index_snapshot_row.get("live_pct_change"),
-            "env_index_live_volume": index_snapshot_row.get("live_volume"),
-            "env_index_live_amount": index_snapshot_row.get("live_amount"),
-            "env_index_dev_ma20_atr": index_snapshot_row.get("dev_ma20_atr"),
-            "env_index_gate_action": index_snapshot_row.get("gate_action"),
-            "env_index_gate_reason": index_snapshot_row.get("gate_reason"),
-            "env_index_position_cap": index_snapshot_row.get("position_cap"),
+            "env_index_code": row.get("env_index_code"),
+            "env_index_asof_trade_date": row.get("env_index_asof_trade_date"),
+            "env_index_live_trade_date": row.get("env_index_live_trade_date"),
+            "env_index_asof_close": row.get("env_index_asof_close"),
+            "env_index_asof_ma20": row.get("env_index_asof_ma20"),
+            "env_index_asof_ma60": row.get("env_index_asof_ma60"),
+            "env_index_asof_macd_hist": row.get("env_index_asof_macd_hist"),
+            "env_index_asof_atr14": row.get("env_index_asof_atr14"),
+            "env_index_live_open": row.get("env_index_live_open"),
+            "env_index_live_high": row.get("env_index_live_high"),
+            "env_index_live_low": row.get("env_index_live_low"),
+            "env_index_live_latest": row.get("env_index_live_latest"),
+            "env_index_live_pct_change": row.get("env_index_live_pct_change"),
+            "env_index_live_volume": row.get("env_index_live_volume"),
+            "env_index_live_amount": row.get("env_index_live_amount"),
+            "env_index_dev_ma20_atr": row.get("env_index_dev_ma20_atr"),
+            "env_index_gate_action": row.get("env_index_gate_action"),
+            "env_index_gate_reason": row.get("env_index_gate_reason"),
+            "env_index_position_cap": row.get("env_index_position_cap"),
         }
 
         env_context: dict[str, Any] = {
@@ -494,7 +493,6 @@ class OpenMonitorEnvService:
             env_index_snapshot_hash = index_snapshot_payload["snapshot_hash"]
             index_env_snapshot["env_index_snapshot_hash"] = env_index_snapshot_hash
             ctx["index_intraday"] = index_env_snapshot
-            self.repo.persist_index_snapshot(index_snapshot_payload)
 
         if index_env_snapshot:
             gate_action = index_env_snapshot.get("env_index_gate_action")

@@ -18,7 +18,6 @@ from .db import DatabaseConfig, MySQLWriter
 from .env_snapshot_utils import load_trading_calendar
 from .ma5_ma20_trend_strategy import _atr, _macd
 from .open_monitor_consts import ENV_RUN_IDS, ENV_RUN_PREOPEN
-from .schema_manager import TABLE_STRATEGY_ENV_INDEX_SNAPSHOT
 from .utils.convert import to_float as _to_float
 
 
@@ -1094,54 +1093,6 @@ class OpenMonitorRepository:
 
         return df
 
-    def load_index_snapshot(self, snapshot_hash: str | None) -> dict[str, Any]:
-        table = TABLE_STRATEGY_ENV_INDEX_SNAPSHOT
-        if not snapshot_hash or not self._table_exists(table):
-            return {}
-
-        stmt = text(
-            f"""
-            SELECT *
-            FROM `{table}`
-            WHERE `snapshot_hash` = :h
-            LIMIT 1
-            """
-        )
-        try:
-            with self.engine.begin() as conn:
-                row = conn.execute(stmt, {"h": snapshot_hash}).mappings().first()
-        except Exception as exc:  # noqa: BLE001
-            self.logger.debug("读取指数快照失败：%s", exc)
-            return {}
-        return dict(row or {})
-
-    def persist_index_snapshot(self, payload: dict[str, Any]) -> None:
-        if not payload:
-            return
-
-        table = TABLE_STRATEGY_ENV_INDEX_SNAPSHOT
-        if not self._table_exists(table):
-            self.logger.debug("指数快照表 %s 不存在，已跳过写入。", table)
-            return
-
-        columns = list(payload.keys())
-        update_cols = [c for c in columns if c != "snapshot_hash"]
-        col_clause = ", ".join(f"`{c}`" for c in columns)
-        value_clause = ", ".join(f":{c}" for c in columns)
-        update_clause = ", ".join(f"`{c}` = VALUES(`{c}`)" for c in update_cols)
-        stmt = text(
-            f"""
-            INSERT INTO `{table}` ({col_clause})
-            VALUES ({value_clause})
-            ON DUPLICATE KEY UPDATE {update_clause}
-            """
-        )
-        try:
-            with self.engine.begin() as conn:
-                conn.execute(stmt, payload)
-        except Exception as exc:  # noqa: BLE001
-            self.logger.debug("写入指数快照失败：%s", exc)
-
     def get_env_broadcast_run_pk(
         self, monitor_date: str, env_run_id: str = ENV_RUN_PREOPEN
     ) -> int | None:
@@ -1518,7 +1469,56 @@ class OpenMonitorRepository:
                 index_snapshot = raw_index_snapshot
         env_index_hash = index_snapshot.get("env_index_snapshot_hash")
         payload["env_index_snapshot_hash"] = env_index_hash
-        index_fields: list[str] = []
+        index_fields = [
+            "env_index_code",
+            "env_index_asof_trade_date",
+            "env_index_live_trade_date",
+            "env_index_asof_close",
+            "env_index_asof_ma20",
+            "env_index_asof_ma60",
+            "env_index_asof_macd_hist",
+            "env_index_asof_atr14",
+            "env_index_live_open",
+            "env_index_live_high",
+            "env_index_live_low",
+            "env_index_live_latest",
+            "env_index_live_pct_change",
+            "env_index_live_volume",
+            "env_index_live_amount",
+            "env_index_dev_ma20_atr",
+            "env_index_gate_action",
+            "env_index_gate_reason",
+            "env_index_position_cap",
+        ]
+        date_fields = {"env_index_asof_trade_date", "env_index_live_trade_date"}
+        numeric_fields = {
+            "env_index_asof_close",
+            "env_index_asof_ma20",
+            "env_index_asof_ma60",
+            "env_index_asof_macd_hist",
+            "env_index_asof_atr14",
+            "env_index_live_open",
+            "env_index_live_high",
+            "env_index_live_low",
+            "env_index_live_latest",
+            "env_index_live_pct_change",
+            "env_index_live_volume",
+            "env_index_live_amount",
+            "env_index_dev_ma20_atr",
+            "env_index_position_cap",
+        }
+        for field in index_fields:
+            value = index_snapshot.get(field)
+            if field in date_fields and value is not None:
+                parsed_date = pd.to_datetime(value, errors="coerce")
+                payload[field] = (
+                    parsed_date.date() if not pd.isna(parsed_date) else value
+                )
+                continue
+            if field in numeric_fields:
+                payload[field] = _to_float(value)
+                continue
+            payload[field] = value
         payload["env_final_gate_action"] = env_context.get("env_final_gate_action")
         if payload["env_final_gate_action"] is None:
             self.logger.error(
