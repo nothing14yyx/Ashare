@@ -1309,6 +1309,117 @@ class OpenMonitorRepository:
             self.logger.warning("写入日线环境失败：%s", exc)
             return 0
 
+    def attach_cycle_phase_from_weekly(
+        self, rows: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        if not rows:
+            return rows
+        table = self.params.weekly_indicator_table
+        if not table:
+            return rows
+
+        df_daily = pd.DataFrame(rows)
+        if df_daily.empty or "asof_trade_date" not in df_daily.columns:
+            return rows
+
+        df_daily = df_daily.copy()
+        df_daily["__order"] = range(len(df_daily))
+        df_daily["__asof_trade_date"] = pd.to_datetime(
+            df_daily["asof_trade_date"], errors="coerce"
+        )
+        parsed_dates = df_daily["__asof_trade_date"].dropna()
+        if parsed_dates.empty:
+            df_daily["cycle_phase"] = None
+            df_daily = df_daily.sort_values("__order")
+            df_daily = df_daily.drop(columns=["__order", "__asof_trade_date"])
+            return df_daily.to_dict(orient="records")
+
+        min_date = parsed_dates.min()
+        max_date = parsed_dates.max()
+        min_date_floor = (min_date - pd.Timedelta(days=14)).date()
+        max_date_val = max_date.date()
+
+        benchmark_code = self.params.weekly_benchmark_code
+        stmt = text(
+            f"""
+            SELECT weekly_asof_trade_date, weekly_scene_code, weekly_phase
+            FROM `{table}`
+            WHERE benchmark_code = :benchmark_code
+              AND weekly_asof_trade_date <= :max_date
+              AND weekly_asof_trade_date >= :min_date
+            """
+        )
+        try:
+            with self.engine.begin() as conn:
+                df_weekly = pd.read_sql_query(
+                    stmt,
+                    conn,
+                    params={
+                        "max_date": max_date_val,
+                        "min_date": min_date_floor,
+                        "benchmark_code": benchmark_code,
+                    },
+                )
+        except Exception as exc:  # noqa: BLE001
+            self.logger.warning("读取周线场景失败：%s", exc)
+            df_daily = df_daily.sort_values("__order")
+            df_daily = df_daily.drop(columns=["__order", "__asof_trade_date"])
+            return df_daily.to_dict(orient="records")
+
+        if df_weekly.empty:
+            df_daily = df_daily.sort_values("__order")
+            df_daily = df_daily.drop(columns=["__order", "__asof_trade_date"])
+            return df_daily.to_dict(orient="records")
+
+        df_weekly = df_weekly.copy()
+        df_weekly["weekly_asof_trade_date"] = pd.to_datetime(
+            df_weekly["weekly_asof_trade_date"], errors="coerce"
+        )
+        df_weekly = df_weekly.dropna(subset=["weekly_asof_trade_date"])
+        if df_weekly.empty:
+            df_daily["cycle_phase"] = None
+            df_daily = df_daily.sort_values("__order")
+            df_daily = df_daily.drop(columns=["__order", "__asof_trade_date"])
+            return df_daily.to_dict(orient="records")
+
+        df_daily_sorted = df_daily.sort_values("__asof_trade_date")
+        df_weekly_sorted = df_weekly.sort_values("weekly_asof_trade_date")
+
+        df_daily_valid = df_daily_sorted.dropna(subset=["__asof_trade_date"])
+        df_daily_invalid = df_daily_sorted[df_daily_sorted["__asof_trade_date"].isna()]
+
+        merged = pd.merge_asof(
+            df_daily_valid,
+            df_weekly_sorted,
+            left_on="__asof_trade_date",
+            right_on="weekly_asof_trade_date",
+            direction="backward",
+        )
+        merged["cycle_phase"] = merged["weekly_scene_code"]
+        if "weekly_phase" in merged.columns:
+            merged["cycle_phase"] = merged["cycle_phase"].fillna(merged["weekly_phase"])
+        merged["cycle_phase"] = merged["cycle_phase"].where(
+            pd.notna(merged["cycle_phase"]), None
+        )
+
+        if not df_daily_invalid.empty:
+            df_daily_invalid = df_daily_invalid.copy()
+            df_daily_invalid["cycle_phase"] = None
+            merged = pd.concat([merged, df_daily_invalid], ignore_index=True)
+
+        merged = merged.sort_values("__order")
+        merged = merged.drop(
+            columns=[
+                "__order",
+                "__asof_trade_date",
+                "weekly_asof_trade_date",
+                "weekly_scene_code",
+                "weekly_phase",
+            ],
+            errors="ignore",
+        )
+        return merged.to_dict(orient="records")
+
     def persist_env_snapshot(
         self,
         env_context: dict[str, Any] | None,

@@ -57,6 +57,7 @@ class MarketIndicatorBuilder:
                 "weekly_asof_trade_date": weekly_asof,
                 "benchmark_code": benchmark_code,
                 "weekly_scene_code": weekly_scenario.get("weekly_scene_code"),
+                "weekly_phase": weekly_scenario.get("weekly_phase"),
                 "weekly_structure_status": weekly_scenario.get("weekly_structure_status"),
                 "weekly_pattern_status": weekly_scenario.get("weekly_pattern_status"),
                 "weekly_risk_score": weekly_scenario.get("weekly_risk_score"),
@@ -160,9 +161,9 @@ class MarketIndicatorBuilder:
         for code, group in df.groupby("code", sort=False):
             grp = group.sort_values("date").copy()
             close = grp["close"]
-            grp["ma20"] = close.rolling(20, min_periods=1).mean()
-            grp["ma60"] = close.rolling(60, min_periods=1).mean()
-            grp["ma250"] = close.rolling(250, min_periods=1).mean()
+            grp["ma20"] = close.rolling(20, min_periods=20).mean()
+            grp["ma60"] = close.rolling(60, min_periods=60).mean()
+            grp["ma250"] = close.rolling(250, min_periods=250).mean()
             dif, dea, hist = _macd(close)
             grp["macd_hist"] = hist
             preclose = close.shift(1)
@@ -196,16 +197,33 @@ class MarketIndicatorBuilder:
 
             status = pd.Series("RISK_ON", index=grp.index, dtype="object")
             status = status.mask(close.isna(), "UNKNOWN")
-            status = status.mask(grp["break_confirmed"], "BEAR_CONFIRMED")
+            status = status.mask(grp["ma60"].isna() | grp["ma250"].isna(), "UNKNOWN")
+
+            risk_off_threshold = -0.5
+            risk_off_condition = (
+                (close < grp["ma60"])
+                & (grp["macd_hist"] < 0)
+                & (grp["dev_ma20_atr"] < risk_off_threshold)
+            )
+            grp["risk_off_flag"] = risk_off_condition
+
             status = status.mask(
-                (grp["rolling_low"].notna()) & (close < grp["rolling_low"]),
+                (status != "UNKNOWN") & grp["break_confirmed"], "BEAR_CONFIRMED"
+            )
+            status = status.mask(
+                (status != "UNKNOWN")
+                & (grp["rolling_low"].notna())
+                & (close < grp["rolling_low"]),
                 "BREAKDOWN",
             )
-            status = status.mask((grp["ma250"].notna()) & (close < grp["ma250"]), "RISK_OFF")
+            status = status.mask(
+                (status != "UNKNOWN") & risk_off_condition,
+                "RISK_OFF",
+            )
             pullback_mask = (grp["ma60"].notna()) & (close < grp["ma60"])
-            status = status.mask(pullback_mask, "PULLBACK")
+            status = status.mask((status != "UNKNOWN") & pullback_mask, "PULLBACK")
             pullback_mask = (grp["ma20"].notna()) & (close < grp["ma20"])
-            status = status.mask(pullback_mask, "PULLBACK")
+            status = status.mask((status != "UNKNOWN") & pullback_mask, "PULLBACK")
             grp["status"] = status
 
             score = (
@@ -222,9 +240,16 @@ class MarketIndicatorBuilder:
             return []
 
         merged["trade_date"] = merged["date"].dt.date
+        merged["above_ma20"] = (merged["close"] > merged["ma20"]) & merged["ma20"].notna()
+        merged["above_ma60"] = (merged["close"] > merged["ma60"]) & merged["ma60"].notna()
         day_summary = (
             merged.groupby("trade_date")[["status", "score_raw", "pullback_mode"]]
             .apply(self._resolve_daily_regime)
+            .reset_index()
+        )
+        breadth_summary = (
+            merged.groupby("trade_date")
+            .apply(self._resolve_breadth_metrics)
             .reset_index()
         )
         merged = merged.merge(day_summary, on="trade_date", how="left")
@@ -253,6 +278,7 @@ class MarketIndicatorBuilder:
         ]
 
         daily_env = day_summary.merge(benchmark_daily, on="trade_date", how="left")
+        daily_env = daily_env.merge(breadth_summary, on="trade_date", how="left")
 
         component_fields = [
             "code",
@@ -288,6 +314,12 @@ class MarketIndicatorBuilder:
 
         daily_env["components_json"] = daily_env["trade_date"].map(components_map)
 
+        invalid_ma_mask = daily_env["ma60"].isna() | daily_env["ma250"].isna()
+        if invalid_ma_mask.any():
+            daily_env.loc[invalid_ma_mask, "regime"] = "UNKNOWN"
+            daily_env.loc[invalid_ma_mask, "position_hint"] = None
+            daily_env.loc[invalid_ma_mask, "score"] = None
+
         rows: list[dict[str, Any]] = []
         for _, row in daily_env.iterrows():
             rows.append(
@@ -304,6 +336,10 @@ class MarketIndicatorBuilder:
                     "atr14": row.get("atr14"),
                     "dev_ma20_atr": row.get("dev_ma20_atr"),
                     "cycle_phase": None,
+                    "breadth_pct_above_ma20": row.get("breadth_pct_above_ma20"),
+                    "breadth_pct_above_ma60": row.get("breadth_pct_above_ma60"),
+                    "breadth_risk_off_ratio": row.get("breadth_risk_off_ratio"),
+                    "dispersion_score": row.get("dispersion_score"),
                     "components_json": row.get("components_json"),
                 }
             )
@@ -318,7 +354,10 @@ class MarketIndicatorBuilder:
         )
 
         regime = "RISK_ON"
-        if "BEAR_CONFIRMED" in statuses:
+        if statuses and all(val == "UNKNOWN" for val in statuses):
+            regime = "UNKNOWN"
+            score = None
+        elif "BEAR_CONFIRMED" in statuses:
             regime = "BEAR_CONFIRMED"
         elif "BREAKDOWN" in statuses:
             regime = "BREAKDOWN"
@@ -330,9 +369,10 @@ class MarketIndicatorBuilder:
         position_hint_map = {
             "RISK_ON": 0.8,
             "PULLBACK": 0.4,
-            "RISK_OFF": 0.2,
+            "RISK_OFF": 0.1,
             "BREAKDOWN": 0.0,
             "BEAR_CONFIRMED": 0.0,
+            "UNKNOWN": None,
         }
         position_hint = position_hint_map.get(regime)
         if regime == "PULLBACK" and pullback_fast and position_hint is not None:
@@ -343,5 +383,51 @@ class MarketIndicatorBuilder:
                 "score": score,
                 "regime": regime,
                 "position_hint": position_hint,
+            }
+        )
+
+    @staticmethod
+    def _resolve_breadth_metrics(group: pd.DataFrame) -> pd.Series:
+        valid_ma20 = group["ma20"].notna()
+        valid_ma60 = group["ma60"].notna()
+
+        breadth_ma20 = (
+            float(group.loc[valid_ma20, "above_ma20"].sum()) / float(valid_ma20.sum())
+            if valid_ma20.any()
+            else None
+        )
+        breadth_ma60 = (
+            float(group.loc[valid_ma60, "above_ma60"].sum()) / float(valid_ma60.sum())
+            if valid_ma60.any()
+            else None
+        )
+
+        risk_off_mask = (
+            group["risk_off_flag"].fillna(False)
+            & group["ma60"].notna()
+            & group["macd_hist"].notna()
+            & group["dev_ma20_atr"].notna()
+        )
+        denom = (
+            group["ma60"].notna()
+            & group["macd_hist"].notna()
+            & group["dev_ma20_atr"].notna()
+        )
+        breadth_risk_off = (
+            float(risk_off_mask.sum()) / float(denom.sum()) if denom.any() else None
+        )
+
+        dispersion = (
+            float(group["dev_ma20_atr"].std())
+            if group["dev_ma20_atr"].notna().any()
+            else None
+        )
+
+        return pd.Series(
+            {
+                "breadth_pct_above_ma20": breadth_ma20,
+                "breadth_pct_above_ma60": breadth_ma60,
+                "breadth_risk_off_ratio": breadth_risk_off,
+                "dispersion_score": dispersion,
             }
         )

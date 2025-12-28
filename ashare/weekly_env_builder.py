@@ -427,6 +427,7 @@ class WeeklyEnvironmentBuilder:
             "weekly_direction_confirmed": False,
             "weekly_key_levels": {},
             "weekly_money_proxy": {},
+            "weekly_phase": None,
             "weekly_plan_a": None,
             "weekly_plan_b": None,
             "weekly_scene_code": None,
@@ -465,6 +466,7 @@ class WeeklyEnvironmentBuilder:
         scenario["weekly_direction_confirmed"] = bool(
             plan.get("weekly_direction_confirmed", False)
         )
+        scenario["weekly_phase"] = plan.get("weekly_phase")
         scenario["weekly_key_levels"] = plan.get("weekly_key_levels", {})
         scenario["weekly_key_levels_str"] = self._clip(plan.get("weekly_key_levels_str"), 255)
         scenario["weekly_plan_a"] = self._clip(plan.get("weekly_plan_a"), 255)
@@ -573,6 +575,7 @@ class WeeklyEnvironmentBuilder:
             "weekly_plan_a": weekly_scenario.get("weekly_plan_a"),
             "weekly_plan_b": weekly_scenario.get("weekly_plan_b"),
             "weekly_scene_code": weekly_scenario.get("weekly_scene_code"),
+            "weekly_phase": weekly_scenario.get("weekly_phase"),
             "weekly_key_levels_str": weekly_scenario.get("weekly_key_levels_str"),
             "weekly_plan_a_if": weekly_scenario.get("weekly_plan_a_if"),
             "weekly_plan_a_then": weekly_scenario.get("weekly_plan_a_then"),
@@ -667,9 +670,20 @@ class WeeklyEnvironmentBuilder:
         risk_level = str(_get_env("weekly_risk_level") or "").upper()
         status = str(_get_env("weekly_status") or "").upper()
         structure_status = str(_get_env("weekly_structure_status") or status).upper()
+        weekly_phase = str(_get_env("weekly_phase") or "").upper()
+        weekly_tags = str(_get_env("weekly_tags") or "")
 
         if not gating_enabled:
             return "ALLOW"
+
+        if weekly_phase == "BREAKDOWN_RISK":
+            return "WAIT"
+
+        if weekly_phase == "BEAR_TREND" and risk_level in {"MEDIUM", "HIGH"}:
+            return "ALLOW_SMALL"
+
+        if "VOL_WEAK" in weekly_tags and risk_level != "LOW":
+            return "ALLOW_SMALL"
 
         if risk_level == "HIGH":
             return "WAIT"
@@ -758,6 +772,7 @@ class WeeklyEnvironmentBuilder:
             "weekly_risk_level",
             "weekly_risk_score",
             "weekly_scene_code",
+            "weekly_phase",
             "weekly_structure_status",
             "weekly_pattern_status",
             "weekly_asof_trade_date",
@@ -773,11 +788,26 @@ class WeeklyEnvironmentBuilder:
 
         final_gate = self._merge_gate_actions(*gate_candidates) or "ALLOW"
 
+        weekly_cap = to_float(env_context.get("weekly_plan_a_exposure_cap"))
+        daily_pos_hint = to_float(env_context.get("position_hint"))
+        breadth_pct = to_float(env_context.get("breadth_pct_above_ma20"))
+        breadth_factor = (
+            0.6 + 0.4 * breadth_pct if breadth_pct is not None else 1.0
+        )
+        daily_cap = (
+            daily_pos_hint * breadth_factor
+            if daily_pos_hint is not None
+            else None
+        )
+
         cap_candidates = [
+            weekly_cap,
+            daily_cap,
             to_float(env_context.get("effective_position_hint")),
             to_float(env_context.get("position_hint")),
         ]
-        final_cap = next((c for c in cap_candidates if c is not None), 1.0)
+        filtered_caps = [c for c in cap_candidates if c is not None]
+        final_cap = min(filtered_caps) if filtered_caps else 1.0
         final_cap = min(max(final_cap, 0.0), 1.0)
         env_context["env_final_gate_action"] = final_gate
         env_context["env_final_cap_pct"] = final_cap

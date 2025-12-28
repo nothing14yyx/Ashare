@@ -1614,6 +1614,7 @@ class SchemaManager:
             "weekly_asof_trade_date": "DATE NOT NULL",
             "benchmark_code": "VARCHAR(16) NOT NULL",
             "weekly_scene_code": "VARCHAR(32) NULL",
+            "weekly_phase": "VARCHAR(32) NULL",
             "weekly_structure_status": "VARCHAR(32) NULL",
             "weekly_pattern_status": "VARCHAR(32) NULL",
             "weekly_risk_score": "DOUBLE NULL",
@@ -1651,6 +1652,10 @@ class SchemaManager:
             "atr14": "DOUBLE NULL",
             "dev_ma20_atr": "DOUBLE NULL",
             "cycle_phase": "VARCHAR(32) NULL",
+            "breadth_pct_above_ma20": "DOUBLE NULL",
+            "breadth_pct_above_ma60": "DOUBLE NULL",
+            "breadth_risk_off_ratio": "DOUBLE NULL",
+            "dispersion_score": "DOUBLE NULL",
             "components_json": "LONGTEXT NULL",
         }
         if not self._table_exists(table):

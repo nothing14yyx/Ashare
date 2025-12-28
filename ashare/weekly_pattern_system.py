@@ -260,17 +260,23 @@ class WeeklyPlanSystem:
         lows: List[Tuple[int, float]],
     ) -> PatternCandidate:
         idx_last = len(df) - 1
-        upper_slope, upper_intercept = _fit_regression(highs)
-        lower_slope, lower_intercept = _fit_regression(lows)
-        upper_last = _line_value(upper_slope, upper_intercept, idx_last)
-        lower_last = _line_value(lower_slope, lower_intercept, idx_last)
-        width_end = upper_last - lower_last if upper_last and lower_last else None
+        log_highs = [(i, float(np.log(p))) for i, p in highs if p and p > 0]
+        log_lows = [(i, float(np.log(p))) for i, p in lows if p and p > 0]
+        upper_slope, upper_intercept = _fit_regression(log_highs)
+        lower_slope, lower_intercept = _fit_regression(log_lows)
+        upper_last_log = _line_value(upper_slope, upper_intercept, idx_last)
+        lower_last_log = _line_value(lower_slope, lower_intercept, idx_last)
+        upper_last = float(np.exp(upper_last_log)) if upper_last_log is not None else None
+        lower_last = float(np.exp(lower_last_log)) if lower_last_log is not None else None
+        width_end = upper_last - lower_last if upper_last is not None and lower_last is not None else None
         width_start = None
-        if highs and lows:
-            min_idx = min(highs[0][0], lows[0][0])
-            upper_start = _line_value(upper_slope, upper_intercept, min_idx)
-            lower_start = _line_value(lower_slope, lower_intercept, min_idx)
-            if upper_start and lower_start:
+        if log_highs and log_lows:
+            min_idx = min(log_highs[0][0], log_lows[0][0])
+            upper_start_log = _line_value(upper_slope, upper_intercept, min_idx)
+            lower_start_log = _line_value(lower_slope, lower_intercept, min_idx)
+            if upper_start_log is not None and lower_start_log is not None:
+                upper_start = float(np.exp(upper_start_log))
+                lower_start = float(np.exp(lower_start_log))
                 width_start = upper_start - lower_start
         convergence = self._convergence(upper_slope, lower_slope, width_start, width_end)
 
@@ -284,9 +290,11 @@ class WeeklyPlanSystem:
         tags: List[str] = []
         score = 55.0
 
-        near_parallel = slope_diff is not None and abs(slope_diff) < 0.001
-        upper_flat = upper_slope is not None and abs(upper_slope) < 0.0005
-        lower_flat = lower_slope is not None and abs(lower_slope) < 0.0005
+        flat_threshold_pct = 0.0005
+        parallel_threshold_pct = 0.0005
+        near_parallel = slope_diff is not None and slope_diff < parallel_threshold_pct
+        upper_flat = upper_slope is not None and abs(upper_slope) < flat_threshold_pct
+        lower_flat = lower_slope is not None and abs(lower_slope) < flat_threshold_pct
         converging = convergence is not None and convergence < 1.0
 
         if near_parallel:
@@ -489,31 +497,107 @@ class WeeklyPlanSystem:
 
         return confirm_tags, money_tags
 
-    def _risk(self, bias: str, status: str, confirmed: bool) -> Tuple[float, str]:
+    def _risk(
+        self,
+        bias: str,
+        status: str,
+        confirmed: bool,
+        *,
+        chan_pos: float | None,
+        width_pct: float | None,
+        atr_pct: float | None,
+        close_below_ma_slow: bool,
+        close_below_lower: bool,
+        close_below_neckline: bool,
+    ) -> Tuple[float, str]:
         score = 50.0
-        level = "MEDIUM"
-        if status == "CONFIRMED" and bias == "BEARISH":
-            score = 85.0
-            level = "HIGH"
-        elif status == "CONFIRMED" and bias == "BULLISH":
-            score = 35.0
-            level = "LOW"
-        elif status in {"BREAKOUT_DOWN"}:
-            score = 80.0
-            level = "HIGH"
-        elif status in {"BREAKOUT_UP"}:
-            score = 45.0
-            level = "LOW" if confirmed else "MEDIUM"
-        elif bias == "NEUTRAL":
-            score = 55.0
-            level = "MEDIUM"
+        if bias == "BEARISH":
+            score += 10.0
         elif bias == "BULLISH":
-            score = 48.0
-            level = "MEDIUM"
-        elif bias == "BEARISH":
-            score = 65.0
+            score -= 5.0
+
+        if status == "CONFIRMED" and bias == "BEARISH":
+            score += 15.0
+        elif status == "CONFIRMED" and bias == "BULLISH":
+            score -= 10.0
+        elif status == "BREAKOUT_DOWN":
+            score += 12.0
+        elif status == "BREAKOUT_UP":
+            score -= 6.0
+
+        if chan_pos is not None:
+            edge_risk = abs(chan_pos - 0.5) * 40.0
+            if chan_pos >= 0.8:
+                edge_risk += 5.0
+            if chan_pos <= 0.2:
+                edge_risk += 10.0
+            score += edge_risk
+
+        vol_pct = None
+        for val in [width_pct, atr_pct]:
+            if val is not None and not pd.isna(val):
+                vol_pct = max(vol_pct or 0.0, float(val))
+        if vol_pct is not None:
+            score += min(vol_pct * 100.0, 20.0)
+
+        if close_below_ma_slow:
+            score += 12.0
+        if close_below_lower:
+            score += 18.0
+        if close_below_neckline:
+            score += 18.0
+
+        score = max(0.0, min(100.0, float(score)))
+
+        force_high = close_below_lower or close_below_neckline
+        if force_high:
+            score = max(score, 80.0)
+
+        if score >= 70.0 or force_high:
+            level = "HIGH"
+        elif score <= 40.0:
+            level = "LOW"
+        else:
             level = "MEDIUM"
         return score, level
+
+    @staticmethod
+    def _derive_weekly_phase(
+        *,
+        last_close: float | None,
+        ma_fast: float | None,
+        ma_slow: float | None,
+        upper: float | None,
+        lower: float | None,
+        status: str,
+        bias: str,
+    ) -> str:
+        if last_close is None or pd.isna(last_close):
+            return "RANGE"
+        breakdown_trigger = False
+        if lower is not None and last_close < lower:
+            breakdown_trigger = True
+        if status == "BREAKOUT_DOWN":
+            breakdown_trigger = True
+        if status == "CONFIRMED" and bias == "BEARISH":
+            breakdown_trigger = True
+        if breakdown_trigger:
+            return "BREAKDOWN_RISK"
+
+        if ma_slow is not None and not pd.isna(ma_slow) and last_close < ma_slow:
+            return "BEAR_TREND"
+
+        if (
+            ma_fast is not None
+            and ma_slow is not None
+            and not pd.isna(ma_fast)
+            and not pd.isna(ma_slow)
+            and last_close > ma_fast
+            and ma_fast >= ma_slow
+        ):
+            return "BULL_TREND"
+
+        return "RANGE"
 
     def _plan_texts(
         self,
@@ -621,6 +705,7 @@ class WeeklyPlanSystem:
             "weekly_confirm_tags": [],
             "weekly_money_tags": [],
             "weekly_money_proxy": {},
+            "weekly_phase": None,
             "weekly_risk_score": None,
             "weekly_risk_level": "UNKNOWN",
             "weekly_confirm": False,
@@ -680,10 +765,6 @@ class WeeklyPlanSystem:
         direction_confirmed = candidate.status == "CONFIRMED"
         structure_status = "CONFIRMED" if direction_confirmed else "FORMING"
         pattern_status = candidate.status
-        risk_score, risk_level = self._risk(
-            candidate.bias, candidate.status, direction_confirmed
-        )
-
         key_levels = dict(candidate.key_levels)
         if not key_levels.get("ma_fast"):
             ma_fast_val = float(df["ma_fast"].iloc[-1]) if pd.notna(df["ma_fast"].iloc[-1]) else None
@@ -697,6 +778,70 @@ class WeeklyPlanSystem:
             atr_val = float(df["atr14"].iloc[-1]) if pd.notna(df["atr14"].iloc[-1]) else None
             if atr_val:
                 key_levels["atr14"] = atr_val
+
+        last_close = float(df["close"].iloc[-1]) if pd.notna(df["close"].iloc[-1]) else None
+        ma_fast_val = key_levels.get("ma_fast")
+        ma_slow_val = key_levels.get("ma_slow")
+        upper_level = key_levels.get("upper")
+        lower_level = key_levels.get("lower")
+        neckline_level = key_levels.get("neckline")
+
+        weekly_phase = self._derive_weekly_phase(
+            last_close=last_close,
+            ma_fast=ma_fast_val,
+            ma_slow=ma_slow_val,
+            upper=upper_level,
+            lower=lower_level,
+            status=candidate.status,
+            bias=candidate.bias,
+        )
+
+        range_width_pct = (
+            float(df["range_width_pct"].iloc[-1])
+            if pd.notna(df["range_width_pct"].iloc[-1])
+            else None
+        )
+        atr_pct = None
+        atr_val = key_levels.get("atr14")
+        if atr_val is not None and last_close:
+            atr_pct = float(atr_val) / float(last_close)
+
+        chan_pos = None
+        if (
+            upper_level is not None
+            and lower_level is not None
+            and last_close is not None
+            and upper_level != lower_level
+        ):
+            chan_pos = (float(last_close) - float(lower_level)) / (
+                float(upper_level) - float(lower_level)
+            )
+
+        close_below_ma_slow = (
+            last_close is not None
+            and ma_slow_val is not None
+            and last_close < ma_slow_val
+        )
+        close_below_lower = (
+            last_close is not None and lower_level is not None and last_close < lower_level
+        )
+        close_below_neckline = (
+            last_close is not None
+            and neckline_level is not None
+            and last_close < neckline_level
+        )
+
+        risk_score, risk_level = self._risk(
+            candidate.bias,
+            candidate.status,
+            direction_confirmed,
+            chan_pos=chan_pos,
+            width_pct=range_width_pct,
+            atr_pct=atr_pct,
+            close_below_ma_slow=close_below_ma_slow,
+            close_below_lower=close_below_lower,
+            close_below_neckline=close_below_neckline,
+        )
 
         key_parts = []
         for label in ["upper", "lower", "neckline", "ma_fast", "ma_slow"]:
@@ -726,21 +871,41 @@ class WeeklyPlanSystem:
         )
 
         if exposure_cap is None:
-            pos_hint = weekly_payload.get("position_hint")
-            try:
-                exposure_cap = float(pos_hint) if pos_hint is not None else None
-            except Exception:  # noqa: BLE001
-                exposure_cap = None
-        if exposure_cap is None:
-            risk_level_norm = str(risk_level or "").upper()
-            default_cap_map = {"HIGH": 0.10, "MEDIUM": 0.25, "LOW": 0.60}
-            exposure_cap = default_cap_map.get(risk_level_norm)
-        if exposure_cap is not None:
-            exposure_cap = float(exposure_cap)
-            if candidate.bias == "BEARISH":
-                exposure_cap = min(exposure_cap, 0.25)
+            base_cap_map = {
+                "BULL_TREND": 0.7,
+                "RANGE": 0.4,
+                "BEAR_TREND": 0.2,
+                "BREAKDOWN_RISK": 0.1,
+            }
+            exposure_cap = base_cap_map.get(weekly_phase, 0.4)
+
+            modifier = 1.0
+            confirm_tags = set(candidate.confirm_tags)
+            if "VOL_CONFIRM" in confirm_tags:
+                modifier += 0.1
+            if "VOL_WEAK" in confirm_tags:
+                modifier -= 0.1
+            if chan_pos is not None:
+                if chan_pos >= 0.85:
+                    modifier -= 0.1
+                elif chan_pos >= 0.75:
+                    modifier -= 0.05
+                if chan_pos <= 0.15:
+                    modifier -= 0.1
+                elif chan_pos <= 0.25:
+                    modifier -= 0.05
+            if range_width_pct is not None:
+                if range_width_pct >= 0.08:
+                    modifier -= 0.1
+                elif range_width_pct >= 0.05:
+                    modifier -= 0.05
+            if atr_pct is not None and atr_pct >= 0.05:
+                modifier -= 0.05
+
+            exposure_cap = float(exposure_cap) * modifier
             if not asof_week_closed:
-                exposure_cap = min(exposure_cap, 0.20)
+                exposure_cap *= 0.8
+            exposure_cap = min(max(exposure_cap, 0.05), 0.95)
 
         money_proxy = {
             "vol_ratio_20": float(df["wk_vol_ratio_20"].iloc[-1])
@@ -766,6 +931,7 @@ class WeeklyPlanSystem:
                 "weekly_confirm_tags": candidate.confirm_tags,
                 "weekly_money_tags": candidate.money_tags,
                 "weekly_money_proxy": money_proxy,
+                "weekly_phase": weekly_phase,
                 "weekly_risk_score": risk_score,
                 "weekly_risk_level": risk_level,
                 "weekly_confirm": direction_confirmed,

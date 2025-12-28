@@ -82,6 +82,7 @@ class OpenMonitorEnvService:
             or weekly_asof,
             "weekly_risk_level": weekly_indicator.get("weekly_risk_level"),
             "weekly_scene_code": weekly_indicator.get("weekly_scene_code"),
+            "weekly_phase": weekly_indicator.get("weekly_phase"),
             "weekly_gate_policy": weekly_indicator.get("weekly_gate_policy"),
             "weekly_gate_action": weekly_indicator.get("weekly_gate_policy"),
             "weekly_structure_status": weekly_indicator.get("weekly_structure_status"),
@@ -102,6 +103,7 @@ class OpenMonitorEnvService:
             "weekly_asof_trade_date": weekly_scenario.get("weekly_asof_trade_date"),
             "weekly_risk_level": weekly_scenario.get("weekly_risk_level"),
             "weekly_scene_code": weekly_scenario.get("weekly_scene_code"),
+            "weekly_phase": weekly_scenario.get("weekly_phase"),
             "weekly_gate_policy": weekly_scenario.get("weekly_gate_policy"),
             "weekly_gate_action": weekly_scenario.get("weekly_gate_action"),
             "regime": (daily_env or {}).get("regime") or row.get("env_regime"),
@@ -120,6 +122,10 @@ class OpenMonitorEnvService:
             "daily_macd_hist": (daily_env or {}).get("macd_hist"),
             "daily_atr14": (daily_env or {}).get("atr14"),
             "daily_dev_ma20_atr": (daily_env or {}).get("dev_ma20_atr"),
+            "breadth_pct_above_ma20": (daily_env or {}).get("breadth_pct_above_ma20"),
+            "breadth_pct_above_ma60": (daily_env or {}).get("breadth_pct_above_ma60"),
+            "breadth_risk_off_ratio": (daily_env or {}).get("breadth_risk_off_ratio"),
+            "dispersion_score": (daily_env or {}).get("dispersion_score"),
             "env_index_snapshot_hash": index_snapshot_hash,
             "env_final_gate_action": row.get("env_final_gate_action"),
             "env_final_cap_pct": row.get("env_final_cap_pct"),
@@ -172,6 +178,7 @@ class OpenMonitorEnvService:
             daily_rows = self.indicator_builder.compute_daily_indicators(
                 start_date, start_date
             )
+            daily_rows = self.repo.attach_cycle_phase_from_weekly(daily_rows)
             self.repo.upsert_daily_market_env(daily_rows)
             daily_env = self.repo.load_daily_market_env(
                 asof_trade_date=latest_trade_date, benchmark_code=benchmark_code
@@ -184,6 +191,7 @@ class OpenMonitorEnvService:
             "weekly_asof_trade_date": weekly_indicator.get("weekly_asof_trade_date")
             or weekly_asof,
             "weekly_scene_code": weekly_indicator.get("weekly_scene_code"),
+            "weekly_phase": weekly_indicator.get("weekly_phase"),
             "weekly_structure_status": weekly_indicator.get("weekly_structure_status"),
             "weekly_pattern_status": weekly_indicator.get("weekly_pattern_status"),
             "weekly_risk_score": weekly_indicator.get("weekly_risk_score"),
@@ -204,6 +212,7 @@ class OpenMonitorEnvService:
             "weekly_risk_score": weekly_scenario.get("weekly_risk_score"),
             "weekly_risk_level": weekly_scenario.get("weekly_risk_level"),
             "weekly_scene_code": weekly_scenario.get("weekly_scene_code"),
+            "weekly_phase": weekly_scenario.get("weekly_phase"),
             "weekly_structure_status": weekly_scenario.get("weekly_structure_status"),
             "weekly_pattern_status": weekly_scenario.get("weekly_pattern_status"),
             "weekly_plan_a_exposure_cap": weekly_scenario.get("weekly_plan_a_exposure_cap"),
@@ -233,6 +242,18 @@ class OpenMonitorEnvService:
             "daily_macd_hist": _to_float(daily_env.get("macd_hist")) if daily_env else None,
             "daily_atr14": _to_float(daily_env.get("atr14")) if daily_env else None,
             "daily_dev_ma20_atr": _to_float(daily_env.get("dev_ma20_atr"))
+            if daily_env
+            else None,
+            "breadth_pct_above_ma20": _to_float(daily_env.get("breadth_pct_above_ma20"))
+            if daily_env
+            else None,
+            "breadth_pct_above_ma60": _to_float(daily_env.get("breadth_pct_above_ma60"))
+            if daily_env
+            else None,
+            "breadth_risk_off_ratio": _to_float(daily_env.get("breadth_risk_off_ratio"))
+            if daily_env
+            else None,
+            "dispersion_score": _to_float(daily_env.get("dispersion_score"))
             if daily_env
             else None,
         }
