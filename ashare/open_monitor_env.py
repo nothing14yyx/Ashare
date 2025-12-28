@@ -175,17 +175,16 @@ class OpenMonitorEnvService:
     def build_environment_context(
         self, latest_trade_date: str, *, checked_at: dt.datetime | None = None
     ) -> dict[str, Any]:
-        weekly_asof = None
-        weekly_asof_date = self.repo.get_latest_weekly_indicator_date()
-        if weekly_asof_date:
-            weekly_asof = weekly_asof_date.isoformat()
-        if not weekly_asof:
+        expected_weekly_asof, _ = self.env_builder.resolve_latest_closed_week_end(
+            latest_trade_date
+        )
+        weekly_indicator = self.repo.load_weekly_indicator(expected_weekly_asof) or {}
+        if not weekly_indicator:
             weekly_rows = self.indicator_builder.compute_weekly_indicator(
                 latest_trade_date, checked_at=checked_at
             )
             self.repo.upsert_weekly_indicator(weekly_rows)
-            if weekly_rows:
-                weekly_asof = str(weekly_rows[0].get("weekly_asof_trade_date"))
+            weekly_indicator = self.repo.load_weekly_indicator(expected_weekly_asof) or {}
 
         benchmark_code = str(self.params.index_code or "sh.000001").strip() or "sh.000001"
         daily_env = self.repo.load_daily_market_env(
@@ -202,12 +201,9 @@ class OpenMonitorEnvService:
                 asof_trade_date=latest_trade_date, benchmark_code=benchmark_code
             )
 
-        weekly_indicator = (
-            self.repo.load_weekly_indicator(weekly_asof) if weekly_asof else {}
-        )
         weekly_scenario = {
             "weekly_asof_trade_date": weekly_indicator.get("weekly_asof_trade_date")
-            or weekly_asof,
+            or expected_weekly_asof,
             "weekly_scene_code": weekly_indicator.get("weekly_scene_code"),
             "weekly_phase": weekly_indicator.get("weekly_phase"),
             "weekly_structure_status": weekly_indicator.get("weekly_structure_status"),

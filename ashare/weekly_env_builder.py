@@ -457,8 +457,9 @@ class WeeklyEnvironmentBuilder:
         scenario.update(plan)
         scenario["weekly_asof_trade_date"] = plan.get("weekly_asof_trade_date")
         scenario["weekly_week_closed"] = plan.get("weekly_week_closed", False)
-        # feat: 周线按最新已收盘周口径输出 周中不再提示未收盘并保持正常cap
-        scenario["weekly_current_week_closed"] = bool(scenario.get("weekly_week_closed", False))
+        scenario["weekly_current_week_closed"] = bool(
+            plan.get("weekly_current_week_closed", False)
+        )
         scenario["weekly_gating_enabled"] = bool(plan.get("weekly_gating_enabled", False))
         scenario["weekly_risk_score"] = to_float(plan.get("weekly_risk_score"))
         scenario["weekly_risk_level"] = plan.get("weekly_risk_level") or "UNKNOWN"

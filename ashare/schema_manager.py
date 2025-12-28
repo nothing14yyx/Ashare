@@ -1597,6 +1597,8 @@ class SchemaManager:
             "atr14": "DOUBLE NULL",
             "dev_ma20_atr": "DOUBLE NULL",
             "cycle_phase": "VARCHAR(32) NULL",
+            "cycle_weekly_asof_trade_date": "DATE NULL",
+            "cycle_weekly_scene_code": "VARCHAR(64) NULL",
             "breadth_pct_above_ma20": "DOUBLE NULL",
             "breadth_pct_above_ma60": "DOUBLE NULL",
             "breadth_risk_off_ratio": "DOUBLE NULL",

@@ -1282,6 +1282,8 @@ class OpenMonitorRepository:
         parsed_dates = df_daily["__asof_trade_date"].dropna()
         if parsed_dates.empty:
             df_daily["cycle_phase"] = None
+            df_daily["cycle_weekly_asof_trade_date"] = None
+            df_daily["cycle_weekly_scene_code"] = None
             df_daily = df_daily.sort_values("__order")
             df_daily = df_daily.drop(columns=["__order", "__asof_trade_date"])
             return df_daily.to_dict(orient="records")
@@ -1319,6 +1321,9 @@ class OpenMonitorRepository:
             return df_daily.to_dict(orient="records")
 
         if df_weekly.empty:
+            df_daily["cycle_phase"] = None
+            df_daily["cycle_weekly_asof_trade_date"] = None
+            df_daily["cycle_weekly_scene_code"] = None
             df_daily = df_daily.sort_values("__order")
             df_daily = df_daily.drop(columns=["__order", "__asof_trade_date"])
             return df_daily.to_dict(orient="records")
@@ -1330,6 +1335,8 @@ class OpenMonitorRepository:
         df_weekly = df_weekly.dropna(subset=["weekly_asof_trade_date"])
         if df_weekly.empty:
             df_daily["cycle_phase"] = None
+            df_daily["cycle_weekly_asof_trade_date"] = None
+            df_daily["cycle_weekly_scene_code"] = None
             df_daily = df_daily.sort_values("__order")
             df_daily = df_daily.drop(columns=["__order", "__asof_trade_date"])
             return df_daily.to_dict(orient="records")
@@ -1347,16 +1354,26 @@ class OpenMonitorRepository:
             right_on="weekly_asof_trade_date",
             direction="backward",
         )
-        merged["cycle_phase"] = merged["weekly_scene_code"]
-        if "weekly_phase" in merged.columns:
-            merged["cycle_phase"] = merged["cycle_phase"].fillna(merged["weekly_phase"])
+        merged["cycle_weekly_asof_trade_date"] = (
+            merged["weekly_asof_trade_date"].dt.date
+        )
+        merged["cycle_weekly_scene_code"] = merged["weekly_scene_code"]
+        merged["cycle_phase"] = merged["weekly_phase"]
         merged["cycle_phase"] = merged["cycle_phase"].where(
             pd.notna(merged["cycle_phase"]), None
         )
+        merged["cycle_weekly_asof_trade_date"] = merged[
+            "cycle_weekly_asof_trade_date"
+        ].where(pd.notna(merged["cycle_weekly_asof_trade_date"]), None)
+        merged["cycle_weekly_scene_code"] = merged[
+            "cycle_weekly_scene_code"
+        ].where(pd.notna(merged["cycle_weekly_scene_code"]), None)
 
         if not df_daily_invalid.empty:
             df_daily_invalid = df_daily_invalid.copy()
             df_daily_invalid["cycle_phase"] = None
+            df_daily_invalid["cycle_weekly_asof_trade_date"] = None
+            df_daily_invalid["cycle_weekly_scene_code"] = None
             merged = pd.concat([merged, df_daily_invalid], ignore_index=True)
 
         merged = merged.sort_values("__order")

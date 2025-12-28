@@ -951,7 +951,7 @@ class WeeklyPlanSystem:
                 "weekly_plan_b_recover_if": plan_b_recover,
                 "weekly_asof_trade_date": asof_str,
                 "weekly_week_closed": bool(weekly_closed),
-                "weekly_current_week_closed": asof_week_closed,
+                "weekly_current_week_closed": current_week_closed,
             }
         )
         plan_payload = {k: v for k, v in plan.items() if k != "weekly_plan_json"}
