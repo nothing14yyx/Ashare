@@ -1080,55 +1080,6 @@ class OpenMonitorRepository:
 
         return df
 
-    def load_index_snapshot_by_hash(self, snapshot_hash: str | None) -> dict[str, Any]:
-        if not snapshot_hash:
-            return {}
-        table = self.params.env_index_snapshot_table
-        if not (table and self._table_exists(table)):
-            return {}
-        stmt = text(
-            f"""
-            SELECT *
-            FROM `{table}`
-            WHERE `snapshot_hash` = :h
-            ORDER BY `checked_at` DESC
-            LIMIT 1
-            """
-        )
-        try:
-            with self.engine.begin() as conn:
-                df = pd.read_sql_query(stmt, conn, params={"h": snapshot_hash})
-        except Exception as exc:  # noqa: BLE001
-            self.logger.debug("读取指数环境快照失败：%s", exc)
-            return {}
-        if df.empty:
-            return {}
-        raw = df.iloc[0].to_dict()
-        normalized = {
-            "env_index_snapshot_hash": raw.get("snapshot_hash"),
-            "env_index_code": raw.get("index_code"),
-            "env_index_asof_trade_date": raw.get("asof_trade_date"),
-            "env_index_live_trade_date": raw.get("live_trade_date"),
-            "env_index_asof_close": raw.get("asof_close"),
-            "env_index_asof_ma20": raw.get("asof_ma20"),
-            "env_index_asof_ma60": raw.get("asof_ma60"),
-            "env_index_asof_macd_hist": raw.get("asof_macd_hist"),
-            "env_index_asof_atr14": raw.get("asof_atr14"),
-            "env_index_live_open": raw.get("live_open"),
-            "env_index_live_high": raw.get("live_high"),
-            "env_index_live_low": raw.get("live_low"),
-            "env_index_live_latest": raw.get("live_latest"),
-            "env_index_live_pct_change": raw.get("live_pct_change"),
-            "env_index_live_volume": raw.get("live_volume"),
-            "env_index_live_amount": raw.get("live_amount"),
-            "env_index_dev_ma20_atr": raw.get("dev_ma20_atr"),
-            "env_index_gate_action": raw.get("gate_action"),
-            "env_index_gate_reason": raw.get("gate_reason"),
-            "env_index_position_cap": raw.get("position_cap"),
-            "checked_at": raw.get("checked_at"),
-        }
-        return normalized
-
     def get_latest_weekly_indicator_date(self) -> dt.date | None:
         table = self.params.weekly_indicator_table
         if not (table and self._table_exists(table)):
@@ -1463,6 +1414,29 @@ class OpenMonitorRepository:
                 index_snapshot = raw_index_snapshot
         env_index_hash = index_snapshot.get("env_index_snapshot_hash")
         payload["env_index_snapshot_hash"] = env_index_hash
+        index_fields = [
+            "env_index_code",
+            "env_index_asof_trade_date",
+            "env_index_live_trade_date",
+            "env_index_asof_close",
+            "env_index_asof_ma20",
+            "env_index_asof_ma60",
+            "env_index_asof_macd_hist",
+            "env_index_asof_atr14",
+            "env_index_live_open",
+            "env_index_live_high",
+            "env_index_live_low",
+            "env_index_live_latest",
+            "env_index_live_pct_change",
+            "env_index_live_volume",
+            "env_index_live_amount",
+            "env_index_dev_ma20_atr",
+            "env_index_gate_action",
+            "env_index_gate_reason",
+            "env_index_position_cap",
+        ]
+        for field in index_fields:
+            payload[field] = _normalize_snapshot_value(index_snapshot.get(field))
         payload["env_final_gate_action"] = env_context.get("env_final_gate_action")
         if payload["env_final_gate_action"] is None:
             self.logger.error(
@@ -1510,70 +1484,6 @@ class OpenMonitorRepository:
             )
         except Exception as exc:  # noqa: BLE001
             self.logger.warning("写入环境快照失败：%s", exc)
-
-    def persist_index_snapshot(
-        self,
-        snapshot: dict[str, Any],
-        *,
-        table: str,
-    ) -> str | None:
-        if not snapshot or not table:
-            return None
-
-        if not self._table_exists(table):
-            self.logger.error("指数环境快照表 %s 不存在，已跳过写入。", table)
-            return None
-
-        for date_col in ["monitor_date", "asof_trade_date", "live_trade_date"]:
-            if date_col in snapshot:
-                parsed = pd.to_datetime(snapshot.get(date_col), errors="coerce")
-                snapshot[date_col] = parsed.date() if not pd.isna(parsed) else snapshot.get(date_col)
-
-
-        # 兜底：run_id 统一为非空字符串（否则无法和 run 表 join）
-        if "run_id" in snapshot:
-            rid = str(snapshot.get("run_id") or "").strip()
-            snapshot["run_id"] = rid or None
-
-        # 指数快照写入时，也顺手确保 run 记录存在（便于后续联表调试）
-        if snapshot.get("monitor_date") and snapshot.get("run_id"):
-            try:
-                self.ensure_run_context(
-                    monitor_date=snapshot.get("monitor_date"),
-                    run_id=str(snapshot.get("run_id")),
-                    checked_at=snapshot.get("checked_at"),
-                    params_json=json.dumps({"phase":"ENV_INDEX_SNAPSHOT"}, ensure_ascii=False, separators=(",", ":")),
-                )
-            except Exception as exc:  # noqa: BLE001
-                self.logger.debug("确保 run 记录存在时失败（可忽略）：%s", exc)
-
-        columns = list(snapshot.keys())
-        if "snapshot_hash" not in columns:
-            return None
-
-        col_clause = ", ".join(f"`{c}`" for c in columns)
-        value_clause = ", ".join(f":{c}" for c in columns)
-        stmt = text(
-            f"""
-            INSERT INTO `{table}` ({col_clause})
-            VALUES ({value_clause})
-            ON DUPLICATE KEY UPDATE `snapshot_hash` = `snapshot_hash`
-            """
-        )
-
-        try:
-            with self.engine.begin() as conn:
-                conn.execute(stmt, snapshot)
-            self.logger.info(
-                "指数环境快照已写入表 %s（hash=%s）。",
-                table,
-                snapshot.get("snapshot_hash"),
-            )
-        except Exception as exc:  # noqa: BLE001
-            self.logger.warning("写入指数环境快照失败：%s", exc)
-            return None
-
-        return str(snapshot.get("snapshot_hash") or "")
 
     def _delete_existing_run_rows(
         self, table: str, monitor_date: str, run_id: str, codes: List[str]

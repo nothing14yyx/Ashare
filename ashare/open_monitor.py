@@ -50,7 +50,6 @@ from .schema_manager import (
     TABLE_STRATEGY_OPEN_MONITOR_EVAL,
     TABLE_STRATEGY_OPEN_MONITOR_QUOTE,
     TABLE_STRATEGY_OPEN_MONITOR_RUN,
-    TABLE_STRATEGY_REALTIME_MARKET_SNAPSHOT,
     TABLE_STRATEGY_WEEKLY_MARKET_ENV,
     WEEKLY_MARKET_BENCHMARK_CODE,
     VIEW_STRATEGY_OPEN_MONITOR,
@@ -119,8 +118,6 @@ class OpenMonitorParams:
     # 环境快照表：存储周线计划等“批次级别”信息，避免在每条标的记录里重复。
     env_snapshot_table: str = TABLE_STRATEGY_OPEN_MOTOR_ENV
 
-    # 指数环境快照表：按哈希去重存储单份指数环境，避免在事实表重复写入。
-    env_index_snapshot_table: str = TABLE_STRATEGY_REALTIME_MARKET_SNAPSHOT
     weekly_indicator_table: str = TABLE_STRATEGY_WEEKLY_MARKET_ENV
     daily_indicator_table: str = TABLE_STRATEGY_DAILY_MARKET_ENV
     weekly_benchmark_code: str = WEEKLY_MARKET_BENCHMARK_CODE
@@ -227,10 +224,6 @@ class OpenMonitorParams:
                 sec.get("env_snapshot_table", cls.env_snapshot_table)
             ).strip()
                                or cls.env_snapshot_table,
-            env_index_snapshot_table=str(
-                sec.get("env_index_snapshot_table", cls.env_index_snapshot_table)
-            ).strip()
-                                     or cls.env_index_snapshot_table,
             weekly_indicator_table=cls.weekly_indicator_table,
             daily_indicator_table=str(
                 sec.get("daily_indicator_table", cls.daily_indicator_table)
