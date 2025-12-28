@@ -87,18 +87,9 @@ class MarketEnvironment:
         if weekly_scene is None:
             weekly_scene = snapshot.get("weekly_scene")
 
-        if "index_score" not in snapshot:
-            raise KeyError("缺少 index_score")
-        if "regime" not in snapshot:
-            raise KeyError("缺少 regime")
-        if "position_hint" not in snapshot:
-            raise KeyError("缺少 position_hint")
-
         score_val = snapshot.get("index_score")
         regime = snapshot.get("regime")
         position_hint = snapshot.get("position_hint")
-        if score_val is None or regime is None or position_hint is None:
-            raise ValueError("环境快照字段缺失（index_score/regime/position_hint）")
 
         return cls(
             gate_action=gate_action,

@@ -23,7 +23,7 @@ import json
 import logging
 import math
 from dataclasses import dataclass, replace
-from typing import Any, List
+from typing import Any, Callable, List
 
 import pandas as pd
 
@@ -34,12 +34,10 @@ from .monitor_rules import MonitorRuleConfig, build_default_monitor_rules
 from .open_monitor_env import OpenMonitorEnvService
 from .open_monitor_eval import (
     OpenMonitorEvaluator,
-    RunupMetrics,
-    compute_runup_metrics,
-    evaluate_runup_breach,
     merge_gate_actions,
 )
 from .open_monitor_market_data import OpenMonitorMarketData
+from .open_monitor_consts import ENV_RUN_PREOPEN
 from .open_monitor_repo import OpenMonitorRepository, calc_run_id
 from .open_monitor_rules import Rule, RuleEngine, RuleResult
 from .market_indicator_builder import MarketIndicatorBuilder
@@ -311,13 +309,15 @@ class MA5MA20OpenMonitorRunner:
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
     def build_and_persist_env_snapshot(
-            self,
-            latest_trade_date: str,
-            *,
-            monitor_date: str | None = None,
-            run_id: str | None = None,
-            run_pk: int | None = None,
-            checked_at: dt.datetime | None = None,
+        self,
+        latest_trade_date: str,
+        *,
+        monitor_date: str | None = None,
+        run_id: str | None = None,
+        run_pk: int | None = None,
+        checked_at: dt.datetime | None = None,
+        allow_auto_compute: bool = False,
+        fetch_index_live_quote: Callable[[], dict[str, Any]] | None = None,
     ) -> dict[str, Any] | None:
         return self.env_service.build_and_persist_env_snapshot(
             latest_trade_date,
@@ -325,7 +325,12 @@ class MA5MA20OpenMonitorRunner:
             run_id=run_id,
             run_pk=run_pk,
             checked_at=checked_at,
-            fetch_index_live_quote=self.market_data.fetch_index_live_quote,
+            allow_auto_compute=allow_auto_compute,
+            fetch_index_live_quote=(
+                self.market_data.fetch_index_live_quote
+                if fetch_index_live_quote is None
+                else fetch_index_live_quote
+            ),
         )
 
     def load_env_snapshot_context(
@@ -377,36 +382,20 @@ class MA5MA20OpenMonitorRunner:
         codes = signals["code"].dropna().astype(str).unique().tolist()
         self.logger.info("待监测标的数量：%s（信号日：%s）", len(codes), signal_dates)
 
-        if run_pk and not self.repo.env_snapshot_exists(monitor_date, run_pk):
-            try:
-                self.build_and_persist_env_snapshot(
-                    latest_trade_date,
-                    monitor_date=monitor_date,
-                    run_id=run_id,
-                    run_pk=run_pk,
-                    checked_at=checked_at,
-                )
-                self.logger.info(
-                    "已自动补齐环境快照（monitor_date=%s, run_id=%s, latest_trade_date=%s）。",
-                    monitor_date,
-                    run_id,
-                    latest_trade_date,
-                )
-            except Exception as exc:  # noqa: BLE001
-                self.logger.exception(
-                    "自动补齐环境快照失败（monitor_date=%s, run_id=%s）：%s",
-                    monitor_date,
-                    run_id,
-                    exc,
-                )
-                return
-
-        env_context = self.load_env_snapshot_context(monitor_date, run_pk)
+        env_run_pk = self.repo.get_env_broadcast_run_pk(monitor_date, ENV_RUN_PREOPEN)
+        if env_run_pk is None:
+            self.logger.error(
+                "未找到环境广播 run_pk（monitor_date=%s, run_id=%s），本次开盘监测终止。",
+                monitor_date,
+                ENV_RUN_PREOPEN,
+            )
+            return
+        env_context = self.env_service.load_env_snapshot_context(monitor_date, env_run_pk)
         if not env_context:
             self.logger.error(
-                "未找到环境快照（monitor_date=%s, run_id=%s），本次开盘监测终止。",
+                "未找到环境广播快照（monitor_date=%s, run_id=%s），本次开盘监测终止。",
                 monitor_date,
-                run_id,
+                ENV_RUN_PREOPEN,
             )
             return
 
@@ -416,59 +405,53 @@ class MA5MA20OpenMonitorRunner:
         else:
             self.logger.info("实时行情已获取：%s 条", len(quotes))
 
-        latest_snapshots = self.repo.load_latest_snapshots(latest_trade_date, codes)
-        asof_trade_date_map: dict[str, str] = {}
-        if not latest_snapshots.empty and "trade_date" in latest_snapshots.columns:
-            snap_codes = latest_snapshots["code"].astype(str)
-            snap_dates = latest_snapshots["trade_date"].astype(str)
-            asof_trade_date_map = dict(zip(snap_codes, snap_dates))
-
-        avg_volume_map = self.repo.load_avg_volume(
-            latest_trade_date,
-            codes,
-            asof_trade_date_map=asof_trade_date_map,
-        )
-        previous_strength_map = self.repo.load_previous_strength(codes, as_of=checked_at)
-
-        env_final_gate_action = (
-            env_context.get("env_final_gate_action") if isinstance(env_context, dict) else None
-        )
+        env_instruction = {
+            "gate_status": env_context.get("env_final_gate_action"),
+            "position_cap": env_context.get("env_final_cap_pct"),
+            "reason": env_context.get("env_final_reason_json"),
+        }
+        env_payload = {
+            "env_final_gate_action": env_instruction.get("gate_status"),
+            "env_final_cap_pct": env_instruction.get("position_cap"),
+            "env_final_reason_json": env_instruction.get("reason"),
+            "env_weekly_gate_action": env_context.get("weekly_gate_action")
+            or env_context.get("weekly_gate_policy"),
+            "weekly_risk_level": env_context.get("weekly_risk_level"),
+            "weekly_scene_code": env_context.get("weekly_scene_code"),
+            "index_score": env_context.get("index_score"),
+            "regime": env_context.get("regime"),
+            "position_hint": env_context.get("position_hint"),
+        }
+        env_final_gate_action = env_instruction.get("gate_status")
         self.logger.info(
-            "已加载环境快照（monitor_date=%s, run_id=%s, gate=%s）。",
+            "已加载环境广播（monitor_date=%s, run_id=%s, gate=%s）。",
             monitor_date,
-            run_id,
+            ENV_RUN_PREOPEN,
             env_final_gate_action,
         )
-        self.env_service.log_weekly_scenario(env_context)
+        try:
+            self.env_service.attach_index_snapshot(
+                latest_trade_date,
+                monitor_date,
+                run_id,
+                checked_at,
+                env_context,
+                fetch_index_live_quote=self.market_data.fetch_index_live_quote,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.logger.debug("记录指数快照失败（将继续评估）：%s", exc)
         result = self.evaluator.evaluate(
             signals,
             quotes,
-            latest_snapshots,
-            latest_trade_date,
-            env_context,
+            env_payload,
             checked_at=checked_at,
             run_id=run_id,
             ready_signals_used=self.repo.ready_signals_used,
-            avg_volume_map=avg_volume_map,
-            previous_strength_map=previous_strength_map,
         )
 
         if result.empty:
             return
-        rank_env_context = env_context
-        if isinstance(env_context, dict) and "boards" not in env_context:
-            try:
-                board_strength = self.env_builder.load_board_spot_strength_from_db(
-                    latest_trade_date, checked_at=checked_at
-                )
-                board_map = self.evaluator.build_board_map_from_strength(board_strength)
-                if board_map:
-                    rank_env_context = dict(env_context)
-                    rank_env_context["boards"] = board_map
-            except Exception as exc:  # noqa: BLE001
-                self.logger.debug("读取板块强弱用于展示排序失败：%s", exc)
-
-        ranked_df, rank_meta = self.evaluator.build_rank_frame(result, rank_env_context)
+        ranked_df, rank_meta = self.evaluator.build_rank_frame(result, env_payload)
         if rank_meta:
             self.logger.info(
                 "展示排序权重(不影响 gate/action/入库)：market_weight=%.2f（%s） board_weight=%s stock_quality=%s",

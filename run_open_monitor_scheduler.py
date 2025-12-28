@@ -9,6 +9,7 @@ import time
 from ashare.config import get_section
 from ashare.open_monitor import MA5MA20OpenMonitorRunner
 from ashare.env_snapshot_utils import load_trading_calendar
+from ashare.open_monitor_consts import ENV_RUN_PREOPEN
 from ashare.schema_manager import ensure_schema
 
 
@@ -95,14 +96,6 @@ def _next_trading_start(ts: dt.datetime, runner: MA5MA20OpenMonitorRunner) -> dt
     return dt.datetime.combine(nxt, TRADING_WINDOWS[0][0])
 
 
-def _env_snapshot_exists(
-    runner: MA5MA20OpenMonitorRunner, *, monitor_date: str, run_pk: int
-) -> bool:
-    """判断指定批次的环境快照是否已存在（委托给 Repository）。"""
-
-    return runner.repo.env_snapshot_exists(monitor_date, run_pk)
-
-
 def main(*, interval_minutes: int | None = None, once: bool = False) -> None:
     ensure_schema()
     runner = MA5MA20OpenMonitorRunner()
@@ -111,127 +104,16 @@ def main(*, interval_minutes: int | None = None, once: bool = False) -> None:
     if interval_min <= 0:
         raise ValueError("interval must be positive")
 
-    ensured_key: tuple[str, int] | None = None
-    ensured_ready: bool = False
-
-    def _load_latest_trade_date() -> str | None:
-        """尽量解析最新交易日，用于自动补齐环境快照。
-
-        约束：
-        - 不再回退读取 open_monitor.indicator_table（该字段仅为旧配置兼容，不应再作为调度入口依赖）；
-        - 优先 daily_table.date；若无日线表，则回退 ready_signals_view.sig_date。
-        """
-        try:
-            view = str(getattr(runner.params, "ready_signals_view", "") or "").strip() or None
-            return runner.repo._resolve_latest_trade_date(ready_view=view)  # noqa: SLF001
-        except Exception:  # noqa: BLE001
-            return None
-
     def _ensure_env_snapshot(trigger_at: dt.datetime) -> tuple[str, str]:
-        nonlocal ensured_key, ensured_ready
-
         monitor_date = runner.repo.resolve_monitor_trade_date(trigger_at)
         biz_ts = dt.datetime.combine(dt.date.fromisoformat(monitor_date), trigger_at.time())
         run_id = runner._calc_run_id(biz_ts)  # noqa: SLF001
-        run_pk = runner.repo.ensure_run_context(
-            monitor_date,
-            run_id,
-            checked_at=trigger_at,
-            triggered_at=trigger_at,
-            params_json=runner._build_run_params_json(),  # noqa: SLF001
-        )
-        if run_pk is None:
-            logger.warning("run_pk 获取失败，跳过环境快照写入。")
-            return monitor_date, run_id
-        key = (monitor_date, run_pk)
-
-        if ensured_key == key and ensured_ready:
-            return monitor_date, run_id
-
-        if _env_snapshot_exists(runner, monitor_date=monitor_date, run_pk=run_pk):
-            ensured_key = key
-            ensured_ready = True
-            return monitor_date, run_id
-
-        latest_trade_date = _load_latest_trade_date()
-        if not latest_trade_date:
+        env_run_pk = runner.repo.get_env_broadcast_run_pk(monitor_date, ENV_RUN_PREOPEN)
+        if env_run_pk is None or not runner.repo.env_snapshot_exists(monitor_date, env_run_pk):
             logger.warning(
-                "无法解析 latest_trade_date，跳过自动补齐环境快照（monitor_date=%s, run_id=%s）。",
+                "环境广播不存在（monitor_date=%s, env_run_id=%s），open_monitor 将直接失败。",
                 monitor_date,
-                run_id,
-            )
-            ensured_key = key
-            ensured_ready = False
-            return monitor_date, run_id
-
-        def _try_build_env(ts: dt.datetime, rid: str) -> bool:
-            try:
-                candidate_run_pk = runner.repo.ensure_run_context(
-                    monitor_date,
-                    rid,
-                    checked_at=ts,
-                    triggered_at=ts,
-                    params_json=runner._build_run_params_json(),  # noqa: SLF001
-                )
-                if candidate_run_pk is None:
-                    return False
-                runner.build_and_persist_env_snapshot(
-                    latest_trade_date,
-                    monitor_date=monitor_date,
-                    run_id=rid,
-                    run_pk=candidate_run_pk,
-                    checked_at=ts,
-                )
-                logger.info(
-                    "已自动补齐环境快照（monitor_date=%s, run_id=%s, latest_trade_date=%s）。",
-                    monitor_date,
-                    rid,
-                    latest_trade_date,
-                )
-                return True
-            except Exception as exc:  # noqa: BLE001
-                logger.exception(
-                    "自动补齐环境快照失败（monitor_date=%s, run_id=%s）：%s",
-                    monitor_date,
-                    rid,
-                    exc,
-                )
-                return False
-
-        candidate_times = [
-            biz_ts,
-            biz_ts - dt.timedelta(seconds=60),
-            biz_ts + dt.timedelta(seconds=60),
-        ]
-        seen_run_ids: set[str] = set()
-        for ts in candidate_times:
-            rid = runner._calc_run_id(ts)  # noqa: SLF001
-            if not rid or rid in seen_run_ids:
-                continue
-            seen_run_ids.add(rid)
-            candidate_run_pk = runner.repo.ensure_run_context(
-                monitor_date,
-                rid,
-                checked_at=trigger_at,
-                triggered_at=trigger_at,
-                params_json=runner._build_run_params_json(),  # noqa: SLF001
-            )
-            if candidate_run_pk and _env_snapshot_exists(
-                runner, monitor_date=monitor_date, run_pk=candidate_run_pk
-            ):
-                break
-            if _try_build_env(trigger_at, rid):
-                break
-
-        ensured_key = key
-        ensured_ready = _env_snapshot_exists(
-            runner, monitor_date=monitor_date, run_pk=run_pk
-        )
-        if not ensured_ready:
-            logger.warning(
-                "环境快照仍不存在（monitor_date=%s, run_id=%s），open_monitor 可能会终止；建议检查 env_snapshot 写入或相关表/配置。",
-                monitor_date,
-                run_id,
+                ENV_RUN_PREOPEN,
             )
         return monitor_date, run_id
 

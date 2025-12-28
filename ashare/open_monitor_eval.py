@@ -146,12 +146,7 @@ class OpenMonitorEvaluator:
         self,
         signals: pd.DataFrame,
         quotes: pd.DataFrame,
-        latest_snapshots: pd.DataFrame,
-        latest_trade_date: str,
-        checked_at_ts: dt.datetime,
-        *,
-        avg_volume_map: dict[str, float] | None = None,
-    ) -> tuple[pd.DataFrame, dict[str, float] | None]:
+    ) -> pd.DataFrame:
         strict_quotes = bool(getattr(self.params, "strict_quotes", True))
         if quotes is None or getattr(quotes, "empty", True):
             q = pd.DataFrame(
@@ -199,20 +194,6 @@ class OpenMonitorEvaluator:
         merged["code"] = merged["code"].astype(str)
         merged = merged.merge(q, on="code", how="left", suffixes=("", "_q"))
 
-        if not latest_snapshots.empty:
-            snap = latest_snapshots.copy()
-            snap["_has_latest_snapshot"] = True
-            rename_map = {
-                c: f"asof_{c}" for c in snap.columns if c not in {"code", "_has_latest_snapshot"}
-            }
-            snap = snap.rename(columns=rename_map)
-            merged = merged.merge(snap, on="code", how="left")
-
-        if "_has_latest_snapshot" not in merged.columns:
-            merged["_has_latest_snapshot"] = False
-        else:
-            merged["_has_latest_snapshot"] = merged["_has_latest_snapshot"].eq(True)
-
         for col in [
             "asof_trade_date",
             "asof_close",
@@ -227,8 +208,12 @@ class OpenMonitorEvaluator:
         ]:
             if col not in merged.columns:
                 merged[col] = None
-
-        merged["avg_volume_20"] = merged["code"].map(avg_volume_map) if avg_volume_map else None
+        if "avg_volume_20" not in merged.columns:
+            merged["avg_volume_20"] = None
+        if "sig_date" in merged.columns:
+            merged["asof_trade_date"] = merged["asof_trade_date"].where(
+                pd.notna(merged["asof_trade_date"]), merged["sig_date"]
+            )
 
         float_cols = [
             "sig_close",
@@ -255,46 +240,36 @@ class OpenMonitorEvaluator:
             if col in merged.columns:
                 merged[col] = merged.get(col).apply(_to_float)
 
-        def _infer_volume_scale_factor(df: pd.DataFrame) -> float:
-            if "live_volume" not in df.columns or "avg_volume_20" not in df.columns:
-                return 1.0
+        def _coalesce_numeric(target: str, fallback: str) -> None:
+            if target not in merged.columns:
+                merged[target] = None
+            if fallback not in merged.columns:
+                return
+            left = pd.to_numeric(merged[target], errors="coerce")
+            right = pd.to_numeric(merged[fallback], errors="coerce")
+            merged[target] = left.fillna(right)
 
-            sample = df[["live_volume", "avg_volume_20"]].dropna()
-            sample = sample[(sample["live_volume"] > 0) & (sample["avg_volume_20"] > 0)]
-            if sample.empty:
-                return 1.0
+        _coalesce_numeric("asof_close", "sig_close")
+        _coalesce_numeric("asof_ma5", "sig_ma5")
+        _coalesce_numeric("asof_ma20", "sig_ma20")
+        _coalesce_numeric("asof_ma60", "sig_ma60")
+        _coalesce_numeric("asof_ma250", "sig_ma250")
+        _coalesce_numeric("asof_vol_ratio", "sig_vol_ratio")
+        _coalesce_numeric("asof_macd_hist", "sig_macd_hist")
+        _coalesce_numeric("asof_atr14", "sig_atr14")
+        _coalesce_numeric("asof_stop_ref", "sig_stop_ref")
 
-            ratio = (sample["live_volume"] / sample["avg_volume_20"]).median()
-            ratio_mul = ((sample["live_volume"] * 100.0) / sample["avg_volume_20"]).median()
-            ratio_div = ((sample["live_volume"] / 100.0) / sample["avg_volume_20"]).median()
-
-            if ratio < 0.02 <= ratio_mul <= 200:
-                return 100.0
-            if ratio > 200 >= ratio_div >= 0.02:
-                return 0.01
-            return 1.0
-
-        live_vol_scale = _infer_volume_scale_factor(merged)
-        if live_vol_scale != 1.0 and "live_volume" in merged.columns:
-            merged["live_volume"] = merged["live_volume"].apply(
-                lambda x: None if x is None else x * live_vol_scale
-            )
-
-        return merged, avg_volume_map
+        return merged
 
     def evaluate(
         self,
         signals: pd.DataFrame,
         quotes: pd.DataFrame,
-        latest_snapshots: pd.DataFrame,
-        latest_trade_date: str,
-        env_context: dict[str, Any] | None = None,
+        env_instruction: dict[str, Any] | None = None,
         *,
         checked_at: dt.datetime | None = None,
         run_id: str | None = None,
         ready_signals_used: bool = False,
-        avg_volume_map: dict[str, float] | None = None,
-        previous_strength_map: dict[str, float] | None = None,
     ) -> pd.DataFrame:
         if signals.empty:
             return pd.DataFrame()
@@ -311,7 +286,7 @@ class OpenMonitorEvaluator:
             )
             return pd.DataFrame()
 
-        env = self._parse_market_environment(env_context)
+        env = self._parse_market_environment(env_instruction)
 
         if env.gate_action is None:
             self.logger.error(
@@ -328,14 +303,7 @@ class OpenMonitorEvaluator:
             )
             return pd.DataFrame()
 
-        merged, avg_volume_map = self.prepare_monitor_frame(
-            signals,
-            quotes,
-            latest_snapshots,
-            latest_trade_date,
-            checked_at_ts,
-            avg_volume_map=avg_volume_map,
-        )
+        merged = self.prepare_monitor_frame(signals, quotes)
 
         def _resolve_ref_close(row: pd.Series) -> float | None:
             for key in ("prev_close", "sig_close"):
@@ -385,7 +353,6 @@ class OpenMonitorEvaluator:
         runup_atr_tol = self.rule_config.runup_atr_tol
         cross_valid_days = self.params.cross_valid_days
         pullback_valid_days = self.params.pullback_valid_days
-        previous_strength_map = previous_strength_map or {}
 
         for _, row in merged.iterrows():
             sig_reason_text = str(row.get("sig_reason") or row.get("reason") or "")
@@ -418,15 +385,10 @@ class OpenMonitorEvaluator:
             live_gap_list.append(live_gap)
             live_pct_change_list.append(live_pct)
 
-            avg_vol_20 = avg_volume_map.get(str(row.get("code"))) if avg_volume_map else None
+            avg_vol_20 = _to_float(row.get("avg_volume_20"))
             live_vol = _to_float(row.get("live_volume"))
             live_intraday = None
-            if (
-                avg_vol_20 is not None
-                and avg_vol_20 > 0
-                and live_vol is not None
-                and live_vol > 0
-            ):
+            if avg_vol_20 is not None and avg_vol_20 > 0 and live_vol is not None:
                 live_intraday = live_vol / avg_vol_20
             live_intraday_vol_list.append(live_intraday)
 
@@ -574,20 +536,8 @@ class OpenMonitorEvaluator:
                 state=state,
                 status_reason=status_reason,
             )
-            previous_strength = _to_float(previous_strength_map.get(str(row.get("code"))))
-            strength_delta = (
-                strength - previous_strength
-                if strength is not None and previous_strength is not None
-                else None
-            )
+            strength_delta = None
             strength_trend = None
-            if strength_delta is not None:
-                if strength_delta > 0.5:
-                    strength_trend = "UP"
-                elif strength_delta < -0.5:
-                    strength_trend = "DOWN"
-                else:
-                    strength_trend = "FLAT"
 
             states.append(state)
             status_reasons.append(status_reason)

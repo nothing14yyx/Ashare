@@ -5,17 +5,17 @@ from __future__ import annotations
 import datetime as dt
 
 from ashare.open_monitor import MA5MA20OpenMonitorRunner
+from ashare.open_monitor_consts import ENV_RUN_PREOPEN
 from ashare.schema_manager import ensure_schema
 
 
-def main() -> None:
+def main() -> int | None:
     ensure_schema()
     runner = MA5MA20OpenMonitorRunner()
 
     checked_at = dt.datetime.now()
     monitor_date = runner.repo.resolve_monitor_trade_date(checked_at)
-    biz_ts = dt.datetime.combine(dt.date.fromisoformat(monitor_date), checked_at.time())
-    run_id = runner._calc_run_id(biz_ts)  # noqa: SLF001
+    run_id = ENV_RUN_PREOPEN
     view = str(getattr(runner.params, "ready_signals_view", "") or "").strip() or None
     latest_trade_date = runner.repo._resolve_latest_trade_date(  # noqa: SLF001
         ready_view=view
@@ -29,7 +29,7 @@ def main() -> None:
     )
     if run_pk is None:
         print("run_pk 获取失败，已跳过环境快照写入。")
-        return
+        return None
 
     runner.build_and_persist_env_snapshot(
         latest_trade_date=latest_trade_date,
@@ -37,7 +37,10 @@ def main() -> None:
         run_id=run_id,
         run_pk=run_pk,
         checked_at=checked_at,
+        allow_auto_compute=False,
+        fetch_index_live_quote=None,
     )
+    return run_pk
 
 
 if __name__ == "__main__":

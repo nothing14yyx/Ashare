@@ -17,6 +17,8 @@ from .config import get_section
 from .db import DatabaseConfig, MySQLWriter
 from .env_snapshot_utils import load_trading_calendar
 from .ma5_ma20_trend_strategy import _atr, _macd
+from .open_monitor_consts import ENV_RUN_IDS, ENV_RUN_PREOPEN
+from .schema_manager import TABLE_STRATEGY_ENV_INDEX_SNAPSHOT
 from .utils.convert import to_float as _to_float
 
 
@@ -86,16 +88,28 @@ def calc_run_id(ts: dt.datetime, run_id_minutes: int | None) -> str:
 
     t = ts.time()
     if t < auction_start:
-        return "PREOPEN"
+        run_id = "PREOPEN"
+        if run_id in ENV_RUN_IDS:
+            return f"TRADE_{run_id}"
+        return run_id
     if lunch_break_start <= t < lunch_break_end:
-        return "BREAK"
+        run_id = "BREAK"
+        if run_id in ENV_RUN_IDS:
+            return f"TRADE_{run_id}"
+        return run_id
     if t >= market_close:
-        return "POSTCLOSE"
+        run_id = "POSTCLOSE"
+        if run_id in ENV_RUN_IDS:
+            return f"TRADE_{run_id}"
+        return run_id
 
     minute_of_day = ts.hour * 60 + ts.minute
     slot_minute = (minute_of_day // window_minutes) * window_minutes
     slot_time = dt.datetime.combine(ts.date(), dt.time(slot_minute // 60, slot_minute % 60))
-    return slot_time.strftime("%Y-%m-%d %H:%M")
+    run_id = slot_time.strftime("%Y-%m-%d %H:%M")
+    if run_id in ENV_RUN_IDS:
+        return f"TRADE_{run_id}"
+    return run_id
 
 
 class OpenMonitorRepository:
@@ -1080,6 +1094,79 @@ class OpenMonitorRepository:
 
         return df
 
+    def load_index_snapshot(self, snapshot_hash: str | None) -> dict[str, Any]:
+        table = TABLE_STRATEGY_ENV_INDEX_SNAPSHOT
+        if not snapshot_hash or not self._table_exists(table):
+            return {}
+
+        stmt = text(
+            f"""
+            SELECT *
+            FROM `{table}`
+            WHERE `snapshot_hash` = :h
+            LIMIT 1
+            """
+        )
+        try:
+            with self.engine.begin() as conn:
+                row = conn.execute(stmt, {"h": snapshot_hash}).mappings().first()
+        except Exception as exc:  # noqa: BLE001
+            self.logger.debug("读取指数快照失败：%s", exc)
+            return {}
+        return dict(row or {})
+
+    def persist_index_snapshot(self, payload: dict[str, Any]) -> None:
+        if not payload:
+            return
+
+        table = TABLE_STRATEGY_ENV_INDEX_SNAPSHOT
+        if not self._table_exists(table):
+            self.logger.debug("指数快照表 %s 不存在，已跳过写入。", table)
+            return
+
+        columns = list(payload.keys())
+        update_cols = [c for c in columns if c != "snapshot_hash"]
+        col_clause = ", ".join(f"`{c}`" for c in columns)
+        value_clause = ", ".join(f":{c}" for c in columns)
+        update_clause = ", ".join(f"`{c}` = VALUES(`{c}`)" for c in update_cols)
+        stmt = text(
+            f"""
+            INSERT INTO `{table}` ({col_clause})
+            VALUES ({value_clause})
+            ON DUPLICATE KEY UPDATE {update_clause}
+            """
+        )
+        try:
+            with self.engine.begin() as conn:
+                conn.execute(stmt, payload)
+        except Exception as exc:  # noqa: BLE001
+            self.logger.debug("写入指数快照失败：%s", exc)
+
+    def get_env_broadcast_run_pk(
+        self, monitor_date: str, env_run_id: str = ENV_RUN_PREOPEN
+    ) -> int | None:
+        table = self.params.run_table
+        if not (table and monitor_date and env_run_id and self._table_exists(table)):
+            return None
+
+        stmt = text(
+            f"""
+            SELECT `run_pk`
+            FROM `{table}`
+            WHERE `monitor_date` = :d AND `run_id` = :r
+            ORDER BY `checked_at` DESC, `run_pk` DESC
+            LIMIT 1
+            """
+        )
+        try:
+            with self.engine.begin() as conn:
+                row = conn.execute(stmt, {"d": monitor_date, "r": env_run_id}).fetchone()
+            if row:
+                return int(row[0])
+        except Exception as exc:  # noqa: BLE001
+            self.logger.debug("读取环境广播 run_pk 失败：%s", exc)
+        return None
+
     def get_latest_weekly_indicator_date(self) -> dt.date | None:
         table = self.params.weekly_indicator_table
         if not (table and self._table_exists(table)):
@@ -1431,29 +1518,7 @@ class OpenMonitorRepository:
                 index_snapshot = raw_index_snapshot
         env_index_hash = index_snapshot.get("env_index_snapshot_hash")
         payload["env_index_snapshot_hash"] = env_index_hash
-        index_fields = [
-            "env_index_code",
-            "env_index_asof_trade_date",
-            "env_index_live_trade_date",
-            "env_index_asof_close",
-            "env_index_asof_ma20",
-            "env_index_asof_ma60",
-            "env_index_asof_macd_hist",
-            "env_index_asof_atr14",
-            "env_index_live_open",
-            "env_index_live_high",
-            "env_index_live_low",
-            "env_index_live_latest",
-            "env_index_live_pct_change",
-            "env_index_live_volume",
-            "env_index_live_amount",
-            "env_index_dev_ma20_atr",
-            "env_index_gate_action",
-            "env_index_gate_reason",
-            "env_index_position_cap",
-        ]
-        for field in index_fields:
-            payload[field] = _normalize_snapshot_value(index_snapshot.get(field))
+        index_fields: list[str] = []
         payload["env_final_gate_action"] = env_context.get("env_final_gate_action")
         if payload["env_final_gate_action"] is None:
             self.logger.error(

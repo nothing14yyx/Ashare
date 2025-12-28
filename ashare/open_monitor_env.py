@@ -96,27 +96,28 @@ class OpenMonitorEnvService:
         }
 
         index_snapshot_hash = row.get("env_index_snapshot_hash")
+        index_snapshot_row = self.repo.load_index_snapshot(str(index_snapshot_hash))
         index_snapshot = {
             "env_index_snapshot_hash": index_snapshot_hash,
-            "env_index_code": row.get("env_index_code"),
-            "env_index_asof_trade_date": row.get("env_index_asof_trade_date"),
-            "env_index_live_trade_date": row.get("env_index_live_trade_date"),
-            "env_index_asof_close": row.get("env_index_asof_close"),
-            "env_index_asof_ma20": row.get("env_index_asof_ma20"),
-            "env_index_asof_ma60": row.get("env_index_asof_ma60"),
-            "env_index_asof_macd_hist": row.get("env_index_asof_macd_hist"),
-            "env_index_asof_atr14": row.get("env_index_asof_atr14"),
-            "env_index_live_open": row.get("env_index_live_open"),
-            "env_index_live_high": row.get("env_index_live_high"),
-            "env_index_live_low": row.get("env_index_live_low"),
-            "env_index_live_latest": row.get("env_index_live_latest"),
-            "env_index_live_pct_change": row.get("env_index_live_pct_change"),
-            "env_index_live_volume": row.get("env_index_live_volume"),
-            "env_index_live_amount": row.get("env_index_live_amount"),
-            "env_index_dev_ma20_atr": row.get("env_index_dev_ma20_atr"),
-            "env_index_gate_action": row.get("env_index_gate_action"),
-            "env_index_gate_reason": row.get("env_index_gate_reason"),
-            "env_index_position_cap": row.get("env_index_position_cap"),
+            "env_index_code": index_snapshot_row.get("index_code"),
+            "env_index_asof_trade_date": index_snapshot_row.get("asof_trade_date"),
+            "env_index_live_trade_date": index_snapshot_row.get("live_trade_date"),
+            "env_index_asof_close": index_snapshot_row.get("asof_close"),
+            "env_index_asof_ma20": index_snapshot_row.get("asof_ma20"),
+            "env_index_asof_ma60": index_snapshot_row.get("asof_ma60"),
+            "env_index_asof_macd_hist": index_snapshot_row.get("asof_macd_hist"),
+            "env_index_asof_atr14": index_snapshot_row.get("asof_atr14"),
+            "env_index_live_open": index_snapshot_row.get("live_open"),
+            "env_index_live_high": index_snapshot_row.get("live_high"),
+            "env_index_live_low": index_snapshot_row.get("live_low"),
+            "env_index_live_latest": index_snapshot_row.get("live_latest"),
+            "env_index_live_pct_change": index_snapshot_row.get("live_pct_change"),
+            "env_index_live_volume": index_snapshot_row.get("live_volume"),
+            "env_index_live_amount": index_snapshot_row.get("live_amount"),
+            "env_index_dev_ma20_atr": index_snapshot_row.get("dev_ma20_atr"),
+            "env_index_gate_action": index_snapshot_row.get("gate_action"),
+            "env_index_gate_reason": index_snapshot_row.get("gate_reason"),
+            "env_index_position_cap": index_snapshot_row.get("position_cap"),
         }
 
         env_context: dict[str, Any] = {
@@ -173,13 +174,21 @@ class OpenMonitorEnvService:
         return self.env_builder.build_weekly_scenario(weekly_payload, index_trend)
 
     def build_environment_context(
-        self, latest_trade_date: str, *, checked_at: dt.datetime | None = None
+        self,
+        latest_trade_date: str,
+        *,
+        checked_at: dt.datetime | None = None,
+        allow_auto_compute: bool = False,
     ) -> dict[str, Any]:
         expected_weekly_asof, _ = self.env_builder.resolve_latest_closed_week_end(
             latest_trade_date
         )
         weekly_indicator = self.repo.load_weekly_indicator(expected_weekly_asof) or {}
         if not weekly_indicator:
+            if not allow_auto_compute:
+                raise RuntimeError(
+                    f"周线环境缺失（weekly_asof={expected_weekly_asof}），已禁止自动补算。"
+                )
             weekly_rows = self.indicator_builder.compute_weekly_indicator(
                 latest_trade_date, checked_at=checked_at
             )
@@ -191,6 +200,10 @@ class OpenMonitorEnvService:
             asof_trade_date=latest_trade_date, benchmark_code=benchmark_code
         )
         if not daily_env:
+            if not allow_auto_compute:
+                raise RuntimeError(
+                    f"日线环境缺失（asof_trade_date={latest_trade_date}），已禁止自动补算。"
+                )
             start_date = dt.date.fromisoformat(latest_trade_date)
             daily_rows = self.indicator_builder.compute_daily_indicators(
                 start_date, start_date
@@ -288,6 +301,7 @@ class OpenMonitorEnvService:
         run_id: str | None = None,
         run_pk: int | None = None,
         checked_at: dt.datetime | None = None,
+        allow_auto_compute: bool = False,
         fetch_index_live_quote: Callable[[], dict[str, Any]] | None = None,
     ) -> dict[str, Any] | None:
         if checked_at is None:
@@ -306,7 +320,9 @@ class OpenMonitorEnvService:
             )
 
         env_context = self.build_environment_context(
-            latest_trade_date, checked_at=checked_at
+            latest_trade_date,
+            checked_at=checked_at,
+            allow_auto_compute=allow_auto_compute,
         )
 
         env_context, _, _ = self.attach_index_snapshot(
@@ -478,6 +494,7 @@ class OpenMonitorEnvService:
             env_index_snapshot_hash = index_snapshot_payload["snapshot_hash"]
             index_env_snapshot["env_index_snapshot_hash"] = env_index_snapshot_hash
             ctx["index_intraday"] = index_env_snapshot
+            self.repo.persist_index_snapshot(index_snapshot_payload)
 
         if index_env_snapshot:
             gate_action = index_env_snapshot.get("env_index_gate_action")
