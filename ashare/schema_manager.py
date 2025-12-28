@@ -33,7 +33,8 @@ TABLE_STRATEGY_OPEN_MONITOR_EVAL = "strategy_open_monitor_eval"
 TABLE_STRATEGY_OPEN_MOTOR_ENV = "strategy_open_motor_env"
 TABLE_STRATEGY_WEEKLY_MARKET_ENV = "strategy_weekly_market_env"
 WEEKLY_MARKET_BENCHMARK_CODE = "sh.000001"
-TABLE_STRATEGY_DAILY_MARKET_INDICATOR = "strategy_daily_market_indicator"
+TABLE_STRATEGY_DAILY_MARKET_ENV = "strategy_daily_market_env"
+DAILY_MARKET_BENCHMARK_CODE = "sh.000001"
 TABLE_STRATEGY_OPEN_MONITOR_QUOTE = "strategy_open_monitor_quote"
 TABLE_STRATEGY_OPEN_MONITOR_RUN = "strategy_open_monitor_run"
 VIEW_STRATEGY_OPEN_MONITOR_WIDE = "v_strategy_open_monitor_wide"
@@ -109,7 +110,7 @@ class SchemaManager:
         self._ensure_open_monitor_run_table(tables.open_monitor_run_table)
         self._ensure_open_monitor_quote_table(tables.open_monitor_quote_table)
         self._ensure_weekly_indicator_table(tables.weekly_indicator_table)
-        self._ensure_daily_indicator_table(tables.daily_indicator_table)
+        self._ensure_daily_market_env_table(tables.daily_indicator_table)
         self._ensure_env_snapshot_table(tables.env_snapshot_table)
         self._ensure_env_index_snapshot_table(tables.env_index_snapshot_table)
         self._ensure_open_monitor_env_view(
@@ -232,10 +233,10 @@ class SchemaManager:
                 str(
                     open_monitor_cfg.get(
                         "daily_indicator_table",
-                        TABLE_STRATEGY_DAILY_MARKET_INDICATOR,
+                        TABLE_STRATEGY_DAILY_MARKET_ENV,
                     )
                 ).strip()
-                or TABLE_STRATEGY_DAILY_MARKET_INDICATOR
+                or TABLE_STRATEGY_DAILY_MARKET_ENV
         )
 
         return TableNames(
@@ -1601,7 +1602,7 @@ class SchemaManager:
              AND weekly.`benchmark_code` = '{WEEKLY_MARKET_BENCHMARK_CODE}'
             LEFT JOIN `{daily_table}` daily
               ON env.`env_daily_asof_trade_date` = daily.`asof_trade_date`
-             AND idx.`index_code` = daily.`index_code`
+             AND daily.`benchmark_code` = '{DAILY_MARKET_BENCHMARK_CODE}'
             """
         )
         with self.engine.begin() as conn:
@@ -1636,12 +1637,12 @@ class SchemaManager:
         self._ensure_date_column(table, "weekly_asof_trade_date", not_null=True)
         self._ensure_varchar_length(table, "benchmark_code", 16)
 
-    def _ensure_daily_indicator_table(self, table: str) -> None:
+    def _ensure_daily_market_env_table(self, table: str) -> None:
         columns = {
             "asof_trade_date": "DATE NOT NULL",
-            "index_code": "VARCHAR(16) NOT NULL",
-            "score": "DOUBLE NULL",
+            "benchmark_code": "VARCHAR(16) NOT NULL DEFAULT 'sh.000001'",
             "regime": "VARCHAR(32) NULL",
+            "score": "DOUBLE NULL",
             "position_hint": "DOUBLE NULL",
             "ma20": "DOUBLE NULL",
             "ma60": "DOUBLE NULL",
@@ -1650,17 +1651,18 @@ class SchemaManager:
             "atr14": "DOUBLE NULL",
             "dev_ma20_atr": "DOUBLE NULL",
             "cycle_phase": "VARCHAR(32) NULL",
+            "components_json": "LONGTEXT NULL",
         }
         if not self._table_exists(table):
             self._create_table(
                 table,
                 columns,
-                primary_key=("asof_trade_date", "index_code"),
+                primary_key=("asof_trade_date", "benchmark_code"),
             )
         else:
             self._add_missing_columns(table, columns)
         self._ensure_date_column(table, "asof_trade_date", not_null=True)
-        self._ensure_varchar_length(table, "index_code", 16)
+        self._ensure_varchar_length(table, "benchmark_code", 16)
 
     def _ensure_open_monitor_view(
             self,

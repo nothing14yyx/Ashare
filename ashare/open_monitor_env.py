@@ -68,10 +68,14 @@ class OpenMonitorEnvService:
         weekly_indicator = (
             self.repo.load_weekly_indicator(str(weekly_asof)) if weekly_asof else {}
         )
-        daily_indicator = (
-            self.repo.load_daily_indicator(str(daily_asof), index_code)
+        benchmark_code = str(self.params.index_code or "sh.000001").strip() or "sh.000001"
+        daily_env = (
+            self.repo.load_daily_market_env(
+                asof_trade_date=str(daily_asof),
+                benchmark_code=benchmark_code,
+            )
             if daily_asof
-            else {}
+            else None
         )
         weekly_scenario = {
             "weekly_asof_trade_date": weekly_indicator.get("weekly_asof_trade_date")
@@ -100,14 +104,22 @@ class OpenMonitorEnvService:
             "weekly_scene_code": weekly_scenario.get("weekly_scene_code"),
             "weekly_gate_policy": weekly_scenario.get("weekly_gate_policy"),
             "weekly_gate_action": weekly_scenario.get("weekly_gate_action"),
-            "regime": daily_indicator.get("regime") or row.get("env_regime"),
-            "index_score": daily_indicator.get("score") or row.get("env_index_score"),
-            "position_hint": daily_indicator.get("position_hint")
+            "regime": (daily_env or {}).get("regime") or row.get("env_regime"),
+            "index_score": (daily_env or {}).get("score") or row.get("env_index_score"),
+            "position_hint": (daily_env or {}).get("position_hint")
             or row.get("env_position_hint"),
-            "effective_position_hint": daily_indicator.get("position_hint")
+            "effective_position_hint": (daily_env or {}).get("position_hint")
             or row.get("env_position_hint"),
             "run_pk": row.get("run_pk"),
-            "daily_asof_trade_date": daily_indicator.get("asof_trade_date") or daily_asof,
+            "daily_asof_trade_date": (daily_env or {}).get("asof_trade_date")
+            or daily_asof,
+            "cycle_phase": (daily_env or {}).get("cycle_phase"),
+            "daily_ma20": (daily_env or {}).get("ma20"),
+            "daily_ma60": (daily_env or {}).get("ma60"),
+            "daily_ma250": (daily_env or {}).get("ma250"),
+            "daily_macd_hist": (daily_env or {}).get("macd_hist"),
+            "daily_atr14": (daily_env or {}).get("atr14"),
+            "daily_dev_ma20_atr": (daily_env or {}).get("dev_ma20_atr"),
             "env_index_snapshot_hash": index_snapshot_hash,
             "env_final_gate_action": row.get("env_final_gate_action"),
             "env_final_cap_pct": row.get("env_final_cap_pct"),
@@ -151,15 +163,19 @@ class OpenMonitorEnvService:
             if weekly_rows:
                 weekly_asof = str(weekly_rows[0].get("weekly_asof_trade_date"))
 
-        index_code = str(self.params.index_code or "").strip()
-        daily_indicator = self.repo.load_daily_indicator(latest_trade_date, index_code)
-        if not daily_indicator:
+        benchmark_code = str(self.params.index_code or "sh.000001").strip() or "sh.000001"
+        daily_env = self.repo.load_daily_market_env(
+            asof_trade_date=latest_trade_date, benchmark_code=benchmark_code
+        )
+        if not daily_env:
             start_date = dt.date.fromisoformat(latest_trade_date)
             daily_rows = self.indicator_builder.compute_daily_indicators(
                 start_date, start_date
             )
-            self.repo.upsert_daily_indicator(daily_rows)
-            daily_indicator = self.repo.load_daily_indicator(latest_trade_date, index_code)
+            self.repo.upsert_daily_market_env(daily_rows)
+            daily_env = self.repo.load_daily_market_env(
+                asof_trade_date=latest_trade_date, benchmark_code=benchmark_code
+            )
 
         weekly_indicator = (
             self.repo.load_weekly_indicator(weekly_asof) if weekly_asof else {}
@@ -197,18 +213,27 @@ class OpenMonitorEnvService:
             "weekly_note": weekly_scenario.get("weekly_note"),
             "weekly_gate_policy": weekly_gate_policy,
             "weekly_gate_action": weekly_gate_policy,
-            "daily_asof_trade_date": daily_indicator.get("asof_trade_date")
-            if daily_indicator
+            "daily_asof_trade_date": daily_env.get("asof_trade_date")
+            if daily_env
             else latest_trade_date,
-            "index_score": _to_float(daily_indicator.get("score"))
-            if daily_indicator
+            "index_score": _to_float(daily_env.get("score"))
+            if daily_env
             else None,
-            "regime": daily_indicator.get("regime") if daily_indicator else None,
-            "position_hint": _to_float(daily_indicator.get("position_hint"))
-            if daily_indicator
+            "regime": daily_env.get("regime") if daily_env else None,
+            "position_hint": _to_float(daily_env.get("position_hint"))
+            if daily_env
             else None,
-            "effective_position_hint": _to_float(daily_indicator.get("position_hint"))
-            if daily_indicator
+            "effective_position_hint": _to_float(daily_env.get("position_hint"))
+            if daily_env
+            else None,
+            "cycle_phase": daily_env.get("cycle_phase") if daily_env else None,
+            "daily_ma20": _to_float(daily_env.get("ma20")) if daily_env else None,
+            "daily_ma60": _to_float(daily_env.get("ma60")) if daily_env else None,
+            "daily_ma250": _to_float(daily_env.get("ma250")) if daily_env else None,
+            "daily_macd_hist": _to_float(daily_env.get("macd_hist")) if daily_env else None,
+            "daily_atr14": _to_float(daily_env.get("atr14")) if daily_env else None,
+            "daily_dev_ma20_atr": _to_float(daily_env.get("dev_ma20_atr"))
+            if daily_env
             else None,
         }
         if not weekly_gate_policy:

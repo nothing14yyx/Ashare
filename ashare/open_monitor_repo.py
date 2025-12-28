@@ -1161,7 +1161,9 @@ class OpenMonitorRepository:
                 return None
         return None
 
-    def get_latest_daily_indicator_date(self, index_code: str) -> dt.date | None:
+    def get_latest_daily_market_env_date(
+        self, *, benchmark_code: str = "sh.000001"
+    ) -> str | None:
         table = self.params.daily_indicator_table
         if not (table and self._table_exists(table)):
             return None
@@ -1169,25 +1171,25 @@ class OpenMonitorRepository:
             f"""
             SELECT MAX(`asof_trade_date`) AS latest_date
             FROM `{table}`
-            WHERE `index_code` = :code
+            WHERE `benchmark_code` = :code
             """
         )
         try:
             with self.engine.begin() as conn:
-                row = conn.execute(stmt, {"code": index_code}).mappings().first()
+                row = conn.execute(stmt, {"code": benchmark_code}).mappings().first()
         except Exception as exc:  # noqa: BLE001
-            self.logger.debug("读取日线指标最新日期失败：%s", exc)
+            self.logger.debug("读取日线环境最新日期失败：%s", exc)
             return None
         if not row:
             return None
         latest = row.get("latest_date")
-        if isinstance(latest, dt.datetime):
-            return latest.date()
-        if isinstance(latest, dt.date):
-            return latest
+        if isinstance(latest, (dt.datetime, dt.date)):
+            if isinstance(latest, dt.datetime):
+                return latest.date().isoformat()
+            return latest.isoformat()
         if latest:
             try:
-                return pd.to_datetime(latest).date()
+                return pd.to_datetime(latest).date().isoformat()
             except Exception:
                 return None
         return None
@@ -1219,15 +1221,17 @@ class OpenMonitorRepository:
             return {}
         return df.iloc[0].to_dict()
 
-    def load_daily_indicator(self, asof_trade_date: str, index_code: str) -> dict[str, Any]:
+    def load_daily_market_env(
+        self, *, asof_trade_date: str, benchmark_code: str = "sh.000001"
+    ) -> dict[str, Any] | None:
         table = self.params.daily_indicator_table
         if not (table and self._table_exists(table)):
-            return {}
+            return None
         stmt = text(
             f"""
             SELECT *
             FROM `{table}`
-            WHERE `asof_trade_date` = :d AND `index_code` = :code
+            WHERE `asof_trade_date` = :d AND `benchmark_code` = :code
             LIMIT 1
             """
         )
@@ -1236,13 +1240,13 @@ class OpenMonitorRepository:
                 df = pd.read_sql_query(
                     stmt,
                     conn,
-                    params={"d": asof_trade_date, "code": index_code},
+                    params={"d": asof_trade_date, "code": benchmark_code},
                 )
         except Exception as exc:  # noqa: BLE001
-            self.logger.debug("读取日线指标失败：%s", exc)
-            return {}
+            self.logger.debug("读取日线环境失败：%s", exc)
+            return None
         if df.empty:
-            return {}
+            return None
         return df.iloc[0].to_dict()
 
     def upsert_weekly_indicator(self, rows: list[dict[str, Any]]) -> int:
@@ -1276,7 +1280,7 @@ class OpenMonitorRepository:
             self.logger.warning("写入周线指标失败：%s", exc)
             return 0
 
-    def upsert_daily_indicator(self, rows: list[dict[str, Any]]) -> int:
+    def upsert_daily_market_env(self, rows: list[dict[str, Any]]) -> int:
         if not rows:
             return 0
         table = self.params.daily_indicator_table
@@ -1286,7 +1290,9 @@ class OpenMonitorRepository:
         if df.empty:
             return 0
         columns = df.columns.tolist()
-        update_cols = [c for c in columns if c not in {"asof_trade_date", "index_code"}]
+        update_cols = [
+            c for c in columns if c not in {"asof_trade_date", "benchmark_code"}
+        ]
         stmt = text(
             f"""
             INSERT INTO `{table}` ({", ".join(f"`{c}`" for c in columns)})
@@ -1300,7 +1306,7 @@ class OpenMonitorRepository:
                 conn.execute(stmt, payloads)
             return len(payloads)
         except Exception as exc:  # noqa: BLE001
-            self.logger.warning("写入日线指标失败：%s", exc)
+            self.logger.warning("写入日线环境失败：%s", exc)
             return 0
 
     def persist_env_snapshot(

@@ -45,7 +45,7 @@ from .open_monitor_rules import Rule, RuleEngine, RuleResult
 from .market_indicator_builder import MarketIndicatorBuilder
 from .schema_manager import (
     STRATEGY_CODE_MA5_MA20_TREND,
-    TABLE_STRATEGY_DAILY_MARKET_INDICATOR,
+    TABLE_STRATEGY_DAILY_MARKET_ENV,
     TABLE_STRATEGY_OPEN_MOTOR_ENV,
     TABLE_STRATEGY_OPEN_MONITOR_EVAL,
     TABLE_STRATEGY_OPEN_MONITOR_QUOTE,
@@ -122,7 +122,7 @@ class OpenMonitorParams:
     # 指数环境快照表：按哈希去重存储单份指数环境，避免在事实表重复写入。
     env_index_snapshot_table: str = TABLE_STRATEGY_REALTIME_MARKET_SNAPSHOT
     weekly_indicator_table: str = TABLE_STRATEGY_WEEKLY_MARKET_ENV
-    daily_indicator_table: str = TABLE_STRATEGY_DAILY_MARKET_INDICATOR
+    daily_indicator_table: str = TABLE_STRATEGY_DAILY_MARKET_ENV
     weekly_benchmark_code: str = WEEKLY_MARKET_BENCHMARK_CODE
 
     # 同一批次内同一 code 只保留“最新 date（信号日）”那条 BUY 信号。

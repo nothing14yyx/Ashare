@@ -70,20 +70,31 @@ class MarketIndicatorRunner:
         end_date: str | None = None,
         mode: str = "incremental",
     ) -> dict[str, Any]:
-        index_code = str(self.repo.params.index_code or "").strip()
-        end_dt = self._resolve_end_date(end_date, index_code)
+        benchmark_code = str(self.repo.params.index_code or "sh.000001").strip()
+        end_dt = self._resolve_end_date(end_date, benchmark_code)
         if end_dt is None:
             raise ValueError("无法解析 daily 指标的 end_date。")
 
+        latest_daily = self.repo.get_latest_daily_market_env_date(
+            benchmark_code=benchmark_code
+        )
+        latest_daily_date = (
+            dt.date.fromisoformat(latest_daily) if latest_daily else None
+        )
         start_dt = self._resolve_start_date(
             start_date,
             end_dt,
             mode=mode,
-            latest_date=self.repo.get_latest_daily_indicator_date(index_code),
+            latest_date=latest_daily_date,
         )
         rows = self.builder.compute_daily_indicators(start_dt, end_dt)
         rows = self._attach_cycle_phase_from_weekly(rows)
-        written = self.repo.upsert_daily_indicator(rows)
+        if rows:
+            dates = [row.get("asof_trade_date") for row in rows]
+            counts = pd.Series(dates).value_counts()
+            if (counts > 1).any():
+                self.logger.warning("daily env 输出存在重复交易日：%s", counts[counts > 1])
+        written = self.repo.upsert_daily_market_env(rows)
         return {
             "written": written,
             "start_date": start_dt.isoformat(),
@@ -153,10 +164,7 @@ class MarketIndicatorRunner:
         df_daily = pd.DataFrame(rows)
         if df_daily.empty:
             return rows
-        if (
-            "asof_trade_date" not in df_daily.columns
-            or "index_code" not in df_daily.columns
-        ):
+        if "asof_trade_date" not in df_daily.columns:
             return rows
 
         df_daily = df_daily.copy()
@@ -166,6 +174,7 @@ class MarketIndicatorRunner:
         )
         parsed_dates = df_daily["__asof_trade_date"].dropna()
         if parsed_dates.empty:
+            df_daily["cycle_phase"] = None
             df_daily = df_daily.sort_values("__order")
             df_daily = df_daily.drop(columns=["__order", "__asof_trade_date"])
             return df_daily.to_dict(orient="records")
@@ -213,18 +222,16 @@ class MarketIndicatorRunner:
         )
         df_weekly = df_weekly.dropna(subset=["weekly_asof_trade_date"])
         if df_weekly.empty:
+            df_daily["cycle_phase"] = None
             df_daily = df_daily.sort_values("__order")
             df_daily = df_daily.drop(columns=["__order", "__asof_trade_date"])
             return df_daily.to_dict(orient="records")
 
-        df_daily_valid = df_daily.dropna(subset=["__asof_trade_date"]).copy()
-        if df_daily_valid.empty:
-            df_daily = df_daily.sort_values("__order")
-            df_daily = df_daily.drop(columns=["__order", "__asof_trade_date"])
-            return df_daily.to_dict(orient="records")
+        df_daily_sorted = df_daily.sort_values("__asof_trade_date")
+        df_weekly = df_weekly.sort_values("weekly_asof_trade_date")
 
-        df_daily_valid = df_daily_valid.sort_values("__asof_trade_date").reset_index(drop=True)
-        df_weekly = df_weekly.sort_values("weekly_asof_trade_date").reset_index(drop=True)
+        df_daily_valid = df_daily_sorted.dropna(subset=["__asof_trade_date"])
+        df_daily_invalid = df_daily_sorted[df_daily_sorted["__asof_trade_date"].isna()]
 
         merged = pd.merge_asof(
             df_daily_valid,
@@ -233,11 +240,24 @@ class MarketIndicatorRunner:
             right_on="weekly_asof_trade_date",
             direction="backward",
         )
-        df_daily.loc[df_daily_valid.index, "cycle_phase"] = merged["weekly_scene_code"].values
-        df_daily["cycle_phase"] = df_daily["cycle_phase"].where(
-            pd.notna(df_daily["cycle_phase"]), None
+        merged["cycle_phase"] = merged["weekly_scene_code"]
+        merged["cycle_phase"] = merged["cycle_phase"].where(
+            pd.notna(merged["cycle_phase"]), None
         )
 
-        df_daily = df_daily.sort_values("__order")
-        df_daily = df_daily.drop(columns=["__order", "__asof_trade_date"])
-        return df_daily.to_dict(orient="records")
+        if not df_daily_invalid.empty:
+            df_daily_invalid = df_daily_invalid.copy()
+            df_daily_invalid["cycle_phase"] = None
+            merged = pd.concat([merged, df_daily_invalid], ignore_index=True)
+
+        merged = merged.sort_values("__order")
+        merged = merged.drop(
+            columns=[
+                "__order",
+                "__asof_trade_date",
+                "weekly_asof_trade_date",
+                "weekly_scene_code",
+            ],
+            errors="ignore",
+        )
+        return merged.to_dict(orient="records")

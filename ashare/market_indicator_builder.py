@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import logging
 from typing import Any, Dict, List
 
@@ -111,6 +112,9 @@ class MarketIndicatorBuilder:
         self, start_date: dt.date, end_date: dt.date
     ) -> list[dict[str, Any]]:
         index_codes = [c for c in self.index_codes if c]
+        benchmark_code = self.env_builder.benchmark_code or "sh.000001"
+        if benchmark_code and benchmark_code not in index_codes:
+            index_codes.append(benchmark_code)
         if not index_codes:
             return []
 
@@ -228,14 +232,70 @@ class MarketIndicatorBuilder:
         merged = merged[
             (merged["trade_date"] >= start_date) & (merged["trade_date"] <= end_date)
         ]
+        day_summary = day_summary[
+            (day_summary["trade_date"] >= start_date)
+            & (day_summary["trade_date"] <= end_date)
+        ]
+        if merged.empty:
+            return []
+
+        benchmark_daily = merged.loc[merged["code"] == benchmark_code, :].copy()
+        benchmark_daily = benchmark_daily[
+            [
+                "trade_date",
+                "ma20",
+                "ma60",
+                "ma250",
+                "macd_hist",
+                "atr14",
+                "dev_ma20_atr",
+            ]
+        ]
+
+        daily_env = day_summary.merge(benchmark_daily, on="trade_date", how="left")
+
+        component_fields = [
+            "code",
+            "ma20",
+            "ma60",
+            "ma250",
+            "macd_hist",
+            "atr14",
+            "dev_ma20_atr",
+            "score_raw",
+            "status",
+        ]
+
+        def _safe_value(value: Any) -> Any:
+            try:
+                if pd.isna(value):
+                    return None
+            except Exception:
+                pass
+            if isinstance(value, (dt.datetime, dt.date)):
+                return value.isoformat()
+            return value
+
+        components_map: dict[dt.date, str] = {}
+        for trade_date, group in merged.groupby("trade_date", sort=False):
+            components = [
+                {field: _safe_value(row.get(field)) for field in component_fields}
+                for _, row in group.iterrows()
+            ]
+            components_map[trade_date] = json.dumps(
+                components, ensure_ascii=False, separators=(",", ":")
+            )
+
+        daily_env["components_json"] = daily_env["trade_date"].map(components_map)
+
         rows: list[dict[str, Any]] = []
-        for _, row in merged.iterrows():
+        for _, row in daily_env.iterrows():
             rows.append(
                 {
                     "asof_trade_date": row.get("trade_date"),
-                    "index_code": row.get("code"),
-                    "score": row.get("score"),
+                    "benchmark_code": benchmark_code,
                     "regime": row.get("regime"),
+                    "score": row.get("score"),
                     "position_hint": row.get("position_hint"),
                     "ma20": row.get("ma20"),
                     "ma60": row.get("ma60"),
@@ -244,6 +304,7 @@ class MarketIndicatorBuilder:
                     "atr14": row.get("atr14"),
                     "dev_ma20_atr": row.get("dev_ma20_atr"),
                     "cycle_phase": None,
+                    "components_json": row.get("components_json"),
                 }
             )
         return rows
