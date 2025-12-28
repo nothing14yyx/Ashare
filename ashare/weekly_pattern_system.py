@@ -97,6 +97,25 @@ class WeeklyPlanSystem:
         self.confirm_vol_ratio_threshold = 1.05
         self.retest_tolerance = 0.01
 
+    def _near_by_atr(
+        self,
+        p1: float,
+        p2: float,
+        *,
+        atr: float | None,
+        pct_floor: float,
+        atr_mult: float,
+    ) -> bool:
+        if p1 is None or p2 is None:
+            return False
+        base = max(float(p1), float(p2))
+        if base <= 0:
+            return False
+        tol_abs = base * float(pct_floor)
+        if atr is not None and not pd.isna(atr):
+            tol_abs = max(tol_abs, float(atr) * float(atr_mult))
+        return abs(float(p1) - float(p2)) <= tol_abs
+
     def _prepare_df(self, bars: List[Dict[str, Any]]) -> pd.DataFrame:
         df = pd.DataFrame(bars)
         if df.empty:
@@ -189,12 +208,11 @@ class WeeklyPlanSystem:
             description="冲击后横盘整理，留意突破",  # 简短描述
         )
 
-    def _detect_double(self, highs: List[Tuple[int, float]], lows: List[Tuple[int, float]]) -> PatternCandidate | None:
+    def _detect_double(self, highs: List[Tuple[int, float]], lows: List[Tuple[int, float]], atr_last: float | None = None) -> PatternCandidate | None:
         if len(highs) >= 2:
             last_two = highs[-2:]
             if last_two[0][1] and last_two[1][1]:
-                diff = abs(last_two[0][1] - last_two[1][1]) / last_two[0][1]
-                if diff <= 0.02:
+                if self._near_by_atr(last_two[0][1], last_two[1][1], atr=atr_last, pct_floor=0.02, atr_mult=0.5):
                     neckline = None
                     if lows:
                         neckline = float(np.mean([p[1] for p in lows[-2:]]))
@@ -212,8 +230,7 @@ class WeeklyPlanSystem:
         if len(lows) >= 2:
             last_two = lows[-2:]
             if last_two[0][1] and last_two[1][1]:
-                diff = abs(last_two[0][1] - last_two[1][1]) / last_two[0][1]
-                if diff <= 0.02:
+                if self._near_by_atr(last_two[0][1], last_two[1][1], atr=atr_last, pct_floor=0.02, atr_mult=0.5):
                     neckline = None
                     if highs:
                         neckline = float(np.mean([p[1] for p in highs[-2:]]))
@@ -230,14 +247,14 @@ class WeeklyPlanSystem:
                     )
         return None
 
-    def _detect_hs(self, highs: List[Tuple[int, float]], lows: List[Tuple[int, float]]) -> PatternCandidate | None:
+    def _detect_hs(self, highs: List[Tuple[int, float]], lows: List[Tuple[int, float]], atr_last: float | None = None) -> PatternCandidate | None:
         if len(highs) < 3 or len(lows) < 2:
             return None
         last_highs = highs[-3:]
         shoulder1, head, shoulder2 = last_highs[0][1], last_highs[1][1], last_highs[2][1]
         if head <= max(shoulder1, shoulder2):
             return None
-        shoulders_close = abs(shoulder1 - shoulder2) / max(shoulder1, shoulder2) <= 0.05
+        shoulders_close = self._near_by_atr(shoulder1, shoulder2, atr=atr_last, pct_floor=0.05, atr_mult=0.8)
         if not shoulders_close:
             return None
         neckline = float(np.mean([p[1] for p in lows[-2:]]))
@@ -366,15 +383,20 @@ class WeeklyPlanSystem:
         self, df: pd.DataFrame, weekly_closed: bool, slope_change: float | None = None
     ) -> PatternCandidate:
         highs, lows = self._extract_pivots(df)
+        atr_last = None
+        if "atr14" in df.columns and not df.empty:
+            val = df["atr14"].iloc[-1]
+            if pd.notna(val):
+                atr_last = float(val)
         base_candidate = self._detect_channel_triangle_wedge(df, highs, lows)
         candidates: List[PatternCandidate] = [base_candidate]
         flag_candidate = self._detect_flag(df)
         if flag_candidate:
             candidates.append(flag_candidate)
-        double_candidate = self._detect_double(highs, lows)
+        double_candidate = self._detect_double(highs, lows, atr_last)
         if double_candidate:
             candidates.append(double_candidate)
-        hs_candidate = self._detect_hs(highs, lows)
+        hs_candidate = self._detect_hs(highs, lows, atr_last)
         if hs_candidate:
             candidates.append(hs_candidate)
         candidates = sorted(candidates, key=lambda c: c.score, reverse=True)
@@ -842,6 +864,12 @@ class WeeklyPlanSystem:
             close_below_lower=close_below_lower,
             close_below_neckline=close_below_neckline,
         )
+
+        confidence = float(candidate.score) if candidate.score is not None else None
+        force_high = bool(close_below_lower or close_below_neckline)
+        if not force_high and confidence is not None and confidence < 75.0 and risk_level == "HIGH":
+            risk_level = "MEDIUM"
+            risk_score = min(float(risk_score), 69.9)
 
         key_parts = []
         for label in ["upper", "lower", "neckline", "ma_fast", "ma_slow"]:

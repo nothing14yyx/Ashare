@@ -795,6 +795,13 @@ class WeeklyEnvironmentBuilder:
         breadth_factor = (
             0.6 + 0.4 * breadth_pct if breadth_pct is not None else 1.0
         )
+        if breadth_pct is not None:
+            if breadth_pct >= 0.95:
+                breadth_factor = min(breadth_factor, 0.85)
+                reason_parts["breadth_saturation"] = "RISK_ON_PEAK"
+            elif breadth_pct <= 0.05:
+                breadth_factor = min(breadth_factor, 0.75)
+                reason_parts["breadth_saturation"] = "RISK_OFF_WASHOUT"
         daily_cap = (
             daily_pos_hint * breadth_factor
             if daily_pos_hint is not None

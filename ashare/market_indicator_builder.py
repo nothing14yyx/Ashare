@@ -247,6 +247,12 @@ class MarketIndicatorBuilder:
             .apply(self._resolve_daily_regime)
             .reset_index()
         )
+        day_summary = day_summary.sort_values("trade_date").reset_index(drop=True)
+        if "position_hint" in day_summary.columns:
+            day_summary["position_hint_raw"] = day_summary["position_hint"]
+            pos = pd.to_numeric(day_summary["position_hint"], errors="coerce")
+            day_summary["position_hint"] = pos.ewm(alpha=0.7, adjust=False).mean()
+
         breadth_summary = (
             merged.groupby("trade_date")
             .apply(self._resolve_breadth_metrics, include_groups=False)
