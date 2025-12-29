@@ -20,7 +20,7 @@ def _parse_asof_date(raw: str | None) -> str | None:
     try:
         return dt.date.fromisoformat(str(raw)).isoformat()
     except Exception:  # noqa: BLE001
-        print(f"[WARN] --asof-date 无法解析：{raw}")
+        logging.warning(f"[WARN] --asof-date 无法解析：{raw}")
         return None
 
 
@@ -103,21 +103,21 @@ def _self_check(
     skipped_weekly: bool,
 ) -> None:
     if ready_view and repo._table_exists(ready_view):  # noqa: SLF001
-        print(f"[CHECK] ready_signals_view OK: {ready_view}")
+        logging.info(f"[CHECK] ready_signals_view OK: {ready_view}")
     else:
-        print("[CHECK] ready_signals_view 缺失或未配置。")
+        logging.info("[CHECK] ready_signals_view 缺失或未配置。")
 
-    print(f"[CHECK] 近 N 天 BUY 总数：{total_buy_cnt}")
-    print(f"[CHECK] 最新信号日 BUY 数量：{latest_sig_date_cnt}")
+    logging.info(f"[CHECK] 近 N 天 BUY 总数：{total_buy_cnt}")
+    logging.info(f"[CHECK] 最新信号日 BUY 数量：{latest_sig_date_cnt}")
 
     if skipped_weekly:
-        print("[CHECK] 周线环境：已跳过。")
+        logging.info("[CHECK] 周线环境：已跳过。")
         return
     written = weekly_status.get("written", 0)
     if written:
-        print(f"[CHECK] 周线指标 OK（写入 {written} 条）。")
+        logging.info(f"[CHECK] 周线指标 OK（写入 {written} 条）。")
     else:
-        print("[CHECK] 周线指标缺失，请检查周线指标生成流程。")
+        logging.info("[CHECK] 周线指标缺失，请检查周线指标生成流程。")
 
 
 def main(
@@ -152,7 +152,7 @@ def main(
                 mode="incremental",
             )
         except Exception as exc:  # noqa: BLE001
-            print(f"[WARN] 周线环境生成失败：{exc}")
+            logging.warning(f"[WARN] 周线环境生成失败：{exc}")
 
     breakdown = []
     if ready_view and repo._table_exists(ready_view):  # noqa: SLF001
