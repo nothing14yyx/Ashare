@@ -1093,6 +1093,34 @@ class OpenMonitorRepository:
 
         return df
 
+    def load_open_monitor_env_view_row(
+        self, monitor_date: str, run_pk: int | None
+    ) -> dict[str, Any] | None:
+        view = getattr(self.params, "open_monitor_env_view", None)
+        if not (view and monitor_date and run_pk):
+            return None
+        if not self._table_exists(view):
+            return None
+
+        stmt = text(
+            f"""
+            SELECT * FROM `{view}`
+            WHERE `run_pk` = :b AND `monitor_date` = :d
+            LIMIT 1
+            """
+        )
+        try:
+            with self.engine.begin() as conn:
+                df = pd.read_sql_query(stmt, conn, params={"d": monitor_date, "b": run_pk})
+        except Exception as exc:  # noqa: BLE001
+            self.logger.debug("读取环境视图失败：%s", exc)
+            return None
+
+        if df.empty:
+            return None
+
+        return df.iloc[0].to_dict()
+
     def get_env_broadcast_run_pk(
         self, monitor_date: str, env_run_id: str = ENV_RUN_PREOPEN
     ) -> int | None:
@@ -1457,11 +1485,6 @@ class OpenMonitorRepository:
             parsed_daily = pd.to_datetime(env_daily_asof, errors="coerce")
             env_daily_asof = parsed_daily.date() if not pd.isna(parsed_daily) else env_daily_asof
         payload["env_daily_asof_trade_date"] = env_daily_asof
-        index_score = _to_float(env_context.get("index_score"))
-        payload["env_index_score"] = int(round(index_score)) if index_score is not None else None
-        regime = env_context.get("regime")
-        payload["env_regime"] = str(regime).strip() if regime is not None else None
-        payload["env_position_hint"] = _to_float(env_context.get("position_hint"))
         index_snapshot = {}
         if isinstance(env_context, dict):
             raw_index_snapshot = env_context.get("index_intraday")
@@ -1469,56 +1492,6 @@ class OpenMonitorRepository:
                 index_snapshot = raw_index_snapshot
         env_index_hash = index_snapshot.get("env_index_snapshot_hash")
         payload["env_index_snapshot_hash"] = env_index_hash
-        index_fields = [
-            "env_index_code",
-            "env_index_asof_trade_date",
-            "env_index_live_trade_date",
-            "env_index_asof_close",
-            "env_index_asof_ma20",
-            "env_index_asof_ma60",
-            "env_index_asof_macd_hist",
-            "env_index_asof_atr14",
-            "env_index_live_open",
-            "env_index_live_high",
-            "env_index_live_low",
-            "env_index_live_latest",
-            "env_index_live_pct_change",
-            "env_index_live_volume",
-            "env_index_live_amount",
-            "env_index_dev_ma20_atr",
-            "env_index_gate_action",
-            "env_index_gate_reason",
-            "env_index_position_cap",
-        ]
-        date_fields = {"env_index_asof_trade_date", "env_index_live_trade_date"}
-        numeric_fields = {
-            "env_index_asof_close",
-            "env_index_asof_ma20",
-            "env_index_asof_ma60",
-            "env_index_asof_macd_hist",
-            "env_index_asof_atr14",
-            "env_index_live_open",
-            "env_index_live_high",
-            "env_index_live_low",
-            "env_index_live_latest",
-            "env_index_live_pct_change",
-            "env_index_live_volume",
-            "env_index_live_amount",
-            "env_index_dev_ma20_atr",
-            "env_index_position_cap",
-        }
-        for field in index_fields:
-            value = index_snapshot.get(field)
-            if field in date_fields and value is not None:
-                parsed_date = pd.to_datetime(value, errors="coerce")
-                payload[field] = (
-                    parsed_date.date() if not pd.isna(parsed_date) else value
-                )
-                continue
-            if field in numeric_fields:
-                payload[field] = _to_float(value)
-                continue
-            payload[field] = value
         payload["env_final_gate_action"] = env_context.get("env_final_gate_action")
         if payload["env_final_gate_action"] is None:
             self.logger.error(

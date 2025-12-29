@@ -851,33 +851,11 @@ class WeeklyEnvironmentBuilder:
             gate_candidates.append(regime_gate)
             reason_parts["regime_gate_action"] = regime_gate
 
-        # feat: env_final_reason_json 补充周线证据字段，便于解释 gate=WAIT/ALLOW_SMALL 的来源
         for key in [
-            "weekly_risk_level",
-            "weekly_risk_score",
-            "weekly_scene_code",
-            "weekly_phase",
-            "weekly_structure_status",
-            "weekly_pattern_status",
             "weekly_asof_trade_date",
-            "weekly_current_week_closed",
-            "weekly_key_levels_str",
-            "weekly_money_proxy",
-            "weekly_tags",
-            "weekly_note",
-        ]:
-            value = env_context.get(key)
-            if value not in (None, "", [], {}, ()):  # noqa: PLC1901
-                reason_parts[key] = value
-
-        for key in [
+            "daily_asof_trade_date",
             "weekly_zone_id",
-            "weekly_zone_score",
-            "weekly_exp_return_bucket",
             "daily_zone_id",
-            "daily_zone_score",
-            "daily_cap_multiplier",
-            "daily_zone_reason",
             "env_live_override_action",
             "env_live_cap_multiplier",
             "env_live_event_tags",

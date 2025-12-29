@@ -49,6 +49,7 @@ from .schema_manager import (
     TABLE_STRATEGY_WEEKLY_MARKET_ENV,
     WEEKLY_MARKET_BENCHMARK_CODE,
     VIEW_STRATEGY_OPEN_MONITOR,
+    VIEW_STRATEGY_OPEN_MONITOR_ENV,
     VIEW_STRATEGY_OPEN_MONITOR_WIDE,
     VIEW_STRATEGY_READY_SIGNALS,
 )
@@ -79,6 +80,7 @@ class OpenMonitorParams:
     run_table: str = TABLE_STRATEGY_OPEN_MONITOR_RUN
     open_monitor_view: str = VIEW_STRATEGY_OPEN_MONITOR
     open_monitor_wide_view: str = VIEW_STRATEGY_OPEN_MONITOR_WIDE
+    open_monitor_env_view: str = VIEW_STRATEGY_OPEN_MONITOR_ENV
 
     # 回看近 N 个交易日的 BUY 信号
     signal_lookback_days: int = 3
@@ -190,6 +192,10 @@ class OpenMonitorParams:
                 sec.get("open_monitor_view", cls.open_monitor_view)
             ).strip()
                               or cls.open_monitor_view,
+            open_monitor_env_view=str(
+                sec.get("open_monitor_env_view", cls.open_monitor_env_view)
+            ).strip()
+                                  or cls.open_monitor_env_view,
             open_monitor_wide_view=str(
                 sec.get("open_monitor_wide_view", cls.open_monitor_wide_view)
             ).strip()

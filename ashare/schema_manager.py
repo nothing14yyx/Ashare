@@ -113,6 +113,7 @@ class SchemaManager:
             tables.weekly_indicator_table,
             tables.daily_indicator_table,
             tables.open_monitor_run_table,
+            tables.open_monitor_quote_table,
         )
 
         self._ensure_open_monitor_view(
@@ -1397,28 +1398,6 @@ class SchemaManager:
             "env_live_event_tags": "VARCHAR(255) NULL",
             "env_live_reason": "VARCHAR(255) NULL",
             "env_index_snapshot_hash": "CHAR(32) NULL",
-            "env_index_score": "INT NULL",
-            "env_regime": "VARCHAR(32) NULL",
-            "env_position_hint": "DOUBLE NULL",
-            "env_index_code": "VARCHAR(16) NULL",
-            "env_index_asof_trade_date": "DATE NULL",
-            "env_index_live_trade_date": "DATE NULL",
-            "env_index_asof_close": "DOUBLE NULL",
-            "env_index_asof_ma20": "DOUBLE NULL",
-            "env_index_asof_ma60": "DOUBLE NULL",
-            "env_index_asof_macd_hist": "DOUBLE NULL",
-            "env_index_asof_atr14": "DOUBLE NULL",
-            "env_index_live_open": "DOUBLE NULL",
-            "env_index_live_high": "DOUBLE NULL",
-            "env_index_live_low": "DOUBLE NULL",
-            "env_index_live_latest": "DOUBLE NULL",
-            "env_index_live_pct_change": "DOUBLE NULL",
-            "env_index_live_volume": "DOUBLE NULL",
-            "env_index_live_amount": "DOUBLE NULL",
-            "env_index_dev_ma20_atr": "DOUBLE NULL",
-            "env_index_gate_action": "VARCHAR(16) NULL",
-            "env_index_gate_reason": "VARCHAR(255) NULL",
-            "env_index_position_cap": "DOUBLE NULL",
         }
         if not self._table_exists(table):
             self._create_table(table, columns, primary_key=("run_pk",))
@@ -1433,21 +1412,36 @@ class SchemaManager:
                     "env_weekly_gate_action",
                     "env_weekly_risk_level",
                     "env_weekly_scene",
+                    "env_index_score",
+                    "env_regime",
+                    "env_position_hint",
+                    "env_index_code",
+                    "env_index_asof_trade_date",
+                    "env_index_live_trade_date",
+                    "env_index_asof_close",
+                    "env_index_asof_ma20",
+                    "env_index_asof_ma60",
+                    "env_index_asof_macd_hist",
+                    "env_index_asof_atr14",
+                    "env_index_live_open",
+                    "env_index_live_high",
+                    "env_index_live_low",
+                    "env_index_live_latest",
+                    "env_index_live_pct_change",
+                    "env_index_live_volume",
+                    "env_index_live_amount",
+                    "env_index_dev_ma20_atr",
+                    "env_index_gate_action",
+                    "env_index_gate_reason",
+                    "env_index_position_cap",
                 ],
             )
         self._ensure_date_column(table, "monitor_date", not_null=True)
         self._ensure_date_column(table, "env_weekly_asof_trade_date", not_null=False)
         self._ensure_date_column(table, "env_daily_asof_trade_date", not_null=False)
         self._ensure_numeric_column(table, "env_final_cap_pct", "DOUBLE NULL")
-        self._ensure_numeric_column(table, "env_position_hint", "DOUBLE NULL")
-        self._ensure_numeric_column(table, "env_index_score", "INT NULL")
         self._ensure_numeric_column(table, "env_live_cap_multiplier", "DOUBLE NULL")
         self._ensure_numeric_column(table, "run_pk", "BIGINT NOT NULL")
-        self._ensure_date_column(table, "env_index_asof_trade_date", not_null=False)
-        self._ensure_date_column(table, "env_index_live_trade_date", not_null=False)
-        self._ensure_varchar_length(table, "env_index_code", 16)
-        self._ensure_varchar_length(table, "env_index_gate_action", 16)
-        self._ensure_varchar_length(table, "env_index_gate_reason", 255)
         self._ensure_varchar_length(table, "env_weekly_zone_id", 32)
         self._ensure_varchar_length(table, "env_daily_zone_id", 32)
         self._ensure_varchar_length(table, "env_live_override_action", 16)
@@ -1500,6 +1494,7 @@ class SchemaManager:
         weekly_table: str,
         daily_table: str,
         run_table: str,
+        quote_table: str,
     ) -> None:
         if not view:
             return
@@ -1524,6 +1519,65 @@ class SchemaManager:
         if not self._table_exists(run_table):
             self._drop_relation(view)
             return
+        if not quote_table:
+            self._drop_relation(view)
+            return
+        if not self._table_exists(quote_table):
+            self._drop_relation(view)
+            return
+
+        history_table = "history_index_daily_kline"
+        has_history = self._table_exists(history_table)
+        index_asof_close = (
+            "idx.`close`" if has_history else "CAST(NULL AS DOUBLE)"
+        )
+        index_asof_join = ""
+        if has_history:
+            index_asof_join = f"""
+            LEFT JOIN `{history_table}` idx
+              ON idx.`date` = env.`env_daily_asof_trade_date`
+             AND idx.`code` = '{WEEKLY_MARKET_BENCHMARK_CODE}'
+            """
+
+        pct_change_expr = f"""
+            CASE
+              WHEN q.`live_latest` IS NULL THEN NULL
+              WHEN {index_asof_close} IS NULL THEN NULL
+              WHEN {index_asof_close} = 0 THEN NULL
+              ELSE (q.`live_latest` / {index_asof_close} - 1) * 100
+            END
+        """
+        dev_ma20_atr_expr = """
+            CASE
+              WHEN q.`live_latest` IS NULL THEN NULL
+              WHEN daily.`ma20` IS NULL THEN NULL
+              WHEN daily.`atr14` IS NULL THEN NULL
+              WHEN daily.`atr14` = 0 THEN NULL
+              ELSE (q.`live_latest` - daily.`ma20`) / daily.`atr14`
+            END
+        """
+        gate_action_expr = """
+            CASE
+              WHEN UPPER(COALESCE(daily.`regime`, '')) IN ('BREAKDOWN', 'BEAR_CONFIRMED')
+                THEN 'STOP'
+              WHEN UPPER(COALESCE(daily.`regime`, '')) = 'RISK_OFF'
+                THEN 'WAIT'
+              WHEN UPPER(COALESCE(daily.`regime`, '')) = 'PULLBACK'
+                THEN CASE
+                  WHEN daily.`position_hint` IS NOT NULL AND daily.`position_hint` <= 0.3
+                    THEN 'WAIT'
+                  ELSE 'ALLOW'
+                END
+              WHEN UPPER(COALESCE(daily.`regime`, '')) = 'RISK_ON'
+                THEN 'ALLOW'
+              WHEN daily.`position_hint` IS NOT NULL THEN CASE
+                WHEN daily.`position_hint` <= 0 THEN 'STOP'
+                WHEN daily.`position_hint` < 0.3 THEN 'WAIT'
+                ELSE 'ALLOW'
+              END
+              ELSE NULL
+            END
+        """
 
         stmt = text(
             f"""
@@ -1544,9 +1598,9 @@ class SchemaManager:
               env.`env_live_cap_multiplier`,
               env.`env_live_event_tags`,
               env.`env_live_reason`,
-              env.`env_index_score`,
-              env.`env_regime`,
-              env.`env_position_hint`,
+              daily.`score` AS `env_index_score`,
+              daily.`regime` AS `env_regime`,
+              daily.`position_hint` AS `env_position_hint`,
               weekly.`weekly_gate_policy` AS `env_weekly_gate_policy`,
               weekly.`weekly_risk_level` AS `env_weekly_risk_level`,
               weekly.`weekly_scene_code` AS `env_weekly_scene`,
@@ -1565,25 +1619,34 @@ class SchemaManager:
               daily.`daily_zone_reason` AS `env_daily_zone_reason`,
               daily.`bb_pos` AS `env_daily_bb_pos`,
               daily.`bb_width` AS `env_daily_bb_width`,
-              env.`env_index_code`,
-              env.`env_index_asof_trade_date`,
-              env.`env_index_live_trade_date`,
-              env.`env_index_asof_close`,
-              env.`env_index_asof_ma20`,
-              env.`env_index_asof_ma60`,
-              env.`env_index_asof_macd_hist`,
-              env.`env_index_asof_atr14`,
-              env.`env_index_live_open`,
-              env.`env_index_live_high`,
-              env.`env_index_live_low`,
-              env.`env_index_live_latest`,
-              env.`env_index_live_pct_change`,
-              env.`env_index_live_volume`,
-              env.`env_index_live_amount`,
-              env.`env_index_dev_ma20_atr`,
-              env.`env_index_gate_action`,
-              env.`env_index_gate_reason`,
-              env.`env_index_position_cap`
+              COALESCE(
+                daily.`benchmark_code`,
+                weekly.`benchmark_code`,
+                '{WEEKLY_MARKET_BENCHMARK_CODE}'
+              ) AS `env_index_code`,
+              env.`env_daily_asof_trade_date` AS `env_index_asof_trade_date`,
+              q.`live_trade_date` AS `env_index_live_trade_date`,
+              {index_asof_close} AS `env_index_asof_close`,
+              daily.`ma20` AS `env_index_asof_ma20`,
+              daily.`ma60` AS `env_index_asof_ma60`,
+              daily.`macd_hist` AS `env_index_asof_macd_hist`,
+              daily.`atr14` AS `env_index_asof_atr14`,
+              q.`live_open` AS `env_index_live_open`,
+              q.`live_high` AS `env_index_live_high`,
+              q.`live_low` AS `env_index_live_low`,
+              q.`live_latest` AS `env_index_live_latest`,
+              {pct_change_expr} AS `env_index_live_pct_change`,
+              q.`live_volume` AS `env_index_live_volume`,
+              q.`live_amount` AS `env_index_live_amount`,
+              {dev_ma20_atr_expr} AS `env_index_dev_ma20_atr`,
+              {gate_action_expr} AS `env_index_gate_action`,
+              CONCAT(
+                'regime=',
+                COALESCE(daily.`regime`, ''),
+                ' pos_hint=',
+                COALESCE(daily.`position_hint`, '')
+              ) AS `env_index_gate_reason`,
+              daily.`position_hint` AS `env_index_position_cap`
             FROM `{env_table}` env
             LEFT JOIN `{run_table}` r
               ON env.`run_pk` = r.`run_pk`
@@ -1593,6 +1656,11 @@ class SchemaManager:
             LEFT JOIN `{daily_table}` daily
               ON env.`env_daily_asof_trade_date` = daily.`asof_trade_date`
              AND daily.`benchmark_code` = '{WEEKLY_MARKET_BENCHMARK_CODE}'
+            LEFT JOIN `{quote_table}` q
+              ON env.`monitor_date` = q.`monitor_date`
+             AND r.`run_id` = q.`run_id`
+             AND q.`code` = '{WEEKLY_MARKET_BENCHMARK_CODE}'
+            {index_asof_join}
             """
         )
         with self.engine.begin() as conn:
