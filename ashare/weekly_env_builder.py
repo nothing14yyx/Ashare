@@ -819,7 +819,22 @@ class WeeklyEnvironmentBuilder:
         final_cap = min(max(final_cap, 0.0), 1.0)
         env_context["env_final_gate_action"] = final_gate
         env_context["env_final_cap_pct"] = final_cap
-        env_context["env_final_reason_json"] = self._clip(json.dumps(reason_parts, ensure_ascii=False), 2000)
+        def _json_default(obj: Any):
+            if isinstance(obj, (dt.datetime, dt.date)):
+                return obj.isoformat()
+            if isinstance(obj, pd.Timestamp):
+                return obj.isoformat()
+            item = getattr(obj, "item", None)
+            if callable(item):
+                try:
+                    return item()
+                except Exception:  # noqa: BLE001
+                    pass
+            return str(obj)
+
+        env_context["env_final_reason_json"] = self._clip(
+            json.dumps(reason_parts, ensure_ascii=False, default=_json_default), 2000
+        )
 
     @property
     def calendar_cache(self) -> set[str]:

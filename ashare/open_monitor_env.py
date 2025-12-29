@@ -441,9 +441,15 @@ class OpenMonitorEnvService:
             idx = ctx.get("index") if isinstance(ctx, dict) else {}
             if not isinstance(idx, dict):
                 idx = {}
-            index_score = _to_float(idx.get("score"))
+            index_score = _to_float(ctx.get("index_score"))
+            if index_score is None:
+                index_score = _to_float(idx.get("score"))
+
             regime = ctx.get("regime") or idx.get("regime")
-            position_hint = _to_float(ctx.get("position_hint") or idx.get("position_hint"))
+
+            position_hint = _to_float(ctx.get("position_hint"))
+            if position_hint is None:
+                position_hint = _to_float(idx.get("position_hint"))
             if regime is not None:
                 regime = str(regime).strip() or None
 
@@ -451,10 +457,14 @@ class OpenMonitorEnvService:
             ctx["regime"] = regime
             ctx["position_hint"] = position_hint
 
-            if index_score is None or regime is None or position_hint is None:
-                raise ValueError(
-                    "指数环境缺失（index_score/regime/position_hint），无法构建指数快照。"
+            if regime is None or position_hint is None:
+                self.logger.warning(
+                    "指数环境缺失（regime/position_hint），已跳过指数快照构建。 index_score=%s regime=%s position_hint=%s",
+                    index_score,
+                    regime,
+                    position_hint,
                 )
+                return ctx or env_context, {}, None
 
             asof_indicators = self.repo.load_index_history(latest_trade_date)
             live_quote = fetch_index_live_quote() if fetch_index_live_quote else {}
