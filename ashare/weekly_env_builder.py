@@ -639,6 +639,13 @@ class WeeklyEnvironmentBuilder:
 
         weekly_gate_policy = self.resolve_env_weekly_gate_policy(env_context)
         env_context["weekly_gate_policy"] = weekly_gate_policy
+        weekly_zone = self._resolve_weekly_zone(
+            weekly_scenario,
+            weekly_gate_policy,
+            env_context.get("weekly_tags"),
+        )
+        weekly_scenario.update(weekly_zone)
+        env_context.update(weekly_zone)
         self._finalize_env_directives(env_context, weekly_gate_policy=weekly_gate_policy)
 
         return env_context
@@ -737,6 +744,64 @@ class WeeklyEnvironmentBuilder:
             return "ALLOW"
         return None
 
+    @staticmethod
+    def _resolve_weekly_zone(
+        weekly_scenario: dict[str, Any] | None,
+        weekly_gate_policy: str | None,
+        weekly_tags: str | None,
+    ) -> dict[str, Any]:
+        scenario = weekly_scenario or {}
+        risk_level = str(scenario.get("weekly_risk_level") or "").upper()
+        gate_policy = str(weekly_gate_policy or scenario.get("weekly_gate_policy") or "").upper()
+        plan_cap = to_float(scenario.get("weekly_plan_a_exposure_cap"))
+        direction_confirmed = bool(scenario.get("weekly_direction_confirmed", False))
+        tags = str(weekly_tags or scenario.get("weekly_tags") or "")
+
+        zone_id = "WZ2_NEUTRAL"
+        reason_parts: list[str] = []
+
+        if gate_policy in {"STOP", "WAIT"} or risk_level == "HIGH":
+            zone_id = "WZ0_RISK_OFF"
+        elif "OVERHEAT" in tags or "EUPHORIA" in tags:
+            zone_id = "WZ4_EUPHORIA"
+        elif risk_level == "MEDIUM" and plan_cap is not None and plan_cap <= 0.25:
+            zone_id = "WZ1_DEFENSIVE"
+        elif risk_level == "LOW" and direction_confirmed:
+            zone_id = "WZ3_ATTACK"
+
+        zone_score_map = {
+            "WZ0_RISK_OFF": 10,
+            "WZ1_DEFENSIVE": 30,
+            "WZ2_NEUTRAL": 50,
+            "WZ3_ATTACK": 70,
+            "WZ4_EUPHORIA": 85,
+        }
+        exp_return_map = {
+            "WZ0_RISK_OFF": "LOW",
+            "WZ1_DEFENSIVE": "LOW",
+            "WZ2_NEUTRAL": "MID",
+            "WZ3_ATTACK": "HIGH",
+            "WZ4_EUPHORIA": "HIGH",
+        }
+
+        if gate_policy:
+            reason_parts.append(f"gate={gate_policy}")
+        if risk_level:
+            reason_parts.append(f"risk={risk_level}")
+        if plan_cap is not None:
+            reason_parts.append(f"cap={plan_cap:.2f}")
+        if direction_confirmed:
+            reason_parts.append("direction_confirmed")
+        if tags:
+            reason_parts.append(f"tags={tags}")
+
+        return {
+            "weekly_zone_id": zone_id,
+            "weekly_zone_score": zone_score_map.get(zone_id, 50),
+            "weekly_exp_return_bucket": exp_return_map.get(zone_id, "MID"),
+            "weekly_zone_reason": ";".join(reason_parts)[:255] if reason_parts else None,
+        }
+
     def _finalize_env_directives(
         self,
         env_context: dict[str, Any] | None,
@@ -760,6 +825,24 @@ class WeeklyEnvironmentBuilder:
                 gate_norm = str(index_gate).strip().upper()
                 gate_candidates.append(gate_norm)
                 reason_parts["index_gate_action"] = gate_norm
+
+        daily_zone_id = env_context.get("daily_zone_id")
+        daily_gate_hint = None
+        if str(daily_zone_id or "").upper() == "DZ_BREAKDOWN":
+            daily_gate_hint = "WAIT"
+        if daily_gate_hint:
+            gate_candidates.append(daily_gate_hint)
+            reason_parts["daily_gate_hint"] = daily_gate_hint
+
+        live_override_action = str(env_context.get("env_live_override_action") or "").upper()
+        live_gate_hint = None
+        if live_override_action == "PAUSE":
+            live_gate_hint = "WAIT"
+        elif live_override_action == "EXIT":
+            live_gate_hint = "STOP"
+        if live_gate_hint:
+            gate_candidates.append(live_gate_hint)
+            reason_parts["live_gate_hint"] = live_gate_hint
 
         regime_gate = self._derive_gate_action(
             env_context.get("regime"), env_context.get("position_hint_raw") or env_context.get("position_hint")
@@ -787,10 +870,29 @@ class WeeklyEnvironmentBuilder:
             if value not in (None, "", [], {}, ()):  # noqa: PLC1901
                 reason_parts[key] = value
 
+        for key in [
+            "weekly_zone_id",
+            "weekly_zone_score",
+            "weekly_exp_return_bucket",
+            "daily_zone_id",
+            "daily_zone_score",
+            "daily_cap_multiplier",
+            "daily_zone_reason",
+            "env_live_override_action",
+            "env_live_cap_multiplier",
+            "env_live_event_tags",
+            "env_live_reason",
+        ]:
+            value = env_context.get(key)
+            if value not in (None, "", [], {}, ()):  # noqa: PLC1901
+                reason_parts[key] = value
+
         final_gate = self._merge_gate_actions(*gate_candidates) or "ALLOW"
 
         weekly_cap = to_float(env_context.get("weekly_plan_a_exposure_cap"))
         daily_pos_hint = to_float(env_context.get("position_hint"))
+        daily_cap_multiplier = to_float(env_context.get("daily_cap_multiplier")) or 1.0
+        live_cap_multiplier = to_float(env_context.get("env_live_cap_multiplier")) or 1.0
         breadth_pct = to_float(env_context.get("breadth_pct_above_ma20"))
         breadth_factor = (
             0.6 + 0.4 * breadth_pct if breadth_pct is not None else 1.0
@@ -802,24 +904,18 @@ class WeeklyEnvironmentBuilder:
             elif breadth_pct <= 0.05:
                 breadth_factor = min(breadth_factor, 0.75)
                 reason_parts["breadth_saturation"] = "RISK_OFF_WASHOUT"
-        daily_cap = (
-            daily_pos_hint * breadth_factor
-            if daily_pos_hint is not None
-            else None
-        )
 
-        cap_candidates = [
-            weekly_cap,
-            daily_cap,
-            to_float(env_context.get("effective_position_hint")),
-            to_float(env_context.get("position_hint")),
-        ]
+        cap_candidates = [weekly_cap, daily_pos_hint]
         filtered_caps = [c for c in cap_candidates if c is not None]
-        final_cap = min(filtered_caps) if filtered_caps else 1.0
+        base_cap = min(filtered_caps) if filtered_caps else 1.0
+        final_cap = base_cap * daily_cap_multiplier * breadth_factor * live_cap_multiplier
         final_cap = min(max(final_cap, 0.0), 1.0)
         env_context["env_final_gate_action"] = final_gate
         env_context["env_final_cap_pct"] = final_cap
-        env_context["env_final_reason_json"] = self._clip(json.dumps(reason_parts, ensure_ascii=False), 2000)
+        env_context["env_final_reason_json"] = self._clip(
+            json.dumps(reason_parts, ensure_ascii=False, default=self._json_default),
+            2000,
+        )
 
     @property
     def calendar_cache(self) -> set[str]:
@@ -828,3 +924,9 @@ class WeeklyEnvironmentBuilder:
     @property
     def calendar_range(self) -> tuple[dt.date, dt.date] | None:
         return self._calendar_range
+
+    @staticmethod
+    def _json_default(obj: Any) -> str:
+        if isinstance(obj, (dt.date, dt.datetime)):
+            return obj.isoformat()
+        return str(obj)

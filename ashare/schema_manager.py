@@ -111,6 +111,7 @@ class SchemaManager:
             tables.open_monitor_env_view,
             tables.env_snapshot_table,
             tables.weekly_indicator_table,
+            tables.daily_indicator_table,
             tables.open_monitor_run_table,
         )
 
@@ -1389,6 +1390,12 @@ class SchemaManager:
             "env_final_gate_action": "VARCHAR(16) NULL",
             "env_final_cap_pct": "DOUBLE NULL",
             "env_final_reason_json": "TEXT NULL",
+            "env_weekly_zone_id": "VARCHAR(32) NULL",
+            "env_daily_zone_id": "VARCHAR(32) NULL",
+            "env_live_override_action": "VARCHAR(16) NULL",
+            "env_live_cap_multiplier": "DOUBLE NULL",
+            "env_live_event_tags": "VARCHAR(255) NULL",
+            "env_live_reason": "VARCHAR(255) NULL",
             "env_index_snapshot_hash": "CHAR(32) NULL",
             "env_index_score": "INT NULL",
             "env_regime": "VARCHAR(32) NULL",
@@ -1434,12 +1441,18 @@ class SchemaManager:
         self._ensure_numeric_column(table, "env_final_cap_pct", "DOUBLE NULL")
         self._ensure_numeric_column(table, "env_position_hint", "DOUBLE NULL")
         self._ensure_numeric_column(table, "env_index_score", "INT NULL")
+        self._ensure_numeric_column(table, "env_live_cap_multiplier", "DOUBLE NULL")
         self._ensure_numeric_column(table, "run_pk", "BIGINT NOT NULL")
         self._ensure_date_column(table, "env_index_asof_trade_date", not_null=False)
         self._ensure_date_column(table, "env_index_live_trade_date", not_null=False)
         self._ensure_varchar_length(table, "env_index_code", 16)
         self._ensure_varchar_length(table, "env_index_gate_action", 16)
         self._ensure_varchar_length(table, "env_index_gate_reason", 255)
+        self._ensure_varchar_length(table, "env_weekly_zone_id", 32)
+        self._ensure_varchar_length(table, "env_daily_zone_id", 32)
+        self._ensure_varchar_length(table, "env_live_override_action", 16)
+        self._ensure_varchar_length(table, "env_live_event_tags", 255)
+        self._ensure_varchar_length(table, "env_live_reason", 255)
 
         unique_name = "ux_env_snapshot_run"
         if not self._index_exists(table, unique_name):
@@ -1485,6 +1498,7 @@ class SchemaManager:
         view: str,
         env_table: str,
         weekly_table: str,
+        daily_table: str,
         run_table: str,
     ) -> None:
         if not view:
@@ -1499,6 +1513,12 @@ class SchemaManager:
             self._drop_relation(view)
             return
         if not self._table_exists(weekly_table):
+            self._drop_relation(view)
+            return
+        if not daily_table:
+            self._drop_relation(view)
+            return
+        if not self._table_exists(daily_table):
             self._drop_relation(view)
             return
         if not self._table_exists(run_table):
@@ -1518,6 +1538,12 @@ class SchemaManager:
               env.`env_weekly_asof_trade_date`,
               env.`env_daily_asof_trade_date`,
               env.`env_final_reason_json`,
+              env.`env_weekly_zone_id`,
+              env.`env_daily_zone_id`,
+              env.`env_live_override_action`,
+              env.`env_live_cap_multiplier`,
+              env.`env_live_event_tags`,
+              env.`env_live_reason`,
               env.`env_index_score`,
               env.`env_regime`,
               env.`env_position_hint`,
@@ -1528,10 +1554,17 @@ class SchemaManager:
               weekly.`weekly_pattern_status` AS `env_weekly_pattern_status`,
               weekly.`weekly_plan_a_exposure_cap` AS `env_weekly_plan_a_exposure_cap`,
               weekly.`weekly_key_levels_str` AS `env_weekly_key_levels_str`,
+              weekly.`weekly_zone_score` AS `env_weekly_zone_score`,
+              weekly.`weekly_exp_return_bucket` AS `env_weekly_exp_return_bucket`,
               weekly.`weekly_money_proxy` AS `env_weekly_money_proxy`,
               weekly.`weekly_tags` AS `env_weekly_tags`,
               weekly.`weekly_note` AS `env_weekly_note`,
               weekly.`weekly_gate_policy` AS `env_weekly_gate_action`,
+              daily.`daily_zone_score` AS `env_daily_zone_score`,
+              daily.`daily_cap_multiplier` AS `env_daily_cap_multiplier`,
+              daily.`daily_zone_reason` AS `env_daily_zone_reason`,
+              daily.`bb_pos` AS `env_daily_bb_pos`,
+              daily.`bb_width` AS `env_daily_bb_width`,
               env.`env_index_code`,
               env.`env_index_asof_trade_date`,
               env.`env_index_live_trade_date`,
@@ -1557,6 +1590,9 @@ class SchemaManager:
             LEFT JOIN `{weekly_table}` weekly
               ON env.`env_weekly_asof_trade_date` = weekly.`weekly_asof_trade_date`
              AND weekly.`benchmark_code` = '{WEEKLY_MARKET_BENCHMARK_CODE}'
+            LEFT JOIN `{daily_table}` daily
+              ON env.`env_daily_asof_trade_date` = daily.`asof_trade_date`
+             AND daily.`benchmark_code` = '{WEEKLY_MARKET_BENCHMARK_CODE}'
             """
         )
         with self.engine.begin() as conn:
@@ -1576,6 +1612,10 @@ class SchemaManager:
             "weekly_gate_policy": "VARCHAR(16) NULL",
             "weekly_plan_a_exposure_cap": "DOUBLE NULL",
             "weekly_key_levels_str": "VARCHAR(255) NULL",
+            "weekly_zone_id": "VARCHAR(32) NULL",
+            "weekly_zone_score": "INT NULL",
+            "weekly_exp_return_bucket": "VARCHAR(16) NULL",
+            "weekly_zone_reason": "VARCHAR(255) NULL",
             "weekly_money_proxy": "VARCHAR(255) NULL",
             "weekly_tags": "VARCHAR(255) NULL",
             "weekly_note": "VARCHAR(255) NULL",
@@ -1605,6 +1645,11 @@ class SchemaManager:
             "macd_hist": "DOUBLE NULL",
             "atr14": "DOUBLE NULL",
             "dev_ma20_atr": "DOUBLE NULL",
+            "bb_mid": "DOUBLE NULL",
+            "bb_upper": "DOUBLE NULL",
+            "bb_lower": "DOUBLE NULL",
+            "bb_width": "DOUBLE NULL",
+            "bb_pos": "DOUBLE NULL",
             "cycle_phase": "VARCHAR(32) NULL",
             "cycle_weekly_asof_trade_date": "DATE NULL",
             "cycle_weekly_scene_code": "VARCHAR(64) NULL",
@@ -1612,6 +1657,10 @@ class SchemaManager:
             "breadth_pct_above_ma60": "DOUBLE NULL",
             "breadth_risk_off_ratio": "DOUBLE NULL",
             "dispersion_score": "DOUBLE NULL",
+            "daily_zone_id": "VARCHAR(32) NULL",
+            "daily_zone_score": "INT NULL",
+            "daily_cap_multiplier": "DOUBLE NULL",
+            "daily_zone_reason": "VARCHAR(255) NULL",
             "components_json": "LONGTEXT NULL",
         }
         if not self._table_exists(table):

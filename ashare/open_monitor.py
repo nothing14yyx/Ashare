@@ -27,7 +27,6 @@ from typing import Any, Callable, List
 
 import pandas as pd
 
-from . import env_snapshot_utils
 from .config import get_section
 from .db import DatabaseConfig, MySQLWriter
 from .monitor_rules import MonitorRuleConfig, build_default_monitor_rules
@@ -37,7 +36,6 @@ from .open_monitor_eval import (
     merge_gate_actions,
 )
 from .open_monitor_market_data import OpenMonitorMarketData
-from .open_monitor_consts import ENV_RUN_PREOPEN
 from .open_monitor_repo import OpenMonitorRepository, calc_run_id
 from .open_monitor_rules import Rule, RuleEngine, RuleResult
 from .market_indicator_builder import MarketIndicatorBuilder
@@ -382,20 +380,19 @@ class MA5MA20OpenMonitorRunner:
         codes = signals["code"].dropna().astype(str).unique().tolist()
         self.logger.info("待监测标的数量：%s（信号日：%s）", len(codes), signal_dates)
 
-        env_run_pk = self.repo.get_env_broadcast_run_pk(monitor_date, ENV_RUN_PREOPEN)
-        if env_run_pk is None:
-            self.logger.error(
-                "未找到环境广播 run_pk（monitor_date=%s, run_id=%s），本次开盘监测终止。",
-                monitor_date,
-                ENV_RUN_PREOPEN,
-            )
-            return
-        env_context = self.env_service.load_env_snapshot_context(monitor_date, env_run_pk)
+        env_context = self.build_and_persist_env_snapshot(
+            latest_trade_date,
+            monitor_date=monitor_date,
+            run_id=run_id,
+            run_pk=run_pk,
+            checked_at=checked_at,
+            allow_auto_compute=True,
+        )
         if not env_context:
             self.logger.error(
-                "未找到环境广播快照（monitor_date=%s, run_id=%s），本次开盘监测终止。",
+                "未构建环境快照（monitor_date=%s, run_id=%s），本次开盘监测终止。",
                 monitor_date,
-                ENV_RUN_PREOPEN,
+                run_id,
             )
             return
 
@@ -424,22 +421,11 @@ class MA5MA20OpenMonitorRunner:
         }
         env_final_gate_action = env_instruction.get("gate_status")
         self.logger.info(
-            "已加载环境广播（monitor_date=%s, run_id=%s, gate=%s）。",
+            "已构建环境快照（monitor_date=%s, run_id=%s, gate=%s）。",
             monitor_date,
-            ENV_RUN_PREOPEN,
+            run_id,
             env_final_gate_action,
         )
-        try:
-            self.env_service.attach_index_snapshot(
-                latest_trade_date,
-                monitor_date,
-                run_id,
-                checked_at,
-                env_context,
-                fetch_index_live_quote=self.market_data.fetch_index_live_quote,
-            )
-        except Exception as exc:  # noqa: BLE001
-            self.logger.debug("记录指数快照失败（将继续评估）：%s", exc)
         result = self.evaluator.evaluate(
             signals,
             quotes,
