@@ -46,6 +46,10 @@ class MarketIndicatorBuilder:
 
         weekly_asof = weekly_scenario.get("weekly_asof_trade_date") or asof_trade_date
         weekly_gate_policy = env_context.get("weekly_gate_policy")
+        weekly_zone_id = env_context.get("weekly_zone_id")
+        weekly_zone_score = env_context.get("weekly_zone_score")
+        weekly_exp_return_bucket = env_context.get("weekly_exp_return_bucket")
+        weekly_zone_reason = env_context.get("weekly_zone_reason")
         weekly_money_proxy = env_context.get("weekly_money_proxy")
         weekly_tags = env_context.get("weekly_tags")
         weekly_note = env_context.get("weekly_note")
@@ -65,6 +69,10 @@ class MarketIndicatorBuilder:
                 "weekly_gate_policy": weekly_gate_policy,
                 "weekly_plan_a_exposure_cap": weekly_scenario.get("weekly_plan_a_exposure_cap"),
                 "weekly_key_levels_str": weekly_scenario.get("weekly_key_levels_str"),
+                "weekly_zone_id": weekly_zone_id,
+                "weekly_zone_score": weekly_zone_score,
+                "weekly_exp_return_bucket": weekly_exp_return_bucket,
+                "weekly_zone_reason": weekly_zone_reason,
                 "weekly_money_proxy": weekly_money_proxy,
                 "weekly_tags": weekly_tags,
                 "weekly_note": weekly_note,
@@ -164,6 +172,19 @@ class MarketIndicatorBuilder:
             grp["ma20"] = close.rolling(20, min_periods=20).mean()
             grp["ma60"] = close.rolling(60, min_periods=60).mean()
             grp["ma250"] = close.rolling(250, min_periods=250).mean()
+            std20 = close.rolling(20, min_periods=20).std()
+            grp["bb_mid"] = grp["ma20"]
+            grp["bb_upper"] = grp["bb_mid"] + 2 * std20
+            grp["bb_lower"] = grp["bb_mid"] - 2 * std20
+            bb_range = grp["bb_upper"] - grp["bb_lower"]
+            grp["bb_width"] = bb_range / grp["bb_mid"]
+            grp["bb_pos"] = (close - grp["bb_lower"]) / bb_range
+            zero_range = bb_range == 0
+            if zero_range.any():
+                grp.loc[zero_range, "bb_pos"] = None
+            zero_mid = grp["bb_mid"] == 0
+            if zero_mid.any():
+                grp.loc[zero_mid, "bb_width"] = None
             dif, dea, hist = _macd(close)
             grp["macd_hist"] = hist
             preclose = close.shift(1)
@@ -280,6 +301,11 @@ class MarketIndicatorBuilder:
                 "macd_hist",
                 "atr14",
                 "dev_ma20_atr",
+                "bb_mid",
+                "bb_upper",
+                "bb_lower",
+                "bb_width",
+                "bb_pos",
             ]
         ]
 
@@ -326,6 +352,10 @@ class MarketIndicatorBuilder:
             daily_env.loc[invalid_ma_mask, "position_hint"] = None
             daily_env.loc[invalid_ma_mask, "score"] = None
 
+        zone_payloads = [self._resolve_daily_zone(row) for _, row in daily_env.iterrows()]
+        zone_df = pd.DataFrame(zone_payloads)
+        daily_env = pd.concat([daily_env.reset_index(drop=True), zone_df], axis=1)
+
         rows: list[dict[str, Any]] = []
         for _, row in daily_env.iterrows():
             rows.append(
@@ -341,11 +371,20 @@ class MarketIndicatorBuilder:
                     "macd_hist": row.get("macd_hist"),
                     "atr14": row.get("atr14"),
                     "dev_ma20_atr": row.get("dev_ma20_atr"),
+                    "bb_mid": row.get("bb_mid"),
+                    "bb_upper": row.get("bb_upper"),
+                    "bb_lower": row.get("bb_lower"),
+                    "bb_width": row.get("bb_width"),
+                    "bb_pos": row.get("bb_pos"),
                     "cycle_phase": None,
                     "breadth_pct_above_ma20": row.get("breadth_pct_above_ma20"),
                     "breadth_pct_above_ma60": row.get("breadth_pct_above_ma60"),
                     "breadth_risk_off_ratio": row.get("breadth_risk_off_ratio"),
                     "dispersion_score": row.get("dispersion_score"),
+                    "daily_zone_id": row.get("daily_zone_id"),
+                    "daily_zone_score": row.get("daily_zone_score"),
+                    "daily_cap_multiplier": row.get("daily_cap_multiplier"),
+                    "daily_zone_reason": row.get("daily_zone_reason"),
                     "components_json": row.get("components_json"),
                 }
             )
@@ -440,3 +479,68 @@ class MarketIndicatorBuilder:
                 "dispersion_score": dispersion,
             }
         )
+
+    @staticmethod
+    def _resolve_daily_zone(row: pd.Series) -> dict[str, Any]:
+        def _as_float(val: Any) -> float | None:
+            try:
+                if pd.isna(val):
+                    return None
+            except Exception:
+                pass
+            try:
+                return float(val)
+            except Exception:
+                return None
+
+        regime = str(row.get("regime") or "").upper()
+        bb_pos = _as_float(row.get("bb_pos"))
+        bb_width = _as_float(row.get("bb_width"))
+
+        zone_id = "DZ_NEUTRAL"
+        zone_score = 50
+        cap_multiplier = 1.0
+        reason_parts: list[str] = []
+
+        if regime == "UNKNOWN":
+            zone_id = "DZ_UNKNOWN"
+            zone_score = 50
+            cap_multiplier = 1.0
+            reason_parts.append("regime=UNKNOWN")
+        elif regime in {"BREAKDOWN", "BEAR_CONFIRMED"}:
+            zone_id = "DZ_BREAKDOWN"
+            zone_score = 10
+            cap_multiplier = 0.2
+            reason_parts.append(f"regime={regime}")
+        elif bb_pos is not None:
+            if bb_pos <= 0.15:
+                zone_id = "DZ_LOW_EDGE"
+                zone_score = 40
+                cap_multiplier = 0.6
+                reason_parts.append(f"bb_pos={bb_pos:.2f}")
+            elif bb_pos >= 0.85:
+                if bb_width is not None and bb_width >= 0.12:
+                    zone_id = "DZ_OVERHEAT"
+                    zone_score = 30
+                    cap_multiplier = 0.5
+                    reason_parts.append(f"bb_pos={bb_pos:.2f}")
+                    reason_parts.append(f"bb_width={bb_width:.2f}")
+                else:
+                    zone_id = "DZ_HIGH_EDGE"
+                    zone_score = 60
+                    cap_multiplier = 0.9
+                    reason_parts.append(f"bb_pos={bb_pos:.2f}")
+            else:
+                reason_parts.append(f"bb_pos={bb_pos:.2f}")
+        else:
+            reason_parts.append("bb_pos=NA")
+
+        if regime and regime != "UNKNOWN":
+            reason_parts.append(f"regime={regime}")
+
+        return {
+            "daily_zone_id": zone_id,
+            "daily_zone_score": zone_score,
+            "daily_cap_multiplier": cap_multiplier,
+            "daily_zone_reason": ";".join(reason_parts)[:255] if reason_parts else None,
+        }

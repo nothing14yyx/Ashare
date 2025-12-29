@@ -89,6 +89,10 @@ class OpenMonitorEnvService:
             "weekly_pattern_status": weekly_indicator.get("weekly_pattern_status"),
             "weekly_plan_a_exposure_cap": weekly_indicator.get("weekly_plan_a_exposure_cap"),
             "weekly_key_levels_str": weekly_indicator.get("weekly_key_levels_str"),
+            "weekly_zone_id": weekly_indicator.get("weekly_zone_id"),
+            "weekly_zone_score": weekly_indicator.get("weekly_zone_score"),
+            "weekly_exp_return_bucket": weekly_indicator.get("weekly_exp_return_bucket"),
+            "weekly_zone_reason": weekly_indicator.get("weekly_zone_reason"),
             "weekly_money_proxy": weekly_indicator.get("weekly_money_proxy"),
             "weekly_tags": weekly_indicator.get("weekly_tags"),
             "weekly_note": weekly_indicator.get("weekly_note"),
@@ -127,6 +131,10 @@ class OpenMonitorEnvService:
             "weekly_phase": weekly_scenario.get("weekly_phase"),
             "weekly_gate_policy": weekly_scenario.get("weekly_gate_policy"),
             "weekly_gate_action": weekly_scenario.get("weekly_gate_action"),
+            "weekly_zone_id": weekly_scenario.get("weekly_zone_id") or row.get("env_weekly_zone_id"),
+            "weekly_zone_score": weekly_scenario.get("weekly_zone_score"),
+            "weekly_exp_return_bucket": weekly_scenario.get("weekly_exp_return_bucket"),
+            "weekly_zone_reason": weekly_scenario.get("weekly_zone_reason"),
             "regime": (daily_env or {}).get("regime") or row.get("env_regime"),
             "index_score": (daily_env or {}).get("score") or row.get("env_index_score"),
             "position_hint": (daily_env or {}).get("position_hint")
@@ -143,6 +151,15 @@ class OpenMonitorEnvService:
             "daily_macd_hist": (daily_env or {}).get("macd_hist"),
             "daily_atr14": (daily_env or {}).get("atr14"),
             "daily_dev_ma20_atr": (daily_env or {}).get("dev_ma20_atr"),
+            "daily_bb_mid": (daily_env or {}).get("bb_mid"),
+            "daily_bb_upper": (daily_env or {}).get("bb_upper"),
+            "daily_bb_lower": (daily_env or {}).get("bb_lower"),
+            "daily_bb_width": (daily_env or {}).get("bb_width"),
+            "daily_bb_pos": (daily_env or {}).get("bb_pos"),
+            "daily_zone_id": (daily_env or {}).get("daily_zone_id") or row.get("env_daily_zone_id"),
+            "daily_zone_score": (daily_env or {}).get("daily_zone_score"),
+            "daily_cap_multiplier": (daily_env or {}).get("daily_cap_multiplier"),
+            "daily_zone_reason": (daily_env or {}).get("daily_zone_reason"),
             "breadth_pct_above_ma20": (daily_env or {}).get("breadth_pct_above_ma20"),
             "breadth_pct_above_ma60": (daily_env or {}).get("breadth_pct_above_ma60"),
             "breadth_risk_off_ratio": (daily_env or {}).get("breadth_risk_off_ratio"),
@@ -151,6 +168,10 @@ class OpenMonitorEnvService:
             "env_final_gate_action": row.get("env_final_gate_action"),
             "env_final_cap_pct": row.get("env_final_cap_pct"),
             "env_final_reason_json": row.get("env_final_reason_json"),
+            "env_live_override_action": row.get("env_live_override_action"),
+            "env_live_cap_multiplier": row.get("env_live_cap_multiplier"),
+            "env_live_event_tags": row.get("env_live_event_tags"),
+            "env_live_reason": row.get("env_live_reason"),
         }
         env_context["index_intraday"] = index_snapshot
 
@@ -226,6 +247,10 @@ class OpenMonitorEnvService:
             "weekly_gate_action": weekly_indicator.get("weekly_gate_policy"),
             "weekly_plan_a_exposure_cap": weekly_indicator.get("weekly_plan_a_exposure_cap"),
             "weekly_key_levels_str": weekly_indicator.get("weekly_key_levels_str"),
+            "weekly_zone_id": weekly_indicator.get("weekly_zone_id"),
+            "weekly_zone_score": weekly_indicator.get("weekly_zone_score"),
+            "weekly_exp_return_bucket": weekly_indicator.get("weekly_exp_return_bucket"),
+            "weekly_zone_reason": weekly_indicator.get("weekly_zone_reason"),
             "weekly_money_proxy": weekly_indicator.get("weekly_money_proxy"),
             "weekly_tags": weekly_indicator.get("weekly_tags"),
             "weekly_note": weekly_indicator.get("weekly_note"),
@@ -248,6 +273,10 @@ class OpenMonitorEnvService:
             "weekly_note": weekly_scenario.get("weekly_note"),
             "weekly_gate_policy": weekly_gate_policy,
             "weekly_gate_action": weekly_gate_policy,
+            "weekly_zone_id": weekly_scenario.get("weekly_zone_id"),
+            "weekly_zone_score": weekly_scenario.get("weekly_zone_score"),
+            "weekly_exp_return_bucket": weekly_scenario.get("weekly_exp_return_bucket"),
+            "weekly_zone_reason": weekly_scenario.get("weekly_zone_reason"),
             "daily_asof_trade_date": daily_env.get("asof_trade_date")
             if daily_env
             else latest_trade_date,
@@ -270,6 +299,17 @@ class OpenMonitorEnvService:
             "daily_dev_ma20_atr": _to_float(daily_env.get("dev_ma20_atr"))
             if daily_env
             else None,
+            "daily_bb_mid": _to_float(daily_env.get("bb_mid")) if daily_env else None,
+            "daily_bb_upper": _to_float(daily_env.get("bb_upper")) if daily_env else None,
+            "daily_bb_lower": _to_float(daily_env.get("bb_lower")) if daily_env else None,
+            "daily_bb_width": _to_float(daily_env.get("bb_width")) if daily_env else None,
+            "daily_bb_pos": _to_float(daily_env.get("bb_pos")) if daily_env else None,
+            "daily_zone_id": daily_env.get("daily_zone_id") if daily_env else None,
+            "daily_zone_score": daily_env.get("daily_zone_score") if daily_env else None,
+            "daily_cap_multiplier": _to_float(daily_env.get("daily_cap_multiplier"))
+            if daily_env
+            else None,
+            "daily_zone_reason": daily_env.get("daily_zone_reason") if daily_env else None,
             "breadth_pct_above_ma20": _to_float(daily_env.get("breadth_pct_above_ma20"))
             if daily_env
             else None,
@@ -416,6 +456,80 @@ class OpenMonitorEnvService:
 
         return snapshot
 
+    @staticmethod
+    def _merge_live_actions(actions: list[str]) -> str:
+        severity = {"EXIT": 3, "PAUSE": 2, "REDUCE": 1, "NONE": 0}
+        if not actions:
+            return "NONE"
+        normalized = [str(action).strip().upper() for action in actions if action]
+        if not normalized:
+            return "NONE"
+        normalized.sort(key=lambda x: severity.get(x, 0), reverse=True)
+        return normalized[0]
+
+    def evaluate_live_override(
+        self, env_context: dict[str, Any], index_snapshot: dict[str, Any]
+    ) -> dict[str, Any]:
+        live_pct = _to_float(index_snapshot.get("env_index_live_pct_change"))
+        live_latest = _to_float(index_snapshot.get("env_index_live_latest"))
+        live_dev_ma20_atr = _to_float(index_snapshot.get("env_index_dev_ma20_atr"))
+        daily_ma20 = _to_float(env_context.get("daily_ma20"))
+        daily_bb_lower = _to_float(env_context.get("daily_bb_lower"))
+        daily_bb_upper = _to_float(env_context.get("daily_bb_upper"))
+        daily_bb_width = _to_float(env_context.get("daily_bb_width"))
+
+        actions: list[str] = []
+        cap_candidates: list[float] = []
+        events: list[str] = []
+
+        if live_pct is not None:
+            if live_pct <= -0.03:
+                actions.append("PAUSE")
+                cap_candidates.append(0.0)
+                events.append("INTRADAY_CRASH")
+            elif live_pct <= -0.02:
+                actions.append("REDUCE")
+                cap_candidates.append(0.25)
+                events.append("INTRADAY_DROP")
+
+        if live_latest is not None and daily_bb_lower is not None:
+            if live_latest < daily_bb_lower:
+                actions.append("PAUSE")
+                cap_candidates.append(0.0)
+                events.append("BB_BREAK_LOWER")
+
+        if (
+            live_latest is not None
+            and daily_ma20 is not None
+            and live_dev_ma20_atr is not None
+            and live_latest < daily_ma20
+            and live_dev_ma20_atr <= -1.2
+        ):
+            actions.append("REDUCE")
+            cap_candidates.append(0.5)
+            events.append("BREAK_MA20")
+
+        if (
+            live_latest is not None
+            and daily_bb_upper is not None
+            and daily_bb_width is not None
+            and live_latest > daily_bb_upper
+            and daily_bb_width >= 0.12
+        ):
+            actions.append("REDUCE")
+            cap_candidates.append(0.5)
+            events.append("BB_OVERHEAT")
+
+        action = self._merge_live_actions(actions)
+        cap_multiplier = min(cap_candidates) if cap_candidates else 1.0
+        reason = ";".join(events)[:255] if events else None
+        return {
+            "env_live_override_action": action,
+            "env_live_cap_multiplier": cap_multiplier,
+            "env_live_event_tags": ";".join(events)[:255] if events else None,
+            "env_live_reason": reason,
+        }
+
     def attach_index_snapshot(
         self,
         latest_trade_date: str,
@@ -503,6 +617,8 @@ class OpenMonitorEnvService:
             env_index_snapshot_hash = index_snapshot_payload["snapshot_hash"]
             index_env_snapshot["env_index_snapshot_hash"] = env_index_snapshot_hash
             ctx["index_intraday"] = index_env_snapshot
+            live_override = self.evaluate_live_override(ctx, index_env_snapshot)
+            ctx.update(live_override)
 
         if index_env_snapshot:
             gate_action = index_env_snapshot.get("env_index_gate_action")

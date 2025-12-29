@@ -1527,6 +1527,12 @@ class OpenMonitorRepository:
                 run_pk,
             )
             return
+        payload["env_weekly_zone_id"] = env_context.get("weekly_zone_id")
+        payload["env_daily_zone_id"] = env_context.get("daily_zone_id")
+        payload["env_live_override_action"] = env_context.get("env_live_override_action")
+        payload["env_live_cap_multiplier"] = _to_float(env_context.get("env_live_cap_multiplier"))
+        payload["env_live_event_tags"] = env_context.get("env_live_event_tags")
+        payload["env_live_reason"] = env_context.get("env_live_reason")
         cap_candidates = [
             env_context.get("env_final_cap_pct") if isinstance(env_context, dict) else None,
             env_context.get("effective_position_hint") if isinstance(env_context, dict) else None,
