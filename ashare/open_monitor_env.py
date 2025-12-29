@@ -338,6 +338,20 @@ class OpenMonitorEnvService:
         self.env_builder._finalize_env_directives(
             env_context, weekly_gate_policy=weekly_gate_policy
         )
+
+        # 补充板块强弱映射：用于展示/排序的 board_status（不影响 gate/action/入库）
+        board_map: dict[str, dict[str, Any]] = {}
+        try:
+            from .open_monitor_eval import OpenMonitorEvaluator
+
+            board_strength = self.env_builder.load_board_spot_strength(
+                latest_trade_date, checked_at
+            )
+            board_map = OpenMonitorEvaluator.build_board_map_from_strength(board_strength)
+        except Exception:  # noqa: BLE001
+            board_map = {}
+
+        env_context["boards"] = board_map
         return env_context
 
     def build_and_persist_open_monitor_env(
@@ -590,6 +604,12 @@ class OpenMonitorEnvService:
 
             asof_indicators = self.repo.load_index_history(latest_trade_date)
             live_quote = fetch_index_live_quote() if fetch_index_live_quote else {}
+            if isinstance(live_quote, dict):
+                live_trade_date = live_quote.get("live_trade_date")
+                if pd.isna(live_trade_date) or (
+                    isinstance(live_trade_date, str) and not live_trade_date.strip()
+                ):
+                    live_quote["live_trade_date"] = monitor_date
             index_env_snapshot = self._build_index_env_snapshot(
                 asof_indicators,
                 live_quote,

@@ -443,7 +443,7 @@ class MA5MA20OpenMonitorRunner:
 
         if result.empty:
             return
-        ranked_df, rank_meta = self.evaluator.build_rank_frame(result, env_payload)
+        ranked_df, rank_meta = self.evaluator.build_rank_frame(result, env_context)
         if rank_meta:
             self.logger.info(
                 "展示排序权重(不影响 gate/action/入库)：market_weight=%.2f（%s） board_weight=%s stock_quality=%s",
