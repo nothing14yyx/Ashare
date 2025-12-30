@@ -318,6 +318,39 @@ class SchemaManager:
             }
         return meta
 
+    def _primary_key_columns(self, table: str) -> list[str]:
+        condition = "TABLE_SCHEMA = :schema" if self.db_name else "TABLE_SCHEMA = DATABASE()"
+        stmt = text(
+            f"""
+            SELECT COLUMN_NAME
+            FROM information_schema.KEY_COLUMN_USAGE
+            WHERE {condition}
+              AND TABLE_NAME = :table
+              AND CONSTRAINT_NAME = 'PRIMARY'
+            ORDER BY ORDINAL_POSITION
+            """
+        )
+        params: Dict[str, str] = {"table": table}
+        if self.db_name:
+            params["schema"] = str(self.db_name)
+        with self.engine.connect() as conn:
+            rows = conn.execute(stmt, params).fetchall()
+        return [str(row[0]) for row in rows]
+
+    def _ensure_primary_key(self, table: str, columns: Iterable[str]) -> None:
+        target = [str(col) for col in columns]
+        if not target:
+            return
+        existing = self._primary_key_columns(table)
+        if existing == target:
+            return
+        with self.engine.begin() as conn:
+            if existing:
+                conn.execute(text(f"ALTER TABLE `{table}` DROP PRIMARY KEY"))
+            pk_clause = ", ".join(f"`{col}`" for col in target)
+            conn.execute(text(f"ALTER TABLE `{table}` ADD PRIMARY KEY ({pk_clause})"))
+        self.logger.info("表 %s 主键已调整为 (%s)。", table, ", ".join(target))
+
     def _add_missing_columns(self, table: str, columns: Dict[str, str]) -> None:
         existing = set(self._column_meta(table).keys())
         to_add = [(col, ddl) for col, ddl in columns.items() if col not in existing]
@@ -843,6 +876,21 @@ class SchemaManager:
                 )
             self.logger.info("信号事件表 %s 已新增唯一索引 %s。", table, unique_name)
 
+        meta = self._column_meta(table)
+        if "expires_on" in meta and "valid_days" in meta:
+            stmt = text(
+                f"""
+                UPDATE `{table}`
+                SET `expires_on` = DATE_ADD(`sig_date`, INTERVAL `valid_days` DAY)
+                WHERE `expires_on` IS NULL AND `valid_days` IS NOT NULL
+                """
+            )
+            with self.engine.begin() as conn:
+                result = conn.execute(stmt)
+            updated = int(getattr(result, "rowcount", 0) or 0)
+            if updated:
+                self.logger.info("信号事件表 %s 已回填 expires_on：%s 条。", table, updated)
+
     def _ensure_strategy_candidates_table(self) -> None:
         table = TABLE_STRATEGY_CANDIDATES
         columns = {
@@ -1263,7 +1311,7 @@ class SchemaManager:
     def _ensure_open_monitor_quote_table(self, table: str) -> None:
         columns = {
             "monitor_date": "DATE NOT NULL",
-            "run_id": "VARCHAR(64) NOT NULL",
+            "run_pk": "BIGINT NOT NULL",
             "code": "VARCHAR(20) NOT NULL",
             "live_trade_date": "DATE NULL",
             "live_open": "DOUBLE NULL",
@@ -1277,14 +1325,15 @@ class SchemaManager:
             self._create_table(
                 table,
                 columns,
-                primary_key=("monitor_date", "run_id", "code"),
+                primary_key=("run_pk", "code"),
             )
             return
         self._add_missing_columns(table, columns)
-        self._drop_columns(table, ["run_pk"])
-        self._ensure_varchar_length(table, "run_id", 64)
+        self._drop_columns(table, ["run_id"])
         self._ensure_date_column(table, "monitor_date", not_null=True)
         self._ensure_date_column(table, "live_trade_date", not_null=False)
+        self._ensure_numeric_column(table, "run_pk", "BIGINT NOT NULL")
+        self._ensure_primary_key(table, ("run_pk", "code"))
 
         unique_name = "ux_open_monitor_quote_run"
         if not self._index_exists(table, unique_name):
@@ -1293,7 +1342,7 @@ class SchemaManager:
                     text(
                         f"""
                         CREATE UNIQUE INDEX `{unique_name}`
-                        ON `{table}` (`monitor_date`, `run_id`, `code`)
+                        ON `{table}` (`monitor_date`, `run_pk`, `code`)
                         """
                     )
                 )
@@ -1303,11 +1352,11 @@ class SchemaManager:
         columns = {
             "monitor_date": "DATE NOT NULL",
             "sig_date": "DATE NOT NULL",
-            "run_id": "VARCHAR(64) NOT NULL",
+            "run_pk": "BIGINT NOT NULL",
+            "strategy_code": "VARCHAR(32) NOT NULL",
             "asof_trade_date": "DATE NULL",
             "live_trade_date": "DATE NULL",
             "signal_age": "INT NULL",
-            "valid_days": "INT NULL",
             "code": "VARCHAR(20) NOT NULL",
             "live_gap_pct": "DOUBLE NULL",
             "live_pct_change": "DOUBLE NULL",
@@ -1342,14 +1391,15 @@ class SchemaManager:
             self._create_table(
                 table,
                 columns,
-                primary_key=("monitor_date", "sig_date", "code", "run_id"),
+                primary_key=("run_pk", "strategy_code", "sig_date", "code"),
             )
         else:
             self._add_missing_columns(table, columns)
             self._drop_columns(
                 table,
                 [
-                    "run_pk",
+                    "run_id",
+                    "valid_days",
                     "checked_at",
                     "env_index_score",
                     "env_regime",
@@ -1366,16 +1416,19 @@ class SchemaManager:
                 ],
             )
 
-        for col in ["code", "snapshot_hash", "run_id"]:
+        for col in ["code", "snapshot_hash"]:
             self._ensure_varchar_length(table, col, 64 if col == "snapshot_hash" else 64)
+        self._ensure_varchar_length(table, "strategy_code", 32)
         self._ensure_date_column(table, "monitor_date", not_null=True)
         self._ensure_date_column(table, "sig_date", not_null=True)
         self._ensure_date_column(table, "asof_trade_date", not_null=False)
         self._ensure_date_column(table, "live_trade_date", not_null=False)
+        self._ensure_numeric_column(table, "run_pk", "BIGINT NOT NULL")
 
         self._ensure_numeric_column(table, "live_intraday_vol_ratio", "DOUBLE NULL")
         self._ensure_numeric_column(table, "signal_strength", "DOUBLE NULL")
         self._ensure_numeric_column(table, "strength_delta", "DOUBLE NULL")
+        self._ensure_primary_key(table, ("run_pk", "strategy_code", "sig_date", "code"))
 
         self._ensure_open_monitor_indexes(table)
 
@@ -1388,7 +1441,7 @@ class SchemaManager:
                         text(
                             f"""
                             CREATE UNIQUE INDEX `{unique_index}`
-                            ON `{table}` (`monitor_date`, `sig_date`, `code`, `run_id`)
+                            ON `{table}` (`run_pk`, `strategy_code`, `sig_date`, `code`)
                             """
                         )
                     )
@@ -1401,7 +1454,7 @@ class SchemaManager:
             with self.engine.begin() as conn:
                 conn.execute(
                     text(
-                        f"CREATE INDEX `{index_name}` ON `{table}` (`monitor_date`, `code`, `run_id`)"
+                        f"CREATE INDEX `{index_name}` ON `{table}` (`monitor_date`, `code`, `run_pk`)"
                     )
                 )
             self.logger.info("表 %s 已新增索引 %s。", table, index_name)
@@ -1410,9 +1463,17 @@ class SchemaManager:
         if not self._index_exists(table, code_time_index):
             with self.engine.begin() as conn:
                 conn.execute(
-                    text(f"CREATE INDEX `{code_time_index}` ON `{table}` (`code`, `run_id`)")
+                    text(f"CREATE INDEX `{code_time_index}` ON `{table}` (`code`, `run_pk`)")
                 )
             self.logger.info("表 %s 已新增索引 %s。", table, code_time_index)
+
+        run_pk_index = "idx_open_monitor_run_pk"
+        if not self._index_exists(table, run_pk_index):
+            with self.engine.begin() as conn:
+                conn.execute(
+                    text(f"CREATE INDEX `{run_pk_index}` ON `{table}` (`run_pk`)")
+                )
+            self.logger.info("表 %s 已新增索引 %s。", table, run_pk_index)
 
     # ---------- Environment snapshots ----------
     def _ensure_open_monitor_env_table(self, table: str) -> None:
@@ -1424,8 +1485,6 @@ class SchemaManager:
             "env_final_gate_action": "VARCHAR(16) NULL",
             "env_final_cap_pct": "DOUBLE NULL",
             "env_final_reason_json": "TEXT NULL",
-            "env_weekly_zone_id": "VARCHAR(32) NULL",
-            "env_daily_zone_id": "VARCHAR(32) NULL",
             "env_live_override_action": "VARCHAR(16) NULL",
             "env_live_cap_multiplier": "DOUBLE NULL",
             "env_live_event_tags": "VARCHAR(255) NULL",
@@ -1445,6 +1504,8 @@ class SchemaManager:
                     "env_weekly_gate_action",
                     "env_weekly_risk_level",
                     "env_weekly_scene",
+                    "env_weekly_zone_id",
+                    "env_daily_zone_id",
                     "env_index_score",
                     "env_regime",
                     "env_position_hint",
@@ -1475,8 +1536,6 @@ class SchemaManager:
         self._ensure_numeric_column(table, "env_final_cap_pct", "DOUBLE NULL")
         self._ensure_numeric_column(table, "env_live_cap_multiplier", "DOUBLE NULL")
         self._ensure_numeric_column(table, "run_pk", "BIGINT NOT NULL")
-        self._ensure_varchar_length(table, "env_weekly_zone_id", 32)
-        self._ensure_varchar_length(table, "env_daily_zone_id", 32)
         self._ensure_varchar_length(table, "env_live_override_action", 16)
         self._ensure_varchar_length(table, "env_live_event_tags", 255)
         self._ensure_varchar_length(table, "env_live_reason", 255)
@@ -1625,8 +1684,8 @@ class SchemaManager:
               env.`env_weekly_asof_trade_date`,
               env.`env_daily_asof_trade_date`,
               env.`env_final_reason_json`,
-              env.`env_weekly_zone_id`,
-              env.`env_daily_zone_id`,
+              weekly.`weekly_zone_id` AS `env_weekly_zone_id`,
+              daily.`daily_zone_id` AS `env_daily_zone_id`,
               env.`env_live_override_action`,
               env.`env_live_cap_multiplier`,
               env.`env_live_event_tags`,
@@ -1691,7 +1750,7 @@ class SchemaManager:
              AND daily.`benchmark_code` = '{WEEKLY_MARKET_BENCHMARK_CODE}'
             LEFT JOIN `{quote_table}` q
               ON env.`monitor_date` = q.`monitor_date`
-             AND r.`run_id` = q.`run_id`
+             AND env.`run_pk` = q.`run_pk`
              AND q.`code` = '{WEEKLY_MARKET_BENCHMARK_CODE}'
             {index_asof_join}
             """
@@ -1820,7 +1879,7 @@ class SchemaManager:
                 f"""
                 LEFT JOIN `{quote_table}` q
                   ON e.`monitor_date` = q.`monitor_date`
-                 AND e.`run_id` = q.`run_id`
+                 AND e.`run_pk` = q.`run_pk`
                  AND e.`code` = q.`code`
                 """
             )
@@ -1838,7 +1897,9 @@ class SchemaManager:
             SELECT
               e.`monitor_date`,
               e.`sig_date`,
-              e.`run_id`,
+              r.`run_id`,
+              e.`run_pk`,
+              e.`strategy_code`,
               e.`code`,
               {name_expr} AS `name`,
               {industry_expr} AS `industry`,
@@ -1847,7 +1908,6 @@ class SchemaManager:
               e.`asof_trade_date`,
               e.`live_trade_date`,
               e.`signal_age`,
-              e.`valid_days`,
               {live_gap_expr} AS `live_gap_pct`,
               {live_pct_expr} AS `live_pct_change`,
               {live_intraday_expr} AS `live_intraday_vol_ratio`,
@@ -1881,7 +1941,6 @@ class SchemaManager:
               e.`risk_tag`,
               e.`risk_note`,
               e.`snapshot_hash`,
-              r.`run_pk`,
               r.`checked_at`,
               r.`status`,
               {live_open_expr} AS `live_open`,
@@ -1919,10 +1978,9 @@ class SchemaManager:
             FROM `{eval_table}` e
             LEFT JOIN `{env_view}` env
               ON e.`monitor_date` = env.`monitor_date`
-             AND e.`run_id` = env.`run_id`
+             AND e.`run_pk` = env.`run_pk`
             LEFT JOIN `{run_table}` r
-              ON e.`monitor_date` = r.`monitor_date`
-             AND e.`run_id` = r.`run_id`
+              ON e.`run_pk` = r.`run_pk`
             {quote_join}
             {stock_join}
             {board_join}
@@ -1938,6 +1996,7 @@ class SchemaManager:
                 "sig_date",
                 "run_id",
                 "run_pk",
+                "strategy_code",
                 "code",
                 "name",
                 "industry",
