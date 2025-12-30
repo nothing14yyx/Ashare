@@ -77,6 +77,7 @@ class MA5MA20Params:
     # - latest：仅写入最新交易日（默认，低开销）
     # - window：写入本次计算窗口内的全部交易日（用于回填历史/回测）
     signals_write_scope: str = "latest"
+    valid_days: int = 3
 
     @classmethod
     def from_config(cls) -> "MA5MA20Params":
@@ -1478,6 +1479,15 @@ class MA5MA20StrategyRunner:
         events_df["sig_date"] = pd.to_datetime(events_df["sig_date"]).dt.date
         events_df["code"] = events_df["code"].astype(str)
         events_df["strategy_code"] = STRATEGY_CODE_MA5_MA20_TREND
+        try:
+            events_df["valid_days"] = int(getattr(self.params, "valid_days", 3))
+        except Exception:
+            self.logger.warning(
+                "valid_days=%s 解析失败，将跳过有效期字段写入。",
+                getattr(self.params, "valid_days", None),
+            )
+            events_df["valid_days"] = pd.NA
+        events_df["expires_on"] = pd.NA
 
         # 防止同一批信号里存在重复键，导致唯一约束/主键冲突（strategy_code, sig_date, code）
         events_df = events_df.drop_duplicates(subset=["strategy_code", "sig_date", "code"], keep="last").copy()

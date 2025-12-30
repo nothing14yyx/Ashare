@@ -29,6 +29,7 @@ READY_SIGNALS_REQUIRED_COLS = (
     "sig_date",
     "code",
     "strategy_code",
+    "valid_days",
     "close",
     "ma20",
     "atr14",
@@ -505,6 +506,7 @@ class OpenMonitorRepository:
             "sig_date",
             "code",
             "strategy_code",
+            "valid_days",
             "close",
             "ma5",
             "ma20",
@@ -569,24 +571,16 @@ class OpenMonitorRepository:
         trade_age_map = self._load_trade_age_map(latest_trade_date, str(min_date), monitor_date)
         events_df["signal_age"] = events_df["sig_date"].map(trade_age_map)
 
-        # fix: 监控候选在拉行情/评估前按有效期剔除过期信号，避免过期 BUY 进入候选池
-        cross_valid_days = int(getattr(self.params, "cross_valid_days", 3) or 3)
-        pullback_valid_days = int(getattr(self.params, "pullback_valid_days", 5) or 5)
-
-        def _infer_valid_days(row: pd.Series) -> int:
-            kind = str(row.get("signal_kind") or "").upper()
-            reason = str(row.get("sig_reason") or "")
-            is_pullback = ("PULL" in kind) or ("回踩" in reason)
-            return pullback_valid_days if is_pullback else cross_valid_days
-
         if "valid_days" not in events_df.columns:
-            events_df["valid_days"] = events_df.apply(_infer_valid_days, axis=1)
+            self.logger.error("ready_signals_view 缺少 valid_days，已跳过候选信号读取。")
+            return latest_trade_date, [], pd.DataFrame()
+        events_df["valid_days"] = pd.to_numeric(events_df["valid_days"], errors="coerce")
 
         before = len(events_df)
         keep_mask = (
-            events_df["signal_age"].isna()
-            | events_df["valid_days"].isna()
-            | (events_df["signal_age"] <= events_df["valid_days"])
+            events_df["signal_age"].notna()
+            & events_df["valid_days"].notna()
+            & (events_df["signal_age"] <= events_df["valid_days"])
         )
         events_df = events_df.loc[keep_mask].copy()
         dropped = before - len(events_df)
