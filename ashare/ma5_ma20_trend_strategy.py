@@ -329,30 +329,48 @@ class MA5MA20StrategyRunner:
 
         window_latest = trade_dates[0]
         window_earliest = trade_dates[-1]
+        sql_params = {
+            "latest": window_latest,
+            "earliest": window_earliest,
+            "strategy": STRATEGY_CODE_MA5_MA20_TREND,
+        }
+        stmt = text(
+            f"""
+            SELECT DISTINCT `code`
+            FROM `{table}`
+            WHERE UPPER(COALESCE(`final_action`, `signal`)) IN ('BUY','BUY_CONFIRM')
+              AND `strategy_code` = :strategy
+              AND `sig_date` <= :latest
+              AND `sig_date` >= :earliest
+            """
+        )
         try:
             with self.db_writer.engine.begin() as conn:
-                codes_df = pd.read_sql_query(
-                    text(
-                        f"""
-                        SELECT DISTINCT `code`
-                        FROM `{table}`
-                        WHERE `signal` = 'BUY'
-                          AND `strategy_code` = :strategy
-                          AND `sig_date` <= :latest
-                          AND `sig_date` >= :earliest
-                        """
-                    ),
-                    conn,
-                    params={
-                        "latest": window_latest,
-                        "earliest": window_earliest,
-                        "strategy": STRATEGY_CODE_MA5_MA20_TREND,
-                    },
-                )
+                codes_df = pd.read_sql_query(stmt, conn, params=sql_params)
+        except OperationalError as exc:  # noqa: BLE001
+            self.logger.debug("读取近期 BUY/BUY_CONFIRM 信号失败，回退为 signal 字段：%s", exc)
+            try:
+                with self.db_writer.engine.begin() as conn:
+                    codes_df = pd.read_sql_query(
+                        text(
+                            f"""
+                            SELECT DISTINCT `code`
+                            FROM `{table}`
+                            WHERE UPPER(`signal`) IN ('BUY','BUY_CONFIRM')
+                              AND `strategy_code` = :strategy
+                              AND `sig_date` <= :latest
+                              AND `sig_date` >= :earliest
+                            """
+                        ),
+                        conn,
+                        params=sql_params,
+                    )
+            except Exception as exc2:  # noqa: BLE001
+                self.logger.warning("读取近期 BUY/BUY_CONFIRM 信号代码失败：%s", exc2)
+                return set()
         except Exception as exc:  # noqa: BLE001
-            self.logger.warning("读取近期 BUY 信号代码失败：%s", exc)
+            self.logger.warning("读取近期 BUY/BUY_CONFIRM 信号代码失败：%s", exc)
             return set()
-
         if codes_df.empty or "code" not in codes_df.columns:
             return set()
 
