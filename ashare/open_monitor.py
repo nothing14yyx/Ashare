@@ -430,6 +430,7 @@ class MA5MA20OpenMonitorRunner:
             env_payload,
             checked_at=checked_at,
             run_id=run_id,
+            run_pk=run_pk,
             ready_signals_used=self.repo.ready_signals_used,
         )
 
@@ -540,7 +541,7 @@ class MA5MA20OpenMonitorRunner:
             )
 
         self.repo.persist_results(result)
-        export_df = self.repo.load_open_monitor_view_data(monitor_date, run_id)
+        export_df = self.repo.load_open_monitor_view_data(monitor_date, run_pk)
         if export_df.empty:
             export_df = result
         self.evaluator.export_csv(export_df)

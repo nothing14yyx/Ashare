@@ -32,6 +32,7 @@ from sqlalchemy.exc import OperationalError
 from .chip_filter import ChipFilter
 from .config import get_section
 from .db import DatabaseConfig, MySQLWriter
+from .env_snapshot_utils import load_trading_calendar
 from .indicator_utils import consecutive_true
 from .schema_manager import (
     STRATEGY_CODE_MA5_MA20_TREND,
@@ -1479,15 +1480,54 @@ class MA5MA20StrategyRunner:
         events_df["sig_date"] = pd.to_datetime(events_df["sig_date"]).dt.date
         events_df["code"] = events_df["code"].astype(str)
         events_df["strategy_code"] = STRATEGY_CODE_MA5_MA20_TREND
+        valid_days = None
         try:
-            events_df["valid_days"] = int(getattr(self.params, "valid_days", 3))
+            valid_days = int(getattr(self.params, "valid_days", 3))
+            events_df["valid_days"] = valid_days
         except Exception:
             self.logger.warning(
                 "valid_days=%s 解析失败，将跳过有效期字段写入。",
                 getattr(self.params, "valid_days", None),
             )
             events_df["valid_days"] = pd.NA
-        events_df["expires_on"] = pd.NA
+            valid_days = None
+
+        expires_cache: dict[dt.date, dt.date | None] = {}
+
+        def _resolve_expires_on(sig_date: dt.date) -> dt.date | None:
+            if sig_date in expires_cache:
+                return expires_cache[sig_date]
+            if valid_days is None:
+                expires_cache[sig_date] = None
+                return None
+            if valid_days <= 0:
+                expires_cache[sig_date] = sig_date
+                return sig_date
+            end_date = sig_date + dt.timedelta(days=max(valid_days * 3, 10))
+            calendar = load_trading_calendar(sig_date, end_date)
+            if calendar:
+                trading_dates = []
+                for raw in calendar:
+                    if not isinstance(raw, str):
+                        continue
+                    try:
+                        trade_date = dt.datetime.strptime(raw, "%Y-%m-%d").date()
+                    except Exception:
+                        continue
+                    if sig_date <= trade_date <= end_date:
+                        trading_dates.append(trade_date)
+                trading_dates.sort()
+                if sig_date not in trading_dates:
+                    trading_dates.insert(0, sig_date)
+                if len(trading_dates) > valid_days:
+                    expires_cache[sig_date] = trading_dates[valid_days]
+                    return trading_dates[valid_days]
+            expires_cache[sig_date] = sig_date + dt.timedelta(days=valid_days)
+            return expires_cache[sig_date]
+
+        events_df["expires_on"] = events_df["sig_date"].apply(
+            lambda d: _resolve_expires_on(d) if pd.notna(d) else pd.NA
+        )
 
         # 防止同一批信号里存在重复键，导致唯一约束/主键冲突（strategy_code, sig_date, code）
         events_df = events_df.drop_duplicates(subset=["strategy_code", "sig_date", "code"], keep="last").copy()

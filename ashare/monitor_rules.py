@@ -329,22 +329,6 @@ def build_default_monitor_rules(
                 action_override=config.env_wait_action,
             ),
         ),
-        # feat: SIGNAL_EXPIRED 过期信号直接跳过
-        Rule(
-            id="SIGNAL_EXPIRED",
-            category="ACTION",
-            severity=config.sev_signal_expired,
-            predicate=lambda ctx: bool(
-                config.enable_signal_expired
-                and getattr(ctx, "signal_age", None) is not None
-                and getattr(ctx, "valid_days", None) is not None
-                and getattr(ctx, "signal_age") > getattr(ctx, "valid_days")
-            ),
-            effect=lambda ctx: RuleResult(
-                reason=config.signal_expired_reason,
-                action_override=config.signal_expired_action,
-            ),
-        ),
         Rule(
             id="CHIP_SCORE_NEG",
             category="ACTION",

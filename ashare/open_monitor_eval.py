@@ -269,6 +269,7 @@ class OpenMonitorEvaluator:
         *,
         checked_at: dt.datetime | None = None,
         run_id: str | None = None,
+        run_pk: int | None = None,
         ready_signals_used: bool = False,
     ) -> pd.DataFrame:
         if signals.empty:
@@ -304,6 +305,17 @@ class OpenMonitorEvaluator:
             return pd.DataFrame()
 
         merged = self.prepare_monitor_frame(signals, quotes)
+        strategy_code = None
+        if "strategy_code" in merged.columns:
+            raw_strategy = merged["strategy_code"].dropna().astype(str)
+            if not raw_strategy.empty:
+                strategy_code = raw_strategy.iloc[0]
+        if not strategy_code:
+            strategy_code = str(getattr(self.params, "strategy_code", "") or "").strip() or None
+        if "strategy_code" not in merged.columns:
+            merged["strategy_code"] = strategy_code
+        else:
+            merged["strategy_code"] = merged["strategy_code"].fillna(strategy_code)
 
         def _resolve_ref_close(row: pd.Series) -> float | None:
             for key in ("prev_close", "sig_close"):
@@ -328,7 +340,6 @@ class OpenMonitorEvaluator:
         states: List[str] = []
         status_reasons: List[str] = []
         signal_kinds: List[str] = []
-        valid_days_list: List[int | None] = []
         entry_exposure_caps: List[float | None] = []
         trade_stop_refs: List[float | None] = []
         sig_stop_refs: List[float | None] = []
@@ -354,14 +365,6 @@ class OpenMonitorEvaluator:
         for _, row in merged.iterrows():
             sig_reason_text = str(row.get("sig_reason") or row.get("reason") or "")
             is_pullback = self._is_pullback_signal(sig_reason_text)
-            raw_valid_days = row.get("valid_days")
-            valid_days = None
-            if raw_valid_days is not None and not pd.isna(raw_valid_days):
-                try:
-                    valid_days = int(float(raw_valid_days))
-                except Exception:
-                    valid_days = None
-            valid_days_list.append(valid_days)
             sig_stop_ref = _to_float(row.get("sig_stop_ref"))
             sig_stop_refs.append(sig_stop_ref)
 
@@ -499,7 +502,6 @@ class OpenMonitorEvaluator:
                 sig_ma20=sig_ma20,
                 ma20_thresh=ma20_thresh,
                 signal_age=signal_age,
-                valid_days=valid_days,
                 limit_up_trigger=limit_up_trigger,
                 runup_breach=breach,
                 runup_breach_reason=breach_reason,
@@ -594,11 +596,14 @@ class OpenMonitorEvaluator:
         merged["status_reason"] = status_reasons
         merged["signal_kind"] = signal_kinds
         merged["signal_age"] = merged.get("signal_age")
-        merged["valid_days"] = valid_days_list
         merged["trade_stop_ref"] = trade_stop_refs
         merged["effective_stop_ref"] = effective_stop_refs
         merged["entry_exposure_cap"] = entry_exposure_caps
         merged["run_id"] = run_id_val
+        if "run_pk" not in merged.columns:
+            merged["run_pk"] = run_pk
+        else:
+            merged["run_pk"] = merged["run_pk"].fillna(run_pk)
         merged["runup_from_sigclose"] = runup_from_sigclose_list
         merged["runup_from_sigclose_atr"] = runup_from_sigclose_atr_list
         merged["runup_ref_price"] = runup_ref_price_list
@@ -641,7 +646,7 @@ class OpenMonitorEvaluator:
             "monitor_date",
             "sig_date",
             "signal_age",
-            "valid_days",
+            "strategy_code",
             "code",
             "name",
             "asof_trade_date",
@@ -709,6 +714,7 @@ class OpenMonitorEvaluator:
             "action",
             "action_reason",
             "run_id",
+            "run_pk",
             "snapshot_hash",
         ]
 
@@ -718,7 +724,7 @@ class OpenMonitorEvaluator:
             "asof_trade_date",
             "live_trade_date",
             "signal_age",
-            "valid_days",
+            "strategy_code",
             "code",
             "name",
             "live_open",
@@ -767,6 +773,7 @@ class OpenMonitorEvaluator:
             "action",
             "action_reason",
             "run_id",
+            "run_pk",
             "snapshot_hash",
         ]
 

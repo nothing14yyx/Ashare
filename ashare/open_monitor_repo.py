@@ -23,13 +23,14 @@ from .utils.convert import to_float as _to_float
 SNAPSHOT_HASH_EXCLUDE = {
     "checked_at",
     "run_id",
+    "run_pk",
 }
 
 READY_SIGNALS_REQUIRED_COLS = (
     "sig_date",
     "code",
     "strategy_code",
-    "valid_days",
+    "expires_on",
     "close",
     "ma20",
     "atr14",
@@ -448,6 +449,7 @@ class OpenMonitorRepository:
                         SELECT DISTINCT `sig_date`
                         FROM `{base_table}`
                         WHERE `sig_date` <= :latest_trade_date AND `strategy_code` = :strategy_code
+                          AND `expires_on` >= :monitor_date
                         ORDER BY `sig_date` DESC
                         LIMIT :lookback
                         """
@@ -456,6 +458,7 @@ class OpenMonitorRepository:
                     params={
                         "latest_trade_date": latest_trade_date,
                         "strategy_code": self.params.strategy_code,
+                        "monitor_date": monitor_date,
                         "lookback": lookback,
                     },
                 )
@@ -480,6 +483,7 @@ class OpenMonitorRepository:
             FROM `{view}`
             WHERE `sig_date` IN :dates
               AND `strategy_code` = :strategy_code
+              AND `expires_on` >= :monitor_date
             ORDER BY `sig_date` DESC, `code`
             """
         ).bindparams(bindparam("dates", expanding=True))
@@ -489,7 +493,11 @@ class OpenMonitorRepository:
                 events_df = pd.read_sql_query(
                     stmt,
                     conn,
-                    params={"dates": signal_dates, "strategy_code": self.params.strategy_code},
+                    params={
+                        "dates": signal_dates,
+                        "strategy_code": self.params.strategy_code,
+                        "monitor_date": monitor_date,
+                    },
                 )
         except Exception as exc:  # noqa: BLE001
             self.logger.error("读取 %s BUY 信号失败：%s", view, exc)
@@ -506,7 +514,7 @@ class OpenMonitorRepository:
             "sig_date",
             "code",
             "strategy_code",
-            "valid_days",
+            "expires_on",
             "close",
             "ma5",
             "ma20",
@@ -570,24 +578,6 @@ class OpenMonitorRepository:
         min_date = events_df["sig_date"].min()
         trade_age_map = self._load_trade_age_map(latest_trade_date, str(min_date), monitor_date)
         events_df["signal_age"] = events_df["sig_date"].map(trade_age_map)
-
-        if "valid_days" not in events_df.columns:
-            self.logger.error("ready_signals_view 缺少 valid_days，已跳过候选信号读取。")
-            return latest_trade_date, [], pd.DataFrame()
-        events_df["valid_days"] = pd.to_numeric(events_df["valid_days"], errors="coerce")
-
-        before = len(events_df)
-        keep_mask = (
-            events_df["signal_age"].notna()
-            & events_df["valid_days"].notna()
-            & (events_df["signal_age"] <= events_df["valid_days"])
-        )
-        events_df = events_df.loc[keep_mask].copy()
-        dropped = before - len(events_df)
-        if dropped:
-            self.logger.info(
-                f"已按信号有效期过滤过期 BUY 候选：移除 {dropped} 条（保留 {len(events_df)} 条）。"
-            )
 
         # 过滤后重算信号日列表（用于日志、行情/指标补全等后续路径）
         signal_dates = sorted(events_df["sig_date"].dropna().unique().tolist())
@@ -887,14 +877,12 @@ class OpenMonitorRepository:
             SELECT t1.`code`, t1.`signal_strength`
             FROM `{table}` t1
             JOIN `{run_table}` r1
-              ON t1.`monitor_date` = r1.`monitor_date`
-             AND t1.`run_id` = r1.`run_id`
+              ON t1.`run_pk` = r1.`run_pk`
             JOIN (
                 SELECT e.`code`, MAX(r.`checked_at`) AS latest_checked
                 FROM `{table}` e
                 JOIN `{run_table}` r
-                  ON e.`monitor_date` = r.`monitor_date`
-                 AND e.`run_id` = r.`run_id`
+                  ON e.`run_pk` = r.`run_pk`
                 WHERE e.`code` IN :codes
                   AND e.`signal_strength` IS NOT NULL
                   {"AND r.`checked_at` < :as_of" if as_of else ""}
@@ -1437,8 +1425,6 @@ class OpenMonitorRepository:
                 run_pk,
             )
             return
-        payload["env_weekly_zone_id"] = env_context.get("weekly_zone_id")
-        payload["env_daily_zone_id"] = env_context.get("daily_zone_id")
         payload["env_live_override_action"] = env_context.get("env_live_override_action")
         payload["env_live_cap_multiplier"] = _to_float(env_context.get("env_live_cap_multiplier"))
         payload["env_live_event_tags"] = env_context.get("env_live_event_tags")
@@ -1484,19 +1470,19 @@ class OpenMonitorRepository:
             self.logger.warning("写入环境快照失败：%s", exc)
 
     def _delete_existing_run_rows(
-        self, table: str, monitor_date: str, run_id: str, codes: List[str]
+        self, table: str, monitor_date: str, run_pk: int, codes: List[str]
     ) -> int:
         if not (
             table
             and monitor_date
-            and run_id
+            and run_pk
             and codes
             and self._table_exists(table)
         ):
             return 0
 
         stmt = text(
-            "DELETE FROM `{table}` WHERE `monitor_date` = :d AND `run_id` = :b AND `code` IN :codes".format(
+            "DELETE FROM `{table}` WHERE `monitor_date` = :d AND `run_pk` = :b AND `code` IN :codes".format(
                 table=table
             )
         ).bindparams(bindparam("codes", expanding=True))
@@ -1504,7 +1490,7 @@ class OpenMonitorRepository:
         try:
             with self.engine.begin() as conn:
                 result = conn.execute(
-                    stmt, {"d": monitor_date, "b": run_id, "codes": codes}
+                    stmt, {"d": monitor_date, "b": run_pk, "codes": codes}
                 )
                 return int(getattr(result, "rowcount", 0) or 0)
         except Exception as exc:  # noqa: BLE001
@@ -1520,7 +1506,7 @@ class OpenMonitorRepository:
 
         keep_cols = [
             "monitor_date",
-            "run_id",
+            "run_pk",
             "code",
             "live_trade_date",
             "live_open",
@@ -1536,35 +1522,33 @@ class OpenMonitorRepository:
         quotes = df[keep_cols].copy()
         quotes["monitor_date"] = pd.to_datetime(quotes["monitor_date"]).dt.date
         quotes["live_trade_date"] = pd.to_datetime(quotes["live_trade_date"]).dt.date
-        if "run_id" not in quotes.columns:
-            quotes["run_id"] = None
-        quotes["run_id"] = quotes["run_id"].fillna(
-            calc_run_id(dt.datetime.now(), self.params.run_id_minutes)
-        )
+        quotes["run_pk"] = pd.to_numeric(quotes["run_pk"], errors="coerce")
         quotes["code"] = quotes["code"].astype(str)
+        quotes = quotes.dropna(subset=["run_pk"]).copy()
+        if quotes.empty:
+            return
 
         monitor_dates = quotes["monitor_date"].dropna().astype(str).unique().tolist()
         if self._table_exists(table) and monitor_dates:
             for monitor in monitor_dates:
-                run_ids = (
-                    quotes.loc[quotes["monitor_date"].astype(str) == monitor, "run_id"]
+                run_pks = (
+                    quotes.loc[quotes["monitor_date"].astype(str) == monitor, "run_pk"]
                     .dropna()
-                    .astype(str)
                     .unique()
                     .tolist()
                 )
-                for run_id in run_ids:
-                    run_id_codes = quotes.loc[
+                for run_pk in run_pks:
+                    run_pk_codes = quotes.loc[
                         (quotes["monitor_date"].astype(str) == monitor)
-                        & (quotes["run_id"].astype(str) == run_id),
+                        & (quotes["run_pk"] == run_pk),
                         "code",
                     ].dropna().astype(str).unique().tolist()
-                    if run_id_codes:
+                    if run_pk_codes:
                         self._delete_existing_run_rows(
                             table,
                             monitor,
-                            run_id,
-                            run_id_codes,
+                            int(run_pk),
+                            run_pk_codes,
                         )
 
         try:
@@ -1589,11 +1573,24 @@ class OpenMonitorRepository:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
 
-        if "run_id" not in df.columns:
-            df["run_id"] = None
-        df["run_id"] = df["run_id"].fillna(
-            calc_run_id(dt.datetime.now(), self.params.run_id_minutes)
-        )
+        if "run_pk" not in df.columns:
+            df["run_pk"] = None
+        df["run_pk"] = pd.to_numeric(df["run_pk"], errors="coerce")
+        if "strategy_code" not in df.columns:
+            df["strategy_code"] = str(getattr(self.params, "strategy_code", "") or "").strip() or None
+        else:
+            fallback_strategy = str(getattr(self.params, "strategy_code", "") or "").strip() or None
+            df["strategy_code"] = df["strategy_code"].fillna(fallback_strategy)
+        if "run_pk" in df.columns:
+            missing_run_pk = df["run_pk"].isna()
+            if missing_run_pk.any():
+                self.logger.warning(
+                    "检测到缺失 run_pk 的开盘监测结果 %s 条，已跳过写入。",
+                    int(missing_run_pk.sum()),
+                )
+                df = df.loc[~missing_run_pk].copy()
+                if df.empty:
+                    return
 
         for col in ["monitor_date", "sig_date", "asof_trade_date", "live_trade_date"]:
             if col in df.columns:
@@ -1621,7 +1618,7 @@ class OpenMonitorRepository:
             df["rule_hits_json"] = df["rule_hits_json"].fillna("").astype(str).str.slice(0, 4000)
 
         df["snapshot_hash"] = df.apply(lambda row: make_snapshot_hash(row.to_dict()), axis=1)
-        df = df.drop_duplicates(subset=["monitor_date", "sig_date", "code", "run_id"])
+        df = df.drop_duplicates(subset=["run_pk", "strategy_code", "sig_date", "code"])
 
         self.persist_quote_snapshots(df)
 
@@ -1643,19 +1640,17 @@ class OpenMonitorRepository:
 
         if table_exists and monitor_date and codes:
             deleted_total = 0
-            run_ids = (
-                df["run_id"].dropna().astype(str).unique().tolist()
-                if "run_id" in df.columns
-                else []
+            run_pks = (
+                df["run_pk"].dropna().unique().tolist() if "run_pk" in df.columns else []
             )
-            for run_id_val in run_ids:
-                if not run_id_val:
+            for run_pk_val in run_pks:
+                if pd.isna(run_pk_val):
                     continue
                 deleted_total += self._delete_existing_run_rows(
-                    table, monitor_date, run_id_val, codes
+                    table, monitor_date, int(run_pk_val), codes
                 )
             if deleted_total > 0:
-                self.logger.info("检测到同 run_id 旧快照：已覆盖删除 %s 条。", deleted_total)
+                self.logger.info("检测到同 run_pk 旧快照：已覆盖删除 %s 条。", deleted_total)
 
         if df.empty:
             self.logger.info("本次开盘监测结果全部为重复快照，跳过写入。")
@@ -1668,7 +1663,7 @@ class OpenMonitorRepository:
             self.logger.error("写入开盘监测表失败：%s", exc)
 
     def load_open_monitor_view_data(
-        self, monitor_date: str, run_id: str | None
+        self, monitor_date: str, run_pk: int | None
     ) -> pd.DataFrame:
         view = self.params.open_monitor_view or self.params.open_monitor_wide_view
         fallback_view = self.params.open_monitor_wide_view
@@ -1680,9 +1675,9 @@ class OpenMonitorRepository:
 
         clauses = ["`monitor_date` = :d"]
         params: dict[str, Any] = {"d": monitor_date}
-        if run_id:
-            clauses.append("`run_id` = :b")
-            params["b"] = run_id
+        if run_pk:
+            clauses.append("`run_pk` = :b")
+            params["b"] = run_pk
         where_clause = " AND ".join(clauses)
         stmt = text(
             f"""
