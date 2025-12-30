@@ -125,6 +125,11 @@ class OpenMonitorParams:
 
     # 环境快照持久化：与行情/评估表保持一致，默认写入
     persist_env_snapshot: bool = True
+    # 盘中关键位突破：触达/站稳/回踩阈值
+    live_breakout_high_eps: float = 0.002
+    live_breakout_latest_eps: float = 0.001
+    live_retest_pct: float = 0.003
+    live_retest_atr_mult: float = 0.5
 
     @classmethod
     def from_config(cls) -> "OpenMonitorParams":
@@ -153,6 +158,13 @@ class OpenMonitorParams:
             raw = sec.get(key, default)
             try:
                 return int(raw)
+            except Exception:
+                return default
+
+        def _get_float(key: str, default: float) -> float:
+            raw = sec.get(key, default)
+            try:
+                return float(raw)
             except Exception:
                 return default
 
@@ -229,6 +241,16 @@ class OpenMonitorParams:
             output_mode=str(sec.get("output_mode", cls.output_mode)).strip().upper()
                         or cls.output_mode,
             persist_env_snapshot=_get_bool("persist_env_snapshot", cls.persist_env_snapshot),
+            live_breakout_high_eps=_get_float(
+                "live_breakout_high_eps", cls.live_breakout_high_eps
+            ),
+            live_breakout_latest_eps=_get_float(
+                "live_breakout_latest_eps", cls.live_breakout_latest_eps
+            ),
+            live_retest_pct=_get_float("live_retest_pct", cls.live_retest_pct),
+            live_retest_atr_mult=_get_float(
+                "live_retest_atr_mult", cls.live_retest_atr_mult
+            ),
         )
 
 
