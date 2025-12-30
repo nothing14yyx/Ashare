@@ -39,6 +39,22 @@ def derive_index_gate_action(regime: str | None, position_hint: float | None) ->
     return None
 
 
+def _parse_weekly_key_levels(levels_str: str | None) -> dict[str, float]:
+    if not levels_str:
+        return {}
+    levels: dict[str, float] = {}
+    for token in str(levels_str).split(";"):
+        token = token.strip()
+        if not token or "=" not in token:
+            continue
+        key, value = token.split("=", 1)
+        key = key.strip().lower()
+        level = _to_float(value)
+        if key and level is not None:
+            levels[key] = level
+    return levels
+
+
 class OpenMonitorEnvService:
     """负责环境快照构建与加载的服务层。"""
 
@@ -494,15 +510,24 @@ class OpenMonitorEnvService:
     ) -> dict[str, Any]:
         live_pct = _to_float(index_snapshot.get("env_index_live_pct_change"))
         live_latest = _to_float(index_snapshot.get("env_index_live_latest"))
+        live_high = _to_float(index_snapshot.get("env_index_live_high"))
+        live_low = _to_float(index_snapshot.get("env_index_live_low"))
         live_dev_ma20_atr = _to_float(index_snapshot.get("env_index_dev_ma20_atr"))
         daily_ma20 = _to_float(env_context.get("daily_ma20"))
         daily_bb_lower = _to_float(env_context.get("daily_bb_lower"))
         daily_bb_upper = _to_float(env_context.get("daily_bb_upper"))
         daily_bb_width = _to_float(env_context.get("daily_bb_width"))
+        weekly_key_levels_str = env_context.get("weekly_key_levels_str")
+        if not weekly_key_levels_str:
+            weekly_scenario = env_context.get("weekly_scenario") or {}
+            if isinstance(weekly_scenario, dict):
+                weekly_key_levels_str = weekly_scenario.get("weekly_key_levels_str")
+        key_levels = _parse_weekly_key_levels(weekly_key_levels_str)
 
         actions: list[str] = []
         cap_candidates: list[float] = []
         events: list[str] = []
+        unlock_gate = None
 
         if live_pct is not None:
             if live_pct <= -3.0:
@@ -542,6 +567,22 @@ class OpenMonitorEnvService:
             cap_candidates.append(0.5)
             events.append("BB_OVERHEAT")
 
+        upper_level = key_levels.get("upper")
+        if (
+            upper_level is not None
+            and live_high is not None
+            and live_latest is not None
+            and live_low is not None
+        ):
+            if (
+                live_high >= upper_level * 1.002
+                and live_latest >= upper_level * 1.001
+                and live_low >= upper_level * 0.997
+            ):
+                unlock_gate = "ALLOW_SMALL"
+                events.append("LIVE_BREAKOUT_UPPER")
+                events.append("LIVE_BREAKOUT_RETEST_HELD")
+
         action = self._merge_live_actions(actions)
         cap_multiplier = min(cap_candidates) if cap_candidates else 1.0
         reason = ";".join(events)[:255] if events else None
@@ -550,6 +591,7 @@ class OpenMonitorEnvService:
             "env_live_cap_multiplier": cap_multiplier,
             "env_live_event_tags": ";".join(events)[:255] if events else None,
             "env_live_reason": reason,
+            "env_live_unlock_gate": unlock_gate,
         }
 
     def attach_index_snapshot(

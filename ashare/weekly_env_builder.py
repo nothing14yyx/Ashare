@@ -815,18 +815,18 @@ class WeeklyEnvironmentBuilder:
 
         gate_candidates: list[str | None] = []
         reason_parts: dict[str, Any] = {}
+        gate_norm = None
         if weekly_gate_policy:
             gate_norm = str(weekly_gate_policy).strip().upper()
-            gate_candidates.append(gate_norm)
             reason_parts["weekly_gate_policy"] = gate_norm
 
+        index_gate_norm = None
         index_snapshot = env_context.get("index_intraday")
         if isinstance(index_snapshot, dict):
             index_gate = index_snapshot.get("env_index_gate_action")
             if index_gate is not None:
-                gate_norm = str(index_gate).strip().upper()
-                gate_candidates.append(gate_norm)
-                reason_parts["index_gate_action"] = gate_norm
+                index_gate_norm = str(index_gate).strip().upper()
+                reason_parts["index_gate_action"] = index_gate_norm
 
         daily_zone_id = env_context.get("daily_zone_id")
         daily_gate_hint = None
@@ -842,16 +842,35 @@ class WeeklyEnvironmentBuilder:
             live_gate_hint = "WAIT"
         elif live_override_action == "EXIT":
             live_gate_hint = "STOP"
-        if live_gate_hint:
-            gate_candidates.append(live_gate_hint)
-            reason_parts["live_gate_hint"] = live_gate_hint
 
         regime_gate = self._derive_gate_action(
             env_context.get("regime"), env_context.get("position_hint_raw") or env_context.get("position_hint")
         )
         if regime_gate:
-            gate_candidates.append(regime_gate)
             reason_parts["regime_gate_action"] = regime_gate
+
+        effective_weekly_gate = gate_norm
+        live_unlock_gate = str(env_context.get("env_live_unlock_gate") or "").strip().upper()
+        if (
+            gate_norm == "WAIT"
+            and live_unlock_gate == "ALLOW_SMALL"
+            and live_override_action not in {"PAUSE", "EXIT"}
+            and index_gate_norm not in {"WAIT", "STOP"}
+            and regime_gate not in {"WAIT", "STOP"}
+        ):
+            effective_weekly_gate = "ALLOW_SMALL"
+            reason_parts["weekly_gate_effective"] = effective_weekly_gate
+            reason_parts["env_live_unlock_gate"] = live_unlock_gate
+
+        if effective_weekly_gate:
+            gate_candidates.append(effective_weekly_gate)
+        if index_gate_norm:
+            gate_candidates.append(index_gate_norm)
+        if live_gate_hint:
+            gate_candidates.append(live_gate_hint)
+            reason_parts["live_gate_hint"] = live_gate_hint
+        if regime_gate:
+            gate_candidates.append(regime_gate)
 
         for key in [
             "weekly_asof_trade_date",
@@ -862,6 +881,7 @@ class WeeklyEnvironmentBuilder:
             "env_live_cap_multiplier",
             "env_live_event_tags",
             "env_live_reason",
+            "env_live_unlock_gate",
         ]:
             value = env_context.get(key)
             if value not in (None, "", [], {}, ()):  # noqa: PLC1901
@@ -891,6 +911,9 @@ class WeeklyEnvironmentBuilder:
         final_cap = base_cap * daily_cap_multiplier * breadth_factor * live_cap_multiplier
         final_cap = min(max(final_cap, 0.0), 1.0)
         small_cap_limit = 0.25
+        if effective_weekly_gate == "ALLOW_SMALL" and gate_norm == "WAIT":
+            small_cap_limit = 0.15
+            reason_parts["unlock_cap_limit"] = f"{small_cap_limit:.2f}"
         if final_gate in {"STOP", "WAIT"}:
             final_cap = 0.0
             reason_parts["gate_cap_limit"] = f"{final_gate}_0"
