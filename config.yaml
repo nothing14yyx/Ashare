@@ -134,6 +134,8 @@ strategy_ma5_ma20_trend:
 
   # signals 写入范围：latest=仅最新交易日（默认），window=回填本次计算窗口内全部交易日
   signals_write_scope: window
+  # 信号有效期（交易日口径）
+  valid_days: 3
 
 # 开盘监测：检查“前一交易日收盘 BUY 信号”是否可在今日开盘执行
 open_monitor:
@@ -159,10 +161,6 @@ open_monitor:
   interval_minutes: 5
   # 去重时间桶分辨率（分钟）：缺省跟 interval_minutes 一致，可单独覆盖
   run_id_minutes: 5
-
-  # 候选有效期（按 reason 区分）：默认金叉 3 天、回踩 5 天
-  cross_valid_days: 3
-  pullback_valid_days: 5
 
   # 过滤阈值（按你的风格可自行调小/调大）
   max_gap_up_pct: 0.05        # 今开高开超过 5%：不追

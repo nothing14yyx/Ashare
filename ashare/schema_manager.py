@@ -795,6 +795,8 @@ class SchemaManager:
             "chip_penalty": "DOUBLE NULL",
             "chip_note": "VARCHAR(255) NULL",
             "age_days": "INT NULL",
+            "valid_days": "INT NULL",
+            "expires_on": "DATE NULL",
             "deadzone_hit": "TINYINT(1) NULL",
             "stale_hit": "TINYINT(1) NULL",
             "fear_score": "DOUBLE NULL",
@@ -821,9 +823,11 @@ class SchemaManager:
         self._ensure_numeric_column(table, "chip_penalty", "DOUBLE NULL")
         self._ensure_numeric_column(table, "fear_score", "DOUBLE NULL")
         self._ensure_numeric_column(table, "age_days", "INT NULL")
+        self._ensure_numeric_column(table, "valid_days", "INT NULL")
         self._ensure_numeric_column(table, "deadzone_hit", "TINYINT(1) NULL")
         self._ensure_numeric_column(table, "stale_hit", "TINYINT(1) NULL")
         self._ensure_date_column(table, "gdhs_announce_date", not_null=False)
+        self._ensure_date_column(table, "expires_on", not_null=False)
         self._ensure_varchar_length(table, "chip_reason", 255)
         self._ensure_varchar_length(table, "chip_note", 255)
         unique_name = "ux_signal_events_strategy_date_code"
@@ -956,6 +960,8 @@ class SchemaManager:
             "e.`risk_tag`",
             "e.`risk_note`",
             "e.`extra_json`",
+            "e.`valid_days`",
+            "e.`expires_on`",
         ]
         optional_cols = [
             "stop_ref",

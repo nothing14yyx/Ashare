@@ -351,13 +351,16 @@ class OpenMonitorEvaluator:
         pullback_runup_atr_max = self.rule_config.pullback_runup_atr_max
         pullback_runup_dev_ma20_atr_min = self.rule_config.pullback_runup_dev_ma20_atr_min
         runup_atr_tol = self.rule_config.runup_atr_tol
-        cross_valid_days = self.params.cross_valid_days
-        pullback_valid_days = self.params.pullback_valid_days
-
         for _, row in merged.iterrows():
             sig_reason_text = str(row.get("sig_reason") or row.get("reason") or "")
             is_pullback = self._is_pullback_signal(sig_reason_text)
-            valid_days = pullback_valid_days if is_pullback else cross_valid_days
+            raw_valid_days = row.get("valid_days")
+            valid_days = None
+            if raw_valid_days is not None and not pd.isna(raw_valid_days):
+                try:
+                    valid_days = int(float(raw_valid_days))
+                except Exception:
+                    valid_days = None
             valid_days_list.append(valid_days)
             sig_stop_ref = _to_float(row.get("sig_stop_ref"))
             sig_stop_refs.append(sig_stop_ref)

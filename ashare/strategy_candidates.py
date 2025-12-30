@@ -18,8 +18,6 @@ from .schema_manager import SchemaManager, TABLE_STRATEGY_CANDIDATES
 @dataclass(frozen=True)
 class StrategyCandidatesConfig:
     signal_lookback_days: int = 3
-    cross_valid_days: int = 3
-    pullback_valid_days: int = 5
 
     @classmethod
     def from_config(cls) -> "StrategyCandidatesConfig":
@@ -39,8 +37,6 @@ class StrategyCandidatesConfig:
                 "signal_lookback_days",
                 cls.signal_lookback_days,
             ),
-            cross_valid_days=_get_int("cross_valid_days", cls.cross_valid_days),
-            pullback_valid_days=_get_int("pullback_valid_days", cls.pullback_valid_days),
         )
 
 
@@ -115,12 +111,8 @@ class StrategyCandidatesService:
             return False
         return any(col.get("name") == column for col in cols if isinstance(col, dict))
 
-    def _resolve_signal_window(self, latest_date: dt.date) -> tuple[dt.date, dt.date]:
-        lookback_days = max(
-            int(self.params.signal_lookback_days),
-            int(max(self.params.cross_valid_days, self.params.pullback_valid_days)) + 1,
-        )
-
+    def _load_trade_dates(self, latest_date: dt.date, limit: int) -> List[str]:
+        lookback_days = max(int(limit), 1)
         base_table = "history_daily_kline"
         date_col = "date"
         if not self._table_exists(base_table):
@@ -144,18 +136,50 @@ class StrategyCandidatesService:
         with self.db_writer.engine.begin() as conn:
             df = pd.read_sql_query(stmt, conn, params={"base_date": latest_date.isoformat()})
 
-        dates = (
-            df["d"].dropna().astype(str).str[:10].tolist()
-            if df is not None and not df.empty
-            else []
+        if df is None or df.empty:
+            return []
+        return df["d"].dropna().astype(str).str[:10].tolist()
+
+    def _load_max_valid_days(self, latest_date: dt.date) -> int | None:
+        table = self.table_names.signal_events_table
+        if not self._table_exists(table):
+            return None
+        if not self._column_exists(table, "valid_days"):
+            return None
+
+        recent_dates = self._load_trade_dates(latest_date, 30)
+        if not recent_dates:
+            return None
+        min_date = recent_dates[-1]
+
+        stmt = text(
+            f"""
+            SELECT MAX(`valid_days`) AS max_valid_days
+            FROM `{table}`
+            WHERE `sig_date` >= :min_date
+            """
         )
-        if not dates:
-            return latest_date, latest_date
-        latest = pd.to_datetime(dates[0], errors="coerce")
-        earliest = pd.to_datetime(dates[-1], errors="coerce")
-        if pd.isna(latest) or pd.isna(earliest):
-            return latest_date, latest_date
-        return earliest.date(), latest.date()
+        with self.db_writer.engine.begin() as conn:
+            row = conn.execute(stmt, {"min_date": min_date}).mappings().first()
+
+        if not row:
+            return None
+        raw = row.get("max_valid_days")
+        if raw is None or pd.isna(raw):
+            return None
+        try:
+            max_days = int(raw)
+        except Exception:
+            return None
+        return max_days if max_days > 0 else None
+
+    def _resolve_scan_days(self, latest_date: dt.date) -> int:
+        lookback = int(self.params.signal_lookback_days)
+        max_valid_days = self._load_max_valid_days(latest_date)
+        scan_days = lookback
+        if max_valid_days is not None:
+            scan_days = max(scan_days, max_valid_days + 1)
+        return max(int(scan_days), 1)
 
     def _load_liquidity_codes(self, asof_date: dt.date) -> List[str]:
         stmt = text(
@@ -176,21 +200,24 @@ class StrategyCandidatesService:
         if not self._table_exists(table):
             return pd.DataFrame()
 
-        earliest, latest = self._resolve_signal_window(asof_date)
         has_valid_days = self._column_exists(table, "valid_days")
+        if not has_valid_days:
+            self.logger.error("strategy_signal_events 缺少 valid_days，已跳过信号候选读取。")
+            return pd.DataFrame()
+
+        scan_days = self._resolve_scan_days(asof_date)
+        trade_dates = self._load_trade_dates(asof_date, scan_days)
+        if not trade_dates:
+            return pd.DataFrame()
+        latest = trade_dates[0]
+        earliest = trade_dates[-1]
         select_cols = [
             "code",
             "sig_date",
             "strategy_code",
             "UPPER(COALESCE(`final_action`, `signal`)) AS action",
+            "valid_days",
         ]
-        if has_valid_days:
-            select_cols.append("valid_days")
-        valid_clause = ""
-        if has_valid_days:
-            valid_clause = (
-                "AND (`valid_days` IS NULL OR DATEDIFF(:latest, `sig_date`) <= `valid_days`)"
-            )
 
         stmt = text(
             f"""
@@ -198,7 +225,6 @@ class StrategyCandidatesService:
             FROM `{table}`
             WHERE `sig_date` BETWEEN :earliest AND :latest
               AND UPPER(COALESCE(`final_action`, `signal`)) IN ('BUY','BUY_CONFIRM')
-              {valid_clause}
             """
         )
         with self.db_writer.engine.begin() as conn:
@@ -216,12 +242,16 @@ class StrategyCandidatesService:
         df = df.dropna(subset=["sig_date", "code"])
         df["code"] = df["code"].astype(str)
         df["action"] = df["action"].astype(str).str.upper()
-
-        if not has_valid_days:
-            self.logger.info(
-                "strategy_signal_events 缺少 valid_days，将不做有效期过滤。"
-            )
-
+        df["valid_days"] = pd.to_numeric(df.get("valid_days"), errors="coerce")
+        df["signal_age"] = df["sig_date"].dt.strftime("%Y-%m-%d").map(
+            {d: i for i, d in enumerate(trade_dates)}
+        )
+        df = df.dropna(subset=["valid_days", "signal_age"])
+        if df.empty:
+            return df
+        df["valid_days"] = df["valid_days"].astype(int)
+        df["signal_age"] = df["signal_age"].astype(int)
+        df = df[df["signal_age"] <= df["valid_days"]]
         if df.empty:
             return df
 

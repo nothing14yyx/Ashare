@@ -88,10 +88,6 @@ class OpenMonitorParams:
     # 行情来源：eastmoney / akshare（兼容：auto 将按 eastmoney 处理）
     quote_source: str = "eastmoney"
 
-    # 候选有效期：回踩形态默认更长
-    cross_valid_days: int = 3
-    pullback_valid_days: int = 5
-
     # 输出控制
     write_to_db: bool = True
 
@@ -202,8 +198,6 @@ class OpenMonitorParams:
                                    or cls.open_monitor_wide_view,
             signal_lookback_days=_get_int("signal_lookback_days", cls.signal_lookback_days),
             quote_source=quote_source,
-            cross_valid_days=_get_int("cross_valid_days", cls.cross_valid_days),
-            pullback_valid_days=_get_int("pullback_valid_days", cls.pullback_valid_days),
             index_code=str(sec.get("index_code", cls.index_code)).strip() or cls.index_code,
             index_hist_lookback_days=_get_int(
                 "index_hist_lookback_days", cls.index_hist_lookback_days
@@ -300,8 +294,6 @@ class MA5MA20OpenMonitorRunner:
     def _build_run_params_json(self) -> str:
         payload = {
             "signal_lookback_days": self.params.signal_lookback_days,
-            "cross_valid_days": self.params.cross_valid_days,
-            "pullback_valid_days": self.params.pullback_valid_days,
             "index_code": self.params.index_code,
             "index_hist_lookback_days": self.params.index_hist_lookback_days,
             "quote_source": self.params.quote_source,
