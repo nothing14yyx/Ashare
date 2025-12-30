@@ -392,6 +392,7 @@ class OpenMonitorEnvService:
             run_id,
             checked_at,
             env_context,
+            run_pk=run_pk,
             fetch_index_live_quote=fetch_index_live_quote,
         )
 
@@ -560,6 +561,7 @@ class OpenMonitorEnvService:
         checked_at: dt.datetime,
         env_context: dict[str, Any] | None,
         *,
+        run_pk: int | None = None,
         fetch_index_live_quote: Callable[[], dict[str, Any]] | None,
     ) -> tuple[dict[str, Any] | None, dict[str, Any], str | None]:
         ctx = env_context or {}
@@ -648,20 +650,24 @@ class OpenMonitorEnvService:
             live_override = self.evaluate_live_override(ctx, index_env_snapshot)
             ctx.update(live_override)
             if index_env_snapshot.get("env_index_code"):
-                quote_payload = {
-                    "monitor_date": monitor_date,
-                    "run_id": run_id,
-                    "code": index_env_snapshot.get("env_index_code"),
-                    "live_trade_date": index_env_snapshot.get("env_index_live_trade_date"),
-                    "live_open": _to_float(index_env_snapshot.get("env_index_live_open")),
-                    "live_high": _to_float(index_env_snapshot.get("env_index_live_high")),
-                    "live_low": _to_float(index_env_snapshot.get("env_index_live_low")),
-                    "live_latest": _to_float(index_env_snapshot.get("env_index_live_latest")),
-                    "live_volume": _to_float(index_env_snapshot.get("env_index_live_volume")),
-                    "live_amount": _to_float(index_env_snapshot.get("env_index_live_amount")),
-                }
-                quote_df = pd.DataFrame([quote_payload])
-                self.repo.persist_quote_snapshots(quote_df)
+                if run_pk is None:
+                    self.logger.warning("指数行情快照缺少 run_pk，已跳过写入。")
+                else:
+                    quote_payload = {
+                        "monitor_date": monitor_date,
+                        "run_pk": run_pk,
+                        "run_id": run_id,
+                        "code": index_env_snapshot.get("env_index_code"),
+                        "live_trade_date": index_env_snapshot.get("env_index_live_trade_date"),
+                        "live_open": _to_float(index_env_snapshot.get("env_index_live_open")),
+                        "live_high": _to_float(index_env_snapshot.get("env_index_live_high")),
+                        "live_low": _to_float(index_env_snapshot.get("env_index_live_low")),
+                        "live_latest": _to_float(index_env_snapshot.get("env_index_live_latest")),
+                        "live_volume": _to_float(index_env_snapshot.get("env_index_live_volume")),
+                        "live_amount": _to_float(index_env_snapshot.get("env_index_live_amount")),
+                    }
+                    quote_df = pd.DataFrame([quote_payload])
+                    self.repo.persist_quote_snapshots(quote_df)
 
         if index_env_snapshot:
             gate_action = index_env_snapshot.get("env_index_gate_action")
