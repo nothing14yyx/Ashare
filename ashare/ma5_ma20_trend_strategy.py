@@ -37,8 +37,10 @@ from .schema_manager import (
     STRATEGY_CODE_MA5_MA20_TREND,
     TABLE_STRATEGY_CHIP_FILTER,
     TABLE_STRATEGY_INDICATOR_DAILY,
+    TABLE_STRATEGY_CANDIDATES,
     TABLE_STRATEGY_SIGNAL_EVENTS,
 )
+from .strategy_candidates import StrategyCandidatesService
 from .utils import setup_logger
 
 
@@ -47,7 +49,6 @@ class MA5MA20Params:
     """策略参数（支持从 config.yaml 的 strategy_ma5_ma20_trend 节覆盖）。"""
 
     enabled: bool = False
-    universe_source: str = "top_liquidity"  # top_liquidity / universe / all
     lookback_days: int = 365
 
     # 日线数据来源表：默认直接用全量表（性能更稳），必要时你也可以在 config.yaml 覆盖
@@ -200,6 +201,7 @@ class MA5MA20StrategyRunner:
         self.logger = setup_logger()
         self.params = MA5MA20Params.from_config()
         self.db_writer = MySQLWriter(DatabaseConfig.from_env())
+        self.candidates_service = StrategyCandidatesService(self.db_writer, self.logger)
         self.indicator_window = self._resolve_indicator_window()
         self._fundamentals_cache: pd.DataFrame | None = None
         self._stock_basic_cache: pd.DataFrame | None = None
@@ -239,142 +241,6 @@ class MA5MA20StrategyRunner:
         if pd.isna(ts):
             raise RuntimeError(f"无法解析最新交易日：{v!r}")
         return ts.date()
-
-    def _load_universe_codes(self, latest_date: dt.date) -> List[str]:
-        """按配置选择选股池来源：top_liquidity / universe / all"""
-        source = (self.params.universe_source or "top_liquidity").strip().lower()
-        # all：表示“全市场”，不要先把 3000+ codes 拉到 Python（更慢）；后续 SQL 直接按日期窗口读取
-        if source == "all":
-            return []
-        with self.db_writer.engine.begin() as conn:
-            if source == "top_liquidity":
-                stmt = text("SELECT `code` FROM `a_share_top_liquidity` WHERE `date` = :d")
-                codes = [r[0] for r in conn.execute(stmt, {"d": latest_date}).fetchall()]
-                if codes:
-                    return [str(c) for c in codes]
-
-            if source == "universe":
-                stmt = text("SELECT `code` FROM `a_share_universe` WHERE `date` = :d")
-                codes = [r[0] for r in conn.execute(stmt, {"d": latest_date}).fetchall()]
-                if codes:
-                    return [str(c) for c in codes]
-
-        # all：退化为 stock_list
-        with self.db_writer.engine.begin() as conn:
-            stmt = text("SELECT `code` FROM `a_share_stock_list`")
-            codes = [r[0] for r in conn.execute(stmt).fetchall()]
-        return [str(c) for c in codes]
-
-    def _resolve_snapshot_buy_lookback(self) -> int:
-        open_monitor_cfg = get_section("open_monitor") or {}
-        if not isinstance(open_monitor_cfg, dict):
-            return 1
-
-        def _to_int(value) -> int:
-            try:
-                return int(value)
-            except Exception:  # noqa: BLE001
-                return 0
-
-        lookback_days = _to_int(open_monitor_cfg.get("signal_lookback_days"))
-        cross_days = _to_int(open_monitor_cfg.get("cross_valid_days"))
-        pullback_days = _to_int(open_monitor_cfg.get("pullback_valid_days"))
-        valid_days_max = max(cross_days, pullback_days)
-        resolved = max(lookback_days, valid_days_max + 1)
-        return resolved if resolved > 0 else 1
-
-    def _load_recent_buy_codes(self, latest_date: dt.date) -> set[str]:
-        table = self.params.signal_events_table
-        if not self._table_exists(table):
-            return set()
-
-        lookback = self._resolve_snapshot_buy_lookback()
-        base_table = self._daily_table_name()
-        date_col = "date"
-        if not self._table_exists(base_table):
-            if self._table_exists(self.params.indicator_table):
-                base_table = self.params.indicator_table
-                date_col = "trade_date"
-            else:
-                base_table = table
-                date_col = "sig_date"
-        base_date_str = latest_date.isoformat()
-
-        try:
-            with self.db_writer.engine.begin() as conn:
-                trade_dates_df = pd.read_sql_query(
-                    text(
-                        f"""
-                        SELECT DISTINCT CAST(`{date_col}` AS CHAR) AS d
-                        FROM `{base_table}`
-                        WHERE `{date_col}` <= :base_date
-                        ORDER BY d DESC
-                        LIMIT {lookback}
-                        """
-                    ),
-                    conn,
-                    params={"base_date": base_date_str},
-                )
-        except Exception as exc:  # noqa: BLE001
-            self.logger.warning("读取快照补齐窗口失败：%s", exc)
-            trade_dates_df = pd.DataFrame()
-
-        trade_dates = (
-            trade_dates_df["d"].dropna().astype(str).str[:10].tolist()
-            if trade_dates_df is not None and not trade_dates_df.empty
-            else []
-        )
-        if not trade_dates:
-            return set()
-
-        window_latest = trade_dates[0]
-        window_earliest = trade_dates[-1]
-        sql_params = {
-            "latest": window_latest,
-            "earliest": window_earliest,
-            "strategy": STRATEGY_CODE_MA5_MA20_TREND,
-        }
-        stmt = text(
-            f"""
-            SELECT DISTINCT `code`
-            FROM `{table}`
-            WHERE UPPER(COALESCE(`final_action`, `signal`)) IN ('BUY','BUY_CONFIRM')
-              AND `strategy_code` = :strategy
-              AND `sig_date` <= :latest
-              AND `sig_date` >= :earliest
-            """
-        )
-        try:
-            with self.db_writer.engine.begin() as conn:
-                codes_df = pd.read_sql_query(stmt, conn, params=sql_params)
-        except OperationalError as exc:  # noqa: BLE001
-            self.logger.debug("读取近期 BUY/BUY_CONFIRM 信号失败，回退为 signal 字段：%s", exc)
-            try:
-                with self.db_writer.engine.begin() as conn:
-                    codes_df = pd.read_sql_query(
-                        text(
-                            f"""
-                            SELECT DISTINCT `code`
-                            FROM `{table}`
-                            WHERE UPPER(`signal`) IN ('BUY','BUY_CONFIRM')
-                              AND `strategy_code` = :strategy
-                              AND `sig_date` <= :latest
-                              AND `sig_date` >= :earliest
-                            """
-                        ),
-                        conn,
-                        params=sql_params,
-                    )
-            except Exception as exc2:  # noqa: BLE001
-                self.logger.warning("读取近期 BUY/BUY_CONFIRM 信号代码失败：%s", exc2)
-                return set()
-        except Exception as exc:  # noqa: BLE001
-            self.logger.warning("读取近期 BUY/BUY_CONFIRM 信号代码失败：%s", exc)
-            return set()
-        if codes_df.empty or "code" not in codes_df.columns:
-            return set()
-
-        return set(codes_df["code"].dropna().astype(str).tolist())
 
     def _load_daily_kline(self, codes: List[str], end_date: dt.date) -> pd.DataFrame:
         """读取最近 indicator_window 天的日线数据，用于指标计算。"""
@@ -1441,15 +1307,32 @@ class MA5MA20StrategyRunner:
             return False
 
     def _write_indicator_daily(
-        self, latest_date: dt.date, signals: pd.DataFrame, codes: List[str]
+        self,
+        latest_date: dt.date,
+        signals: pd.DataFrame,
+        codes: List[str],
+        *,
+        scope_override: str | None = None,
     ) -> None:
         table = self.params.indicator_table
-        scope = (getattr(self.params, "signals_write_scope", "latest") or "latest").strip().lower()
+        scope = (
+            (scope_override or getattr(self.params, "signals_write_scope", "latest"))
+            or "latest"
+        ).strip().lower()
         if scope not in {"latest", "window"}:
             self.logger.warning("signals_write_scope=%s 无效，已回退为 latest。", scope)
             scope = "latest"
 
-        base = signals[signals["date"].dt.date == latest_date].copy() if scope == "latest" else signals.copy()
+        base = signals.copy()
+        codes_clean = [str(c) for c in (codes or []) if str(c).strip()]
+        if codes_clean:
+            base = base[base["code"].astype(str).isin(codes_clean)].copy()
+        if base.empty:
+            self.logger.warning("指标写入为空（scope=%s），已跳过。", scope)
+            return
+
+        if scope == "latest":
+            base = base[base["date"].dt.date == latest_date].copy()
         if base.empty:
             self.logger.warning("signals_write_scope=%s 下无任何指标行，已跳过写入。", scope)
             return
@@ -1499,7 +1382,6 @@ class MA5MA20StrategyRunner:
         else:
             start_d = min(indicator_df["trade_date"])
             end_d = max(indicator_df["trade_date"])
-            codes_clean = [str(c) for c in (codes or []) if str(c).strip()]
             delete_by_date_only = (not codes_clean) or (len(codes_clean) > 2000)
             with self.db_writer.engine.begin() as conn:
                 if delete_by_date_only:
@@ -1536,15 +1418,32 @@ class MA5MA20StrategyRunner:
         self.db_writer.write_dataframe(indicator_df, table, if_exists="append")
 
     def _write_signal_events(
-        self, latest_date: dt.date, signals: pd.DataFrame, codes: List[str]
+        self,
+        latest_date: dt.date,
+        signals: pd.DataFrame,
+        codes: List[str],
+        *,
+        scope_override: str | None = None,
     ) -> None:
         table = self.params.signal_events_table
-        scope = (getattr(self.params, "signals_write_scope", "latest") or "latest").strip().lower()
+        scope = (
+            (scope_override or getattr(self.params, "signals_write_scope", "latest"))
+            or "latest"
+        ).strip().lower()
         if scope not in {"latest", "window"}:
             self.logger.warning("signals_write_scope=%s 无效，已回退为 latest。", scope)
             scope = "latest"
 
-        base = signals[signals["date"].dt.date == latest_date].copy() if scope == "latest" else signals.copy()
+        base = signals.copy()
+        codes_clean = [str(c) for c in (codes or []) if str(c).strip()]
+        if codes_clean:
+            base = base[base["code"].astype(str).isin(codes_clean)].copy()
+        if base.empty:
+            self.logger.warning("信号事件写入为空（scope=%s），已跳过。", scope)
+            return
+
+        if scope == "latest":
+            base = base[base["date"].dt.date == latest_date].copy()
         if base.empty:
             self.logger.warning("signals_write_scope=%s 下无任何信号事件，已跳过写入。", scope)
             return
@@ -1644,7 +1543,6 @@ class MA5MA20StrategyRunner:
         else:
             start_d = min(events_df["sig_date"])
             end_d = max(events_df["sig_date"])
-            codes_clean = [str(c) for c in (codes or []) if str(c).strip()]
             delete_by_date_only = (not codes_clean) or (len(codes_clean) > 2000)
             with self.db_writer.engine.begin() as conn:
                 if delete_by_date_only:
@@ -1751,30 +1649,71 @@ class MA5MA20StrategyRunner:
 
         daily_tbl = self._daily_table_name()
         latest_date = self._get_latest_trade_date()
-        signal_codes = self._load_universe_codes(latest_date)
-        recent_buy_codes = self._load_recent_buy_codes(latest_date)
-        source = (self.params.universe_source or "top_liquidity").strip().lower()
-        calc_codes_set: set[str] = set()
-        if source == "all" and not signal_codes:
-            calc_codes = []
-        else:
-            calc_codes_set = set(signal_codes).union(recent_buy_codes)
-            calc_codes = sorted(calc_codes_set)
+        self.candidates_service.refresh(latest_date)
+
+        with self.db_writer.engine.begin() as conn:
+            candidates_df = pd.read_sql_query(
+                text(
+                    f"""
+                    SELECT `code`, `is_liquidity`, `has_signal`
+                    FROM `{TABLE_STRATEGY_CANDIDATES}`
+                    WHERE `asof_trade_date` = :d
+                    """
+                ),
+                conn,
+                params={"d": latest_date},
+            )
+
+        if candidates_df.empty:
+            self.logger.warning(
+                "strategy_candidates=%s 为空，已跳过 MA5-MA20 策略运行。",
+                latest_date,
+            )
+            return
+
+        candidates_df["code"] = candidates_df["code"].astype(str)
+        candidate_codes = candidates_df["code"].dropna().unique().tolist()
+        liquidity_codes = (
+            candidates_df.loc[candidates_df["is_liquidity"] == 1, "code"]
+            .dropna()
+            .unique()
+            .tolist()
+        )
+        signal_codes = (
+            candidates_df.loc[candidates_df["has_signal"] == 1, "code"]
+            .dropna()
+            .unique()
+            .tolist()
+        )
+        candidate_set = set(candidate_codes)
+        liquidity_set = set(liquidity_codes)
+        signal_set = set(signal_codes)
+        both_set = liquidity_set & signal_set
+        snapshot_only_set = candidate_set - liquidity_set
         self.logger.info(
-            "MA5-MA20 策略：日线表=%s，信号选股池来源=%s，信号 codes=%s，快照补齐=%s（新增 %s 个近期 BUY code）",
+            "MA5-MA20 策略：日线表=%s candidates_total=%s liquidity=%s signal=%s both=%s snapshot_only=%s",
             daily_tbl,
-            self.params.universe_source,
-            len(signal_codes),
-            len(calc_codes),
-            max(len(calc_codes_set) - len(set(signal_codes)), 0),
+            len(candidate_set),
+            len(liquidity_set),
+            len(signal_set),
+            len(both_set),
+            len(snapshot_only_set),
         )
 
-        daily = self._load_daily_kline(calc_codes, latest_date)
+        daily = self._load_daily_kline(candidate_codes, latest_date)
         self.logger.info("MA5-MA20 策略：读取日线 %s 行（%s 只股票）。", len(daily), daily["code"].nunique())
 
         ind = self._compute_indicators(daily)
-        fundamentals = self._load_fundamentals_latest() if self._fundamentals_cache is None else self._fundamentals_cache
-        stock_basic = self._load_stock_basic() if self._stock_basic_cache is None else self._stock_basic_cache
+        fundamentals = (
+            self._load_fundamentals_latest()
+            if self._fundamentals_cache is None
+            else self._fundamentals_cache
+        )
+        stock_basic = (
+            self._load_stock_basic()
+            if self._stock_basic_cache is None
+            else self._stock_basic_cache
+        )
         self._fundamentals_cache = fundamentals
         self._stock_basic_cache = stock_basic
         sig = self._generate_signals(ind, fundamentals, stock_basic)
@@ -1788,7 +1727,8 @@ class MA5MA20StrategyRunner:
         )
         sig["code"] = sig["code"].astype(str)
         sig_for_write = sig.copy()
-        snapshot_only_codes = calc_codes_set - set(signal_codes) if calc_codes_set else set()
+        snapshot_only_codes = sorted(snapshot_only_set)
+        liquidity_codes = sorted(liquidity_set)
         if snapshot_only_codes:
             snapshot_mask = sig_for_write["code"].isin(snapshot_only_codes)
             latest_mask = sig_for_write["date"].dt.date == latest_date
@@ -1801,8 +1741,23 @@ class MA5MA20StrategyRunner:
                 ignore_index=True,
             )
 
-        self._write_indicator_daily(latest_date, sig, calc_codes)
-        self._write_signal_events(latest_date, sig_for_write, calc_codes)
+        self._write_indicator_daily(latest_date, sig, liquidity_codes)
+        if snapshot_only_codes:
+            self._write_indicator_daily(
+                latest_date,
+                sig,
+                snapshot_only_codes,
+                scope_override="latest",
+            )
+
+        self._write_signal_events(latest_date, sig_for_write, liquidity_codes)
+        if snapshot_only_codes:
+            self._write_signal_events(
+                latest_date,
+                sig_for_write,
+                snapshot_only_codes,
+                scope_override="latest",
+            )
 
         self._precompute_chip_filter(sig_for_write)
 

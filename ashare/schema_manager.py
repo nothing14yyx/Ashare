@@ -21,6 +21,7 @@ TABLE_A_SHARE_UNIVERSE = "a_share_universe"
 # 统一策略信号体系表命名：按单一职责拆分
 TABLE_STRATEGY_INDICATOR_DAILY = "strategy_indicator_daily"
 TABLE_STRATEGY_SIGNAL_EVENTS = "strategy_signal_events"
+TABLE_STRATEGY_CANDIDATES = "strategy_candidates"
 # 策略准备就绪信号（含筹码）
 VIEW_STRATEGY_READY_SIGNALS = "v_strategy_ready_signals"
 TABLE_STRATEGY_CHIP_FILTER = "strategy_chip_filter"
@@ -90,6 +91,7 @@ class SchemaManager:
 
         self._ensure_indicator_table(tables.indicator_table)
         self._ensure_signal_events_table(tables.signal_events_table)
+        self._ensure_strategy_candidates_table()
         self._ensure_trade_metrics_table()
         self._ensure_backtest_view()
         self._ensure_chip_filter_table()
@@ -837,6 +839,31 @@ class SchemaManager:
                 )
             self.logger.info("信号事件表 %s 已新增唯一索引 %s。", table, unique_name)
 
+    def _ensure_strategy_candidates_table(self) -> None:
+        table = TABLE_STRATEGY_CANDIDATES
+        columns = {
+            "asof_trade_date": "DATE NOT NULL",
+            "code": "VARCHAR(20) NOT NULL",
+            "is_liquidity": "TINYINT(1) NOT NULL DEFAULT 0",
+            "has_signal": "TINYINT(1) NOT NULL DEFAULT 0",
+            "latest_sig_date": "DATE NULL",
+            "latest_sig_action": "VARCHAR(16) NULL",
+            "latest_sig_strategy_code": "VARCHAR(32) NULL",
+            "created_at": "DATETIME(6) NULL",
+        }
+        if not self._table_exists(table):
+            self._create_table(
+                table,
+                columns,
+                primary_key=("asof_trade_date", "code"),
+            )
+            return
+        self._add_missing_columns(table, columns)
+        self._ensure_varchar_length(table, "latest_sig_action", 16)
+        self._ensure_varchar_length(table, "latest_sig_strategy_code", 32)
+        self._ensure_date_column(table, "asof_trade_date", not_null=True)
+        self._ensure_date_column(table, "latest_sig_date", not_null=False)
+        self._ensure_datetime_column(table, "created_at")
     def _ensure_ready_signals_view(
             self,
             view: str,
