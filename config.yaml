@@ -176,6 +176,12 @@ open_monitor:
   dev_ma5_atr_max: 2.0
   dev_ma20_atr_max: 2.5
 
+  # 指数关键位突破阈值（用于盘中解锁/解释）
+  live_breakout_high_eps: 0.002    # 冲过上沿：high >= upper * (1 + eps)
+  live_breakout_latest_eps: 0.001  # 站稳上方：latest >= upper * (1 + eps)
+  live_retest_pct: 0.003           # 回踩容忍：upper * pct 与 ATR 容忍二选大
+  live_retest_atr_mult: 0.5        # 回踩容忍：daily_atr14 * mult
+
   # 风控：开盘以“实际入场价”为基准计算止损（stop_ref=entry-stop_atr_mult*ATR）
   stop_atr_mult: 2.0
 

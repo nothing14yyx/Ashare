@@ -515,6 +515,7 @@ class OpenMonitorEnvService:
         live_low = _to_float(index_snapshot.get("env_index_live_low"))
         live_dev_ma20_atr = _to_float(index_snapshot.get("env_index_dev_ma20_atr"))
         daily_ma20 = _to_float(env_context.get("daily_ma20"))
+        daily_atr14 = _to_float(env_context.get("daily_atr14"))
         daily_bb_lower = _to_float(env_context.get("daily_bb_lower"))
         daily_bb_upper = _to_float(env_context.get("daily_bb_upper"))
         daily_bb_width = _to_float(env_context.get("daily_bb_width"))
@@ -529,6 +530,7 @@ class OpenMonitorEnvService:
         cap_candidates: list[float] = []
         events: list[str] = []
         unlock_gate = None
+        upper_reason = None
 
         if live_pct is not None:
             if live_pct <= -3.0:
@@ -575,18 +577,47 @@ class OpenMonitorEnvService:
             and live_latest is not None
             and live_low is not None
         ):
+            breakout_high_eps = self.params.live_breakout_high_eps
+            breakout_latest_eps = self.params.live_breakout_latest_eps
+            retest_pct = self.params.live_retest_pct
+            retest_atr_mult = self.params.live_retest_atr_mult
+            retest_atr_allowance = (
+                daily_atr14 * retest_atr_mult if daily_atr14 is not None else 0.0
+            )
+            retest_pct_allowance = upper_level * retest_pct
+            retest_allowance = max(retest_pct_allowance, retest_atr_allowance)
+            retest_floor = upper_level - retest_allowance
+
+            if live_high >= upper_level * (1 + breakout_high_eps):
+                events.append("LIVE_TOUCH_UPPER")
+            if live_latest >= upper_level * (1 + breakout_latest_eps):
+                events.append("LIVE_BREAKOUT_HOLDING")
             if (
-                live_high >= upper_level * 1.002
-                and live_latest >= upper_level * 1.001
-                and live_low >= upper_level * 0.997
+                live_high >= upper_level * (1 + breakout_high_eps)
+                and live_low < retest_floor
+            ):
+                events.append("LIVE_RETEST_FAILED")
+
+            if (
+                live_high >= upper_level * (1 + breakout_high_eps)
+                and live_latest >= upper_level * (1 + breakout_latest_eps)
+                and live_low >= retest_floor
             ):
                 unlock_gate = "ALLOW_SMALL"
                 events.append("LIVE_BREAKOUT_UPPER")
                 events.append("LIVE_BREAKOUT_RETEST_HELD")
 
+            upper_reason = (
+                "upper={:.2f} high={:.2f} low={:.2f} latest={:.2f} "
+                "hold_low>={:.2f}"
+            ).format(upper_level, live_high, live_low, live_latest, retest_floor)
+
         action = self._merge_live_actions(actions)
         cap_multiplier = min(cap_candidates) if cap_candidates else 1.0
-        reason = ";".join(events)[:255] if events else None
+        if upper_reason:
+            reason = upper_reason[:255]
+        else:
+            reason = ";".join(events)[:255] if events else None
         return {
             "env_live_override_action": action,
             "env_live_cap_multiplier": cap_multiplier,

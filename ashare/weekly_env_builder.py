@@ -680,6 +680,7 @@ class WeeklyEnvironmentBuilder:
         structure_status = str(_get_env("weekly_structure_status") or status).upper()
         weekly_phase = str(_get_env("weekly_phase") or "").upper()
         weekly_tags = str(_get_env("weekly_tags") or "")
+        weekly_risk_score = to_float(_get_env("weekly_risk_score"))
 
         if not gating_enabled:
             return "ALLOW"
@@ -688,7 +689,17 @@ class WeeklyEnvironmentBuilder:
         if weekly_phase == "BREAKDOWN_RISK":
             baseline_gate = "WAIT"
         elif risk_level == "HIGH":
-            baseline_gate = "WAIT"
+            if weekly_risk_score is not None and weekly_risk_score >= 85:
+                baseline_gate = "WAIT"
+            elif (
+                weekly_risk_score is not None
+                and 70 <= weekly_risk_score < 85
+                and weekly_phase == "BULL_TREND"
+                and structure_status == "FORMING"
+            ):
+                baseline_gate = "ALLOW_SMALL"
+            else:
+                baseline_gate = "WAIT"
         elif risk_level == "MEDIUM" and structure_status == "FORMING":
             # feat: MEDIUM 风险周线不一票 WAIT，改为 ALLOW_SMALL 以降仓放行
             baseline_gate = "ALLOW_SMALL"
@@ -874,6 +885,10 @@ class WeeklyEnvironmentBuilder:
 
         for key in [
             "weekly_asof_trade_date",
+            "weekly_risk_score",
+            "weekly_scene_code",
+            "weekly_structure_status",
+            "weekly_pattern_status",
             "daily_asof_trade_date",
             "weekly_zone_id",
             "daily_zone_id",
