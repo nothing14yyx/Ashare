@@ -86,19 +86,20 @@ def calc_run_id(ts: dt.datetime, run_id_minutes: int | None) -> str:
     lunch_break_end = dt.time(13, 0)
     market_close = dt.time(15, 0)
 
-    t = ts.time()
-    if t < auction_start:
-        return "PREOPEN"
-    if lunch_break_start <= t < lunch_break_end:
-        return "BREAK"
-    if t >= market_close:
-        return "POSTCLOSE"
-
     minute_of_day = ts.hour * 60 + ts.minute
     slot_minute = (minute_of_day // window_minutes) * window_minutes
     slot_time = dt.datetime.combine(ts.date(), dt.time(slot_minute // 60, slot_minute % 60))
-    run_id = slot_time.strftime("%Y-%m-%d %H:%M")
-    return run_id
+    slot_text = slot_time.strftime("%Y-%m-%d %H:%M")
+
+    t = ts.time()
+    if t < auction_start:
+        return f"PREOPEN {slot_text}"
+    if lunch_break_start <= t < lunch_break_end:
+        return f"BREAK {slot_text}"
+    if t >= market_close:
+        return f"POSTCLOSE {slot_text}"
+
+    return slot_text
 
 
 class OpenMonitorRepository:
@@ -947,6 +948,69 @@ class OpenMonitorRepository:
         if not df.empty and "code" in df.columns:
             df["code"] = df["code"].astype(str)
         return df
+
+
+    def load_latest_run_context_by_stage(
+        self,
+        monitor_date: str,
+        *,
+        stage: str | None = None,
+    ) -> dict[str, Any] | None:
+        table = getattr(self.params, "run_table", None)
+        if not (table and monitor_date and self._table_exists(table)):
+            return None
+
+        stage_norm = (str(stage).strip().upper() if stage else "") or None
+        where_clauses = ["`monitor_date` = :d"]
+        params: dict[str, Any] = {"d": monitor_date}
+
+        if stage_norm in {"PREOPEN", "BREAK", "POSTCLOSE"}:
+            where_clauses.append("`run_id` LIKE :p")
+            params["p"] = f"{stage_norm} %"
+        elif stage_norm == "INTRADAY":
+            where_clauses.append("`run_id` NOT LIKE 'PREOPEN %'")
+            where_clauses.append("`run_id` NOT LIKE 'BREAK %'")
+            where_clauses.append("`run_id` NOT LIKE 'POSTCLOSE %'")
+
+        stmt = text(
+            f"""
+            SELECT `run_pk`,`run_id`,`params_json`
+            FROM `{table}`
+            WHERE {" AND ".join(where_clauses)}
+            ORDER BY `run_pk` DESC
+            LIMIT 1
+            """
+        )
+        try:
+            with self.engine.begin() as conn:
+                row = conn.execute(stmt, params).fetchone()
+        except Exception as exc:  # noqa: BLE001
+            self.logger.debug("读取最新 run_context 失败：%s", exc)
+            return None
+
+        if not row:
+            return None
+
+        run_pk_val = row[0]
+        run_id_val = row[1]
+        params_json_raw = row[2]
+
+        parsed: dict[str, Any] = {}
+        if isinstance(params_json_raw, str) and params_json_raw.strip():
+            try:
+                parsed = json.loads(params_json_raw)
+            except Exception:
+                parsed = {}
+        if not isinstance(parsed, dict):
+            parsed = {}
+
+        return {
+            "run_pk": int(run_pk_val) if run_pk_val is not None else None,
+            "run_id": str(run_id_val) if run_id_val is not None else None,
+            "params_json": params_json_raw,
+            "dedup_sig": parsed.get("dedup_sig"),
+            "dedup_stage": parsed.get("dedup_stage"),
+        }
 
     def ensure_run_context(
         self,

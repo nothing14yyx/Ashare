@@ -279,6 +279,7 @@ class OpenMonitorEvaluator:
         run_id_val = run_id or calc_run_id(checked_at_ts, self.params.run_id_minutes)
         monitor_date = checked_at_ts.date().isoformat()
         run_id_norm = str(run_id_val or "").strip().upper()
+        run_stage = run_id_norm.split(" ", 1)[0] if run_id_norm else ""
         if not ready_signals_used:
             self.logger.error(
                 "未启用 ready_signals_view（严格模式），已终止评估（monitor_date=%s, run_id=%s）。",
@@ -373,9 +374,9 @@ class OpenMonitorEvaluator:
             price_now = price_open if price_open is not None else price_latest
             ref_close = _resolve_ref_close(row)
             if price_now is None:
-                if run_id_norm == "PREOPEN" and ref_close is not None:
+                if run_stage == "PREOPEN" and ref_close is not None:
                     price_now = ref_close
-                elif run_id_norm == "POSTCLOSE":
+                elif run_stage == "POSTCLOSE":
                     price_now = _to_float(row.get("live_latest")) or ref_close or _to_float(
                         row.get("sig_close")
                     )

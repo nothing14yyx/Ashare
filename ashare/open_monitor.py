@@ -36,7 +36,7 @@ from .open_monitor_eval import (
     merge_gate_actions,
 )
 from .open_monitor_market_data import OpenMonitorMarketData
-from .open_monitor_repo import OpenMonitorRepository, calc_run_id
+from .open_monitor_repo import OpenMonitorRepository, calc_run_id, make_snapshot_hash
 from .open_monitor_rules import Rule, RuleEngine, RuleResult
 from .market_indicator_builder import MarketIndicatorBuilder
 from .schema_manager import (
@@ -381,21 +381,95 @@ class MA5MA20OpenMonitorRunner:
         self.repo.params = self.params
         self.market_data.params = self.params
         run_id = self._calc_run_id(biz_ts)
+
+        latest_trade_date, signal_dates, signals = self.repo.load_recent_buy_signals()
+
+        run_id_norm = str(run_id or "").strip()
+        run_stage = run_id_norm.split(" ", 1)[0] if " " in run_id_norm else ""
+        if run_stage not in {"PREOPEN", "BREAK", "POSTCLOSE"}:
+            run_stage = "INTRADAY"
+
+        fetch_index_quote = None
+        dedup_sig = None
+        signals_sig = None
+        index_sig = None
+        if latest_trade_date and (signals is not None) and (not signals.empty):
+            codes = signals["code"].dropna().astype(str).unique().tolist()
+            signal_dates_sorted = sorted(
+                [str(d) for d in (signal_dates or []) if str(d).strip()]
+            )
+            signals_payload = {
+                "latest_trade_date": latest_trade_date,
+                "signal_dates": signal_dates_sorted,
+                "codes": sorted(codes),
+            }
+            signals_sig = make_snapshot_hash(signals_payload)
+
+            index_live_quote = self.market_data.fetch_index_live_quote()
+            if isinstance(index_live_quote, dict) and index_live_quote:
+                fetch_index_quote = lambda: dict(index_live_quote)
+                index_payload = {
+                    "index_code": str(self.params.index_code or "").strip() or None,
+                    "live_trade_date": index_live_quote.get("live_trade_date"),
+                    "live_open": _to_float(index_live_quote.get("live_open") or index_live_quote.get("open")),
+                    "live_high": _to_float(index_live_quote.get("live_high") or index_live_quote.get("high")),
+                    "live_low": _to_float(index_live_quote.get("live_low") or index_live_quote.get("low")),
+                    "live_latest": _to_float(index_live_quote.get("live_latest") or index_live_quote.get("latest")),
+                    "live_pct_change": _to_float(
+                        index_live_quote.get("live_pct_change")
+                        or index_live_quote.get("pct_change")
+                    ),
+                    "live_volume": _to_float(
+                        index_live_quote.get("live_volume") or index_live_quote.get("volume")
+                    ),
+                    "live_amount": _to_float(
+                        index_live_quote.get("live_amount") or index_live_quote.get("amount")
+                    ),
+                }
+                index_sig = make_snapshot_hash(index_payload)
+
+            if index_sig:
+                dedup_sig = make_snapshot_hash(
+                    {
+                        "dedup_stage": run_stage,
+                        "signals_sig": signals_sig,
+                        "index_sig": index_sig,
+                    }
+                )
+                prev = self.repo.load_latest_run_context_by_stage(
+                    monitor_date, stage=run_stage
+                )
+                if prev and prev.get("dedup_sig") == dedup_sig and prev.get("run_id"):
+                    run_id = str(prev["run_id"])
+
         run_params_json = self._build_run_params_json()
+        try:
+            run_params = json.loads(run_params_json)
+        except Exception:
+            run_params = {"raw_params_json": run_params_json}
+        if isinstance(run_params, dict):
+            run_params.setdefault("dedup_stage", run_stage)
+            if dedup_sig:
+                run_params["dedup_sig"] = dedup_sig
+            if signals_sig:
+                run_params["signals_sig"] = signals_sig
+            if index_sig:
+                run_params["index_sig"] = index_sig
+
         run_pk = self.repo.ensure_run_context(
             monitor_date,
             run_id,
             checked_at=checked_at,
             triggered_at=checked_at,
-            params_json=run_params_json,
+            params_json=run_params,
         )
         if run_pk is None:
             self.logger.error("未获取 run_pk，无法继续执行开盘监测。")
             return
 
-        latest_trade_date, signal_dates, signals = self.repo.load_recent_buy_signals()
         if not latest_trade_date or signals.empty:
             return
+
 
         codes = signals["code"].dropna().astype(str).unique().tolist()
         self.logger.info("待监测标的数量：%s（信号日：%s）", len(codes), signal_dates)
@@ -407,6 +481,7 @@ class MA5MA20OpenMonitorRunner:
             run_pk=run_pk,
             checked_at=checked_at,
             allow_auto_compute=True,
+            fetch_index_live_quote=fetch_index_quote,
         )
         if not env_context:
             self.logger.error(
