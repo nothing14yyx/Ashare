@@ -12,6 +12,7 @@ from ashare.config import get_section
 
 _DEFAULT_FMT = "%(asctime)s [%(levelname)s] %(message)s"
 _DEFAULT_DATEFMT = "%Y-%m-%d %H:%M:%S"
+_DEFAULT_CONSOLE_FMT = "[%(levelname)s] %(message)s"
 
 
 def _parse_level(value: str) -> int:
@@ -31,6 +32,18 @@ def _get_level_from_config() -> Optional[int]:
     if isinstance(level_value, str):
         return _parse_level(level_value)
     return _parse_level(str(level_value))
+
+
+def _get_level_from_config_key(key: str) -> Optional[int]:
+    section = get_section("logging")
+    value = section.get(key)
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        return _parse_level(value)
+    return _parse_level(str(value))
 
 
 def setup_logger(
@@ -87,13 +100,18 @@ def setup_logger(
     fmt = logging.Formatter(_DEFAULT_FMT, datefmt=_DEFAULT_DATEFMT)
 
     if console_level is None:
+        console_level = _get_level_from_config_key("console_level")
+    if file_level is None:
+        file_level = _get_level_from_config_key("file_level")
+
+    if console_level is None:
         console_level = level
     if file_level is None:
         file_level = level
 
     console_handler = logging.StreamHandler()
     console_handler.setLevel(console_level)
-    console_handler.setFormatter(fmt)
+    console_handler.setFormatter(logging.Formatter(_DEFAULT_CONSOLE_FMT))
 
     file_handler = RotatingFileHandler(
         log_file,

@@ -633,22 +633,56 @@ class MA5MA20StrategyRunner:
         reason = _append(reason, buy_macd_confirm, "MACD柱翻红")
         reason = _append(reason, buy_pattern, "W底突破")
 
-        # 卖出原因优先覆盖
-        reason = reason.mask(sell_without_hist, "MA5下穿MA20（死叉）或跌破MA20放量")
-        reason = reason.mask(hist_cross_down, "MACD柱翻绿/死叉")
-        reason = reason.mask(dead_cross, "死叉+缩量清")
-        reason = reason.mask(reduce_mask, "弱势缩量减仓")
-        reason = reason.mask(reason.eq(""), "观望")
+        # 识别接近信号：价格接近MA20但尚未触发买入条件
+        near_ma20 = ((df["close"] - df["ma20"]).abs() / df["ma20"]) <= 0.02  # 价格在MA20的2%范围内
+        ma5_above_ma20 = df["ma5"] > df["ma20"]  # MA5在MA20之上
+        ma5_approaching_ma20 = (df["ma5"] - df["ma5"].groupby(df["code"]).shift(1)) > 0  # MA5向上接近
+        near_signal_condition = near_ma20 & ma5_above_ma20 & ma5_approaching_ma20
 
         signal = np.select(
-            [sell | dead_cross, reduce_mask, buy_cross | buy_pullback | buy_pattern, buy_macd_confirm],
-            ["SELL", "REDUCE", "BUY", "BUY_CONFIRM"],
+            [sell | dead_cross, reduce_mask, buy_cross | buy_pullback | buy_pattern, buy_macd_confirm, near_signal_condition],
+            ["SELL", "REDUCE", "BUY", "BUY_CONFIRM", "NEAR_SIGNAL"],
             default="HOLD",
         )
 
         out = df.copy()
         out["signal"] = signal
         out["reason"] = reason.to_numpy()
+
+        # 更新reason以包含接近信号
+        out["reason"] = np.where(
+            out["signal"] == "NEAR_SIGNAL",
+            "价格接近MA20（接近信号）",
+            out["reason"]
+        )
+
+        # 卖出原因优先覆盖
+        out["reason"] = np.where(
+            sell_without_hist,
+            "MA5下穿MA20（死叉）或跌破MA20放量",
+            out["reason"]
+        )
+        out["reason"] = np.where(
+            hist_cross_down,
+            "MACD柱翻绿/死叉",
+            out["reason"]
+        )
+        out["reason"] = np.where(
+            dead_cross,
+            "死叉+缩量清",
+            out["reason"]
+        )
+        out["reason"] = np.where(
+            reduce_mask,
+            "弱势缩量减仓",
+            out["reason"]
+        )
+        out["reason"] = np.where(
+            out["reason"] == "",
+            "观望",
+            out["reason"]
+        )
+
         # 风险参考：2*ATR 作为“初始止损价”参考（你也可以换成 MA20 跌破止损）
         out["stop_ref"] = out["close"] - 2.0 * out["atr14"]
 

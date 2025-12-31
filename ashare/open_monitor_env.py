@@ -394,7 +394,9 @@ class OpenMonitorEnvService:
         if monitor_date is None:
             monitor_date = checked_at.date().isoformat()
         if run_id is None:
-            run_id = calc_run_id(checked_at, self.params.run_id_minutes)
+            run_id = calc_run_id(
+                checked_at, self.params.run_id_minutes, self.params.run_id_use_seconds
+            )
         run_id_norm = str(run_id or "").strip()
         run_stage = run_id_norm.split(" ", 1)[0] if " " in run_id_norm else ""
         if run_stage not in {"PREOPEN", "BREAK", "POSTCLOSE"}:

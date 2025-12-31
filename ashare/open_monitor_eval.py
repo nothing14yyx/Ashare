@@ -270,6 +270,7 @@ class OpenMonitorEvaluator:
         env_instruction: dict[str, Any] | None = None,
         *,
         checked_at: dt.datetime | None = None,
+        monitor_date: str | None = None,
         run_id: str | None = None,
         run_pk: int | None = None,
         ready_signals_used: bool = False,
@@ -279,7 +280,13 @@ class OpenMonitorEvaluator:
 
         checked_at_ts = checked_at or dt.datetime.now()
         run_id_val = run_id or calc_run_id(checked_at_ts, self.params.run_id_minutes)
-        monitor_date = checked_at_ts.date().isoformat()
+        if monitor_date is None:
+            monitor_date = checked_at_ts.date().isoformat()
+        else:
+            try:
+                monitor_date = dt.date.fromisoformat(str(monitor_date)).isoformat()
+            except Exception:
+                monitor_date = str(monitor_date).strip() or checked_at_ts.date().isoformat()
         run_id_norm = str(run_id_val or "").strip().upper()
         run_stage = run_id_norm.split(" ", 1)[0] if run_id_norm else ""
         if not ready_signals_used:

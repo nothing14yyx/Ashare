@@ -11,6 +11,7 @@ from ashare.app import AshareApp
 from ashare.ma5_ma20_trend_strategy import MA5MA20StrategyRunner
 from ashare.open_monitor import MA5MA20OpenMonitorRunner
 from ashare.schema_manager import ensure_schema
+from ashare.utils.logger import setup_logger
 from run_index_weekly_channel import run_weekly_market_indicator
 from run_chip_filter import main as run_chip_filter
 from run_daily_market_indicator import run_daily_market_indicator
@@ -22,7 +23,8 @@ def _parse_asof_date(raw: str | None) -> str | None:
     try:
         return dt.date.fromisoformat(str(raw)).isoformat()
     except Exception:  # noqa: BLE001
-        logging.warning(f"[WARN] --asof-date 无法解析：{raw}")
+        logger = logging.getLogger("ashare")
+        logger.warning("start --asof-date 无法解析：%s", raw)
         return None
 
 
@@ -103,23 +105,32 @@ def _self_check(
     latest_sig_date_cnt: int,
     weekly_status: dict,
     skipped_weekly: bool,
+    daily_indicator_written: int,
+    chip_processed: int,
 ) -> None:
+    logger = logging.getLogger("ashare")
     if ready_view and repo._table_exists(ready_view):  # noqa: SLF001
-        logging.info(f"[CHECK] ready_signals_view OK: {ready_view}")
+        ready_view_msg = f"ready_signals_view={ready_view}"
     else:
-        logging.info("[CHECK] ready_signals_view 缺失或未配置。")
+        ready_view_msg = "ready_signals_view=missing"
 
-    logging.info(f"[CHECK] 近 N 天 BUY 总数：{total_buy_cnt}")
-    logging.info(f"[CHECK] 最新信号日 BUY 数量：{latest_sig_date_cnt}")
-
+    weekly_msg = "weekly=skipped" if skipped_weekly else f"weekly_written={weekly_status.get('written', 0)}"
+    logger.info(
+        "start summary: %s buy_total_recent=%s latest_buy=%s daily_written=%s chip_processed=%s %s",
+        ready_view_msg,
+        total_buy_cnt,
+        latest_sig_date_cnt,
+        daily_indicator_written,
+        chip_processed,
+        weekly_msg,
+    )
     if skipped_weekly:
-        logging.info("[CHECK] 周线环境：已跳过。")
         return
     written = weekly_status.get("written", 0)
     if written:
-        logging.info(f"[CHECK] 周线指标 OK（写入 {written} 条）。")
+        logger.debug("start weekly indicator written=%s", written)
     else:
-        logging.info("[CHECK] 周线指标缺失，请检查周线指标生成流程。")
+        logger.warning("start weekly indicator missing; check weekly pipeline")
 
 
 def main(
@@ -131,6 +142,8 @@ def main(
     skip_daily_indicator: bool = False,
     asof_date: str | None = None,
 ) -> None:
+    setup_logger()
+    logger = logging.getLogger("ashare")
     ensure_schema()
     if not skip_fetch:
         AshareApp().run()
@@ -154,18 +167,16 @@ def main(
                 end_date=asof_date,
                 mode="incremental",
             )
-            logging.info(f"[INFO] 日线市场指标计算完成，写入 {daily_indicator_status.get('written', 0)} 条记录。")
         except Exception as exc:  # noqa: BLE001
-            logging.warning(f"[WARN] 日线市场指标计算失败：{exc}")
+            logger.warning("start daily indicator failed: %s", exc)
 
     # 执行筹码筛选计算
     chip_filter_status: dict = {"processed": 0}
     if not skip_chip:
         try:
             chip_filter_status["processed"] = run_chip_filter()
-            logging.info(f"[INFO] 筹码筛选计算完成，处理 {chip_filter_status.get('processed', 0)} 条记录。")
         except Exception as exc:  # noqa: BLE001
-            logging.warning(f"[WARN] 筹码筛选计算失败：{exc}")
+            logger.warning("start chip filter failed: %s", exc)
 
     weekly_status: dict = {"written": 0}
     skipped_weekly = bool(skip_weekly)
@@ -178,7 +189,7 @@ def main(
                 mode="incremental",
             )
         except Exception as exc:  # noqa: BLE001
-            logging.warning(f"[WARN] 周线环境生成失败：{exc}")
+            logger.warning("start weekly indicator failed: %s", exc)
 
     breakdown = []
     if ready_view and repo._table_exists(ready_view):  # noqa: SLF001
@@ -193,24 +204,6 @@ def main(
     latest_sig_date_buy_cnt = breakdown[0]["count"] if breakdown else 0
     buy_cnt_total_recent_n_days = sum(item.get("count", 0) for item in breakdown)
 
-    report = {
-        "latest_trade_date": latest_trade_date,
-        "latest_sig_date_buy_cnt": latest_sig_date_buy_cnt,
-        "buy_cnt_total_recent_n_days": buy_cnt_total_recent_n_days,
-        "buy_sig_date_breakdown": breakdown[:7],
-        "weekly_env_status": weekly_status if not skipped_weekly else {"skipped": True},
-        "daily_indicator_status": daily_indicator_status if not skip_daily_indicator else {"skipped": True},
-        "chip_filter_status": chip_filter_status if not skip_chip else {"skipped": True},
-    }
-
-    output_dir = Path("output")
-    output_dir.mkdir(parents=True, exist_ok=True)
-    ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-    report_path = output_dir / f"prep_report_{ts}.json"
-    with report_path.open("w", encoding="utf-8") as f:
-        json.dump(report, f, ensure_ascii=False, indent=2)
-    logging.info(f"[REPORT] 准备报告：已写入 {report_path.as_posix()}")
-
     _self_check(
         repo,
         ready_view=ready_view,
@@ -218,6 +211,8 @@ def main(
         latest_sig_date_cnt=latest_sig_date_buy_cnt,
         weekly_status=weekly_status,
         skipped_weekly=skipped_weekly,
+        daily_indicator_written=int(daily_indicator_status.get("written", 0) or 0),
+        chip_processed=int(chip_filter_status.get("processed", 0) or 0),
     )
 
 

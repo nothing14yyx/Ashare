@@ -219,6 +219,7 @@ class StrategyCandidatesService:
             "valid_days",
         ]
 
+        # 包含BUY/BUY_CONFIRM信号的股票
         stmt = text(
             f"""
             SELECT {", ".join(select_cols)}
@@ -234,34 +235,40 @@ class StrategyCandidatesService:
                 params={"earliest": earliest, "latest": latest},
             )
 
-        if df.empty:
-            return df
+        # 添加接近信号的股票
+        near_signal_df = self._load_near_signal_candidates(asof_date)
 
-        df = df.copy()
-        df["sig_date"] = pd.to_datetime(df["sig_date"], errors="coerce")
-        df = df.dropna(subset=["sig_date", "code"])
-        df["code"] = df["code"].astype(str)
-        df["action"] = df["action"].astype(str).str.upper()
-        df["valid_days"] = pd.to_numeric(df.get("valid_days"), errors="coerce")
-        df["signal_age"] = df["sig_date"].dt.strftime("%Y-%m-%d").map(
+        # 合并所有信号
+        all_signals_df = pd.concat([df, near_signal_df], ignore_index=True)
+
+        if all_signals_df.empty:
+            return all_signals_df
+
+        all_signals_df = all_signals_df.copy()
+        all_signals_df["sig_date"] = pd.to_datetime(all_signals_df["sig_date"], errors="coerce")
+        all_signals_df = all_signals_df.dropna(subset=["sig_date", "code"])
+        all_signals_df["code"] = all_signals_df["code"].astype(str)
+        all_signals_df["action"] = all_signals_df["action"].astype(str).str.upper()
+        all_signals_df["valid_days"] = pd.to_numeric(all_signals_df.get("valid_days"), errors="coerce")
+        all_signals_df["signal_age"] = all_signals_df["sig_date"].dt.strftime("%Y-%m-%d").map(
             {d: i for i, d in enumerate(trade_dates)}
         )
-        df = df.dropna(subset=["valid_days", "signal_age"])
-        if df.empty:
-            return df
-        df["valid_days"] = df["valid_days"].astype(int)
-        df["signal_age"] = df["signal_age"].astype(int)
-        df = df[df["signal_age"] <= df["valid_days"]]
-        if df.empty:
-            return df
+        all_signals_df = all_signals_df.dropna(subset=["valid_days", "signal_age"])
+        if all_signals_df.empty:
+            return all_signals_df
+        all_signals_df["valid_days"] = all_signals_df["valid_days"].astype(int)
+        all_signals_df["signal_age"] = all_signals_df["signal_age"].astype(int)
+        all_signals_df = all_signals_df[all_signals_df["signal_age"] <= all_signals_df["valid_days"]]
+        if all_signals_df.empty:
+            return all_signals_df
 
-        action_priority = {"BUY": 1, "BUY_CONFIRM": 2}
-        df["action_priority"] = df["action"].map(action_priority).fillna(0).astype(int)
-        df = df.sort_values(
+        action_priority = {"BUY": 1, "BUY_CONFIRM": 2, "NEAR_SIGNAL": 3}
+        all_signals_df["action_priority"] = all_signals_df["action"].map(action_priority).fillna(0).astype(int)
+        all_signals_df = all_signals_df.sort_values(
             ["code", "sig_date", "action_priority"],
             ascending=[True, False, False],
         )
-        latest_df = df.groupby("code", as_index=False).first()
+        latest_df = all_signals_df.groupby("code", as_index=False).first()
         latest_df = latest_df.rename(
             columns={
                 "sig_date": "latest_sig_date",
@@ -272,6 +279,43 @@ class StrategyCandidatesService:
         return latest_df[
             ["code", "latest_sig_date", "latest_sig_action", "latest_sig_strategy_code"]
         ]
+
+    def _load_near_signal_candidates(self, asof_date: dt.date) -> pd.DataFrame:
+        """加载接近信号的股票"""
+        # 从indicator表获取接近MA20的股票
+        indicator_table = self.table_names.indicator_table
+        if not self._table_exists(indicator_table):
+            return pd.DataFrame()
+
+        # 获取最近的交易日数据
+        trade_dates = self._load_trade_dates(asof_date, 1)
+        if not trade_dates:
+            return pd.DataFrame()
+
+        latest_date = trade_dates[0]
+
+        # 查找接近MA20的股票
+        stmt = text(
+            f"""
+            SELECT
+                code,
+                trade_date as sig_date,
+                'MA5_MA20_TREND' as strategy_code,
+                'NEAR_SIGNAL' as action,
+                1 as valid_days
+            FROM `{indicator_table}`
+            WHERE trade_date = :latest_date
+              AND close IS NOT NULL
+              AND ma20 IS NOT NULL
+              AND ABS((close - ma20) / ma20) <= 0.02  -- 接近MA20阈值2%
+              AND ma5 IS NOT NULL
+              AND ma5 > ma20  -- MA5在MA20之上，显示潜在买入机会
+            """
+        )
+        with self.db_writer.engine.begin() as conn:
+            df = pd.read_sql_query(stmt, conn, params={"latest_date": latest_date})
+
+        return df
 
     def _merge_candidates(
         self,

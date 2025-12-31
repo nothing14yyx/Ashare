@@ -109,6 +109,7 @@ class OpenMonitorParams:
     output_subdir: str = "open_monitor"
     interval_minutes: int = 5
     run_id_minutes: int = 5
+    run_id_use_seconds: bool = False
 
     # 环境表：存储周线计划等“批次级别”信息，避免在每条标的记录里重复。
     open_monitor_env_table: str = TABLE_STRATEGY_OPEN_MONITOR_ENV
@@ -147,6 +148,7 @@ class OpenMonitorParams:
             params = replace(params, **{field: default_val})
 
         def _ensure_min_int(field: str, min_val: int) -> None:
+            nonlocal params
             val = getattr(params, field)
             try:
                 val_int = int(val)
@@ -160,6 +162,7 @@ class OpenMonitorParams:
                 params = replace(params, **{field: val_int})
 
         def _ensure_float_range(field: str, min_val: float, max_val: float) -> None:
+            nonlocal params
             val = getattr(params, field)
             try:
                 val_float = float(val)
@@ -316,6 +319,7 @@ class OpenMonitorParams:
                           or cls.output_subdir,
             interval_minutes=interval_minutes,
             run_id_minutes=run_id_minutes,
+            run_id_use_seconds=_get_bool("run_id_use_seconds", cls.run_id_use_seconds),
             unique_code_latest_date_only=_get_bool(
                 "unique_code_latest_date_only", cls.unique_code_latest_date_only
             ),
@@ -403,7 +407,7 @@ class MA5MA20OpenMonitorRunner:
         )
 
     def _calc_run_id(self, ts: dt.datetime) -> str:
-        return calc_run_id(ts, self.params.run_id_minutes)
+        return calc_run_id(ts, self.params.run_id_minutes, self.params.run_id_use_seconds)
 
     def _build_run_params_json(self) -> str:
         payload = {
@@ -413,6 +417,7 @@ class MA5MA20OpenMonitorRunner:
             "quote_source": self.params.quote_source,
             "interval_minutes": self.params.interval_minutes,
             "run_id_minutes": self.params.run_id_minutes,
+            "run_id_use_seconds": self.params.run_id_use_seconds,
             "strategy_code": self.params.strategy_code,
             "ready_signals_view": self.params.ready_signals_view,
         }
@@ -547,7 +552,7 @@ class MA5MA20OpenMonitorRunner:
                 prev = self.repo.load_latest_run_context_by_stage(
                     monitor_date, stage=run_stage
                 )
-                if prev and prev.get("dedup_sig") == dedup_sig and prev.get("run_id"):
+                if (not self.params.run_id_use_seconds) and prev and prev.get("dedup_sig") == dedup_sig and prev.get("run_id"):
                     run_id = str(prev["run_id"])
 
         run_params_json = self._build_run_params_json()
@@ -649,6 +654,7 @@ class MA5MA20OpenMonitorRunner:
             quotes,
             env_payload,
             checked_at=checked_at,
+            monitor_date=monitor_date,
             run_id=run_id,
             run_pk=run_pk,
             ready_signals_used=self.repo.ready_signals_used,

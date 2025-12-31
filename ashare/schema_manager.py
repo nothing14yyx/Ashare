@@ -1568,7 +1568,7 @@ class SchemaManager:
             {chip_join}
             {industry_join}
             {board_join}
-            WHERE COALESCE(e.`final_action`, e.`signal`) IN ('BUY','BUY_CONFIRM')
+            WHERE COALESCE(e.`final_action`, e.`signal`) IN ('BUY','BUY_CONFIRM', 'NEAR_SIGNAL')
             """
         return select_sql, list(READY_SIGNALS_COLUMNS.keys())
 

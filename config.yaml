@@ -3,6 +3,10 @@ logging:
   # 日志级别（DEBUG/INFO/WARNING/ERROR 或数字），默认 INFO；
   # 也可通过环境变量 ASHARE_LOG_LEVEL 覆盖。
   level: INFO
+  # 控制台输出级别（默认沿用 level）
+  console_level: INFO
+  # 文件输出级别（默认沿用 level）
+  file_level: INFO
 
 app:
   # 输出目录（AshareApp.output_dir）
@@ -161,6 +165,7 @@ open_monitor:
   interval_minutes: 5
   # 去重时间桶分辨率（分钟）：缺省跟 interval_minutes 一致，可单独覆盖
   run_id_minutes: 5
+  run_id_use_seconds: true
 
   # 过滤阈值（按你的风格可自行调小/调大）
   max_gap_up_pct: 0.05        # 今开高开超过 5%：不追

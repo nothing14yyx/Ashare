@@ -88,18 +88,26 @@ def make_snapshot_hash(row: Dict[str, Any]) -> str:
     return hashlib.md5(serialized.encode("utf-8")).hexdigest()
 
 
-def calc_run_id(ts: dt.datetime, run_id_minutes: int | None) -> str:
-    window_minutes = max(int(run_id_minutes or 5), 1)
-
+def calc_run_id(
+    ts: dt.datetime,
+    run_id_minutes: int | None,
+    use_seconds: bool = False,
+) -> str:
     auction_start = dt.time(9, 15)
     lunch_break_start = dt.time(11, 30)
     lunch_break_end = dt.time(13, 0)
     market_close = dt.time(15, 0)
 
-    minute_of_day = ts.hour * 60 + ts.minute
-    slot_minute = (minute_of_day // window_minutes) * window_minutes
-    slot_time = dt.datetime.combine(ts.date(), dt.time(slot_minute // 60, slot_minute % 60))
-    slot_text = slot_time.strftime("%Y-%m-%d %H:%M")
+    if use_seconds:
+        slot_text = ts.strftime("%Y-%m-%d %H:%M:%S")
+    else:
+        window_minutes = max(int(run_id_minutes or 5), 1)
+        minute_of_day = ts.hour * 60 + ts.minute
+        slot_minute = (minute_of_day // window_minutes) * window_minutes
+        slot_time = dt.datetime.combine(
+            ts.date(), dt.time(slot_minute // 60, slot_minute % 60)
+        )
+        slot_text = slot_time.strftime("%Y-%m-%d %H:%M")
 
     t = ts.time()
     if t < auction_start:
