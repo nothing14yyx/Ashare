@@ -6,3 +6,5 @@ dbn_trading_auto
 ashare.log
 .qwen/
 gha-creds-*.json
+.codex/
+diff_output.txt

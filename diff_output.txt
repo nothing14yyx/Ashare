@@ -1,1420 +1,1485 @@
-diff --git a/.gitignore b/.gitignore
-index 2bb2d55..ad8966b 100644
---- a/.gitignore
-+++ b/.gitignore
-@@ -3,4 +3,6 @@ data
- dbn_trading_auto
- .idea
- /project_for_llm.txt
--ashare.log
-\ No newline at end of file
-+ashare.log
-+.qwen/
-+gha-creds-*.json
-diff --git a/ashare/external_signal_manager.py b/ashare/external_signal_manager.py
-index 6d3e982..afc3032 100644
---- a/ashare/external_signal_manager.py
-+++ b/ashare/external_signal_manager.py
-@@ -97,7 +97,7 @@ class ExternalSignalManager:
-             self.logger.info("表 %s 本次无新增数据，跳过写入。", table)
-             return
+diff --git a/diff_output.txt b/diff_output.txt
+index 9b7e22f..e69de29 100644
+--- a/diff_output.txt
++++ b/diff_output.txt
+@@ -1,1420 +0,0 @@
+-diff --git a/.gitignore b/.gitignore
+-index 2bb2d55..ad8966b 100644
+---- a/.gitignore
+-+++ b/.gitignore
+-@@ -3,4 +3,6 @@ data
+- dbn_trading_auto
+- .idea
+- /project_for_llm.txt
+--ashare.log
+-\ No newline at end of file
+-+ashare.log
+-+.qwen/
+-+gha-creds-*.json
+-diff --git a/ashare/external_signal_manager.py b/ashare/external_signal_manager.py
+-index 6d3e982..afc3032 100644
+---- a/ashare/external_signal_manager.py
+-+++ b/ashare/external_signal_manager.py
+-@@ -97,7 +97,7 @@ class ExternalSignalManager:
+-             self.logger.info("表 %s 本次无新增数据，跳过写入。", table)
+-             return
+- 
+--        deduped = df.copy()
+-+        deduped = df.drop_duplicates().copy()
+-         if subset:
+-             deduped.drop_duplicates(subset=list(subset), keep="last", inplace=True)
+- 
+-@@ -221,6 +221,9 @@ class ExternalSignalManager:
+-                 df[col] = df[col].apply(
+-                     lambda x: self._to_yyyymmdd(x) or normalized_default
+-                 )
+-+        self._coerce_yyyymmdd_date_column(df, "trade_date")
+-+        for col in ["上榜日", "信用交易日期", "日期", "交易日期"]:
+-+            self._coerce_yyyymmdd_date_column(df, col)
+- 
+-     def _normalize_period(self, df: pd.DataFrame, period: str | None = None) -> None:
+-         self._rename_first(
+-@@ -241,6 +244,7 @@ class ExternalSignalManager:
+-             or fallback_period
+-             or ("" if pd.isna(x) else str(x))
+-         )
+-+        self._coerce_yyyymmdd_date_column(df, "period")
+- 
+-     def _normalize_exchange(self, df: pd.DataFrame, exchange: str) -> None:
+-         self._rename_first(df, ["exchange", "交易所"], "exchange")
+-@@ -262,6 +266,28 @@ class ExternalSignalManager:
+-             return code.split(".", 1)[1]
+-         return code
+- 
+-+    def _coerce_yyyymmdd_date_column(self, df: pd.DataFrame, column: str) -> None:
+-+        if column not in df.columns:
+-+            return
+-+        series = df[column].apply(lambda x: self._to_yyyymmdd(x))
+-+        parsed = pd.to_datetime(series, format="%Y%m%d", errors="coerce")
+-+        df[column] = parsed.dt.date
+-+
+-+    def _coerce_any_date_column(self, df: pd.DataFrame, column: str) -> None:
+-+        if column not in df.columns:
+-+            return
+-+        df[column] = pd.to_datetime(df[column], errors="coerce").dt.date
+-+
+-+    def _normalize_security_name(self, df: pd.DataFrame) -> None:
+-+        if "证券简称" not in df.columns and "标的证券简称" in df.columns:
+-+            df.rename(columns={"标的证券简称": "证券简称"}, inplace=True)
+-+            return
+-+        if "证券简称" in df.columns and "标的证券简称" in df.columns:
+-+            df["证券简称"] = df["证券简称"].where(
+-+                df["证券简称"].notna(), df["标的证券简称"]
+-+            )
+-+            df.drop(columns=["标的证券简称"], inplace=True)
+-+
+-     # =========================
+-     # Trade-date backoff (核心：取最近一次可用数据)
+-     # =========================
+-@@ -436,6 +462,8 @@ class ExternalSignalManager:
+-         used_date_for_norm = used_iso or trade_date
+-         self._normalize_code_column(df)
+-         self._normalize_trade_date(df, used_date_for_norm)
+-+        if "上榜日" not in df.columns and "trade_date" in df.columns:
+-+            df["上榜日"] = df["trade_date"]
+-         subset = [col for col in ["code", "trade_date", "上榜日", "上榜原因"] if col in df.columns]
+-         self._upsert(df, "a_share_lhb_detail", subset=subset or None)
+-         return df
+-@@ -466,6 +494,9 @@ class ExternalSignalManager:
+-             self._normalize_code_column(df)
+-             self._normalize_trade_date(df, used_date_for_norm)
+-             self._normalize_exchange(df, exchange)
+-+            self._normalize_security_name(df)
+-+            if "信用交易日期" in df.columns and "trade_date" in df.columns:
+-+                df["信用交易日期"] = df["trade_date"]
+-             frames.append(df)
+- 
+-         if not frames:
+-@@ -494,6 +525,8 @@ class ExternalSignalManager:
+-                 period = str(period_from_data.iloc[0])
+-             self._normalize_code_column(summary_df)
+-             self._normalize_period(summary_df, period)
+-+            for col in ["股东户数统计截止日-上次", "公告日期"]:
+-+                self._coerce_any_date_column(summary_df, col)
+-             summary_subset = [col for col in ["code", "period"] if col in summary_df.columns]
+-             self._upsert(summary_df, "a_share_gdhs", subset=summary_subset or None)
+-         else:
+-@@ -528,6 +561,7 @@ class ExternalSignalManager:
+- 
+-         self._normalize_period(detail_df, period)
+-         self._normalize_code_column(detail_df)
+-+        self._coerce_any_date_column(detail_df, "股东户数公告日期")
+-         subset = [col for col in ["code", "period"] if col in detail_df.columns]
+-         self._upsert(
+-             detail_df,
+-diff --git a/ashare/market_indicator_builder.py b/ashare/market_indicator_builder.py
+-index 78f09dc..8dd19af 100644
+---- a/ashare/market_indicator_builder.py
+-+++ b/ashare/market_indicator_builder.py
+-@@ -26,6 +26,7 @@ class MarketIndicatorBuilder:
+-         self.env_builder = env_builder
+-         self.logger = logger
+-         self.market_regime = MarketRegimeClassifier()
+-+        self.regime_confirm_days = 2
+- 
+-     @property
+-     def index_codes(self) -> list[str]:
+-@@ -269,6 +270,11 @@ class MarketIndicatorBuilder:
+-             .reset_index()
+-         )
+-         day_summary = day_summary.sort_values("trade_date").reset_index(drop=True)
+-+        if "regime" in day_summary.columns:
+-+            day_summary["regime_raw"] = day_summary["regime"]
+-+            day_summary = self._apply_regime_hysteresis(
+-+                day_summary, confirm_days=self.regime_confirm_days
+-+            )
+-         if "position_hint" in day_summary.columns:
+-             day_summary["position_hint_raw"] = day_summary["position_hint"]
+-             pos = pd.to_numeric(day_summary["position_hint"], errors="coerce")
+-@@ -428,9 +434,85 @@ class MarketIndicatorBuilder:
+-                 "score": score,
+-                 "regime": regime,
+-                 "position_hint": position_hint,
+-+                "pullback_fast": pullback_fast,
+-             }
+-         )
+- 
+-+    @staticmethod
+-+    def _apply_regime_hysteresis(
+-+        day_summary: pd.DataFrame, *, confirm_days: int
+-+    ) -> pd.DataFrame:
+-+        if day_summary.empty or "regime" not in day_summary.columns:
+-+            return day_summary
+-+
+-+        confirm_days = max(int(confirm_days), 1)
+-+        severe = {"BREAKDOWN", "BEAR_CONFIRMED"}
+-+        position_hint_map = {
+-+            "RISK_ON": 0.8,
+-+            "PULLBACK": 0.4,
+-+            "RISK_OFF": 0.1,
+-+            "BREAKDOWN": 0.0,
+-+            "BEAR_CONFIRMED": 0.0,
+-+            "UNKNOWN": None,
+-+        }
+-+
+-+        current = None
+-+        pending = None
+-+        pending_count = 0
+-+
+-+        smoothed = []
+-+        for _, row in day_summary.iterrows():
+-+            raw = str(row.get("regime") or "").upper()
+-+            if raw == "UNKNOWN":
+-+                smoothed.append(current or "UNKNOWN")
+-+                continue
+-+
+-+            if current is None:
+-+                current = raw
+-+                pending = None
+-+                pending_count = 0
+-+                smoothed.append(current)
+-+                continue
+-+
+-+            if raw == current:
+-+                pending = None
+-+                pending_count = 0
+-+                smoothed.append(current)
+-+                continue
+-+
+-+            if raw in severe:
+-+                current = raw
+-+                pending = None
+-+                pending_count = 0
+-+                smoothed.append(current)
+-+                continue
+-+
+-+            if pending != raw:
+-+                pending = raw
+-+                pending_count = 1
+-+            else:
+-+                pending_count += 1
+-+
+-+            if pending_count >= confirm_days:
+-+                current = pending
+-+                pending = None
+-+                pending_count = 0
+-+
+-+            smoothed.append(current)
+-+
+-+        day_summary = day_summary.copy()
+-+        day_summary["regime"] = smoothed
+-+
+-+        def _recalc_hint(row: pd.Series) -> float | None:
+-+            regime = str(row.get("regime") or "").upper()
+-+            hint = position_hint_map.get(regime)
+-+            if regime == "PULLBACK" and bool(row.get("pullback_fast")) and hint is not None:
+-+                hint = min(hint, 0.3)
+-+            return hint
+-+
+-+        day_summary["position_hint"] = day_summary.apply(_recalc_hint, axis=1)
+-+        return day_summary
+-+
+-     @staticmethod
+-     def _resolve_breadth_metrics(group: pd.DataFrame) -> pd.Series:
+-         valid_ma20 = group["ma20"].notna()
+-diff --git a/ashare/monitor_rules.py b/ashare/monitor_rules.py
+-index 81532a9..0123bda 100644
+---- a/ashare/monitor_rules.py
+-+++ b/ashare/monitor_rules.py
+-@@ -26,9 +26,14 @@ class MonitorRuleConfig:
+-     limit_up_trigger_pct: float = 9.7
+-     max_entry_vs_ma5_pct: float = 0.08
+-     runup_atr_max: float = 1.2
+-+    runup_atr_vol_mult: float = 1.2
+-+    runup_atr_max_cap: float = 2.0
+-     runup_atr_tol: float = 0.02
+-     pullback_runup_atr_max: float = 1.5
+-     pullback_runup_dev_ma20_atr_min: float = 1.0
+-+    ma20_atr_tol_mult: float = 0.5
+-+    ma20_dyn_min_pct: float = -0.03
+-+    ma20_prewarn_buffer_pct: float = 0.005
+-     dev_ma5_atr_max: float = 2.0
+-     dev_ma20_atr_max: float = 2.5
+-     stop_atr_mult: float = 2.0
+-@@ -45,6 +50,7 @@ class MonitorRuleConfig:
+-     enable_below_ma20: bool = True
+-     enable_limit_up: bool = True
+-     enable_runup_breach: bool = True
+-+    enable_ma20_prewarn: bool = True
+- 
+-     enable_signal_expired: bool = True
+- 
+-@@ -67,6 +73,7 @@ class MonitorRuleConfig:
+-     gap_down_reason: str = "低开破位"
+-     below_ma20_action: str = "SKIP"
+-     below_ma20_reason: str = "未站上MA20要求"
+-+    ma20_prewarn_reason: str = "接近MA20阈值"
+-     limit_up_action: str = "SKIP"
+-     limit_up_reason: str = "涨停不可成交"
+-     runup_breach_action: str = "WAIT"
+-@@ -85,6 +92,7 @@ class MonitorRuleConfig:
+-     sev_gap_up: int = 70
+-     sev_gap_down: int = 70
+-     sev_below_ma20: int = 60
+-+    sev_ma20_prewarn: int = 10
+-     sev_limit_up: int = 60
+-     sev_runup_breach: int = 55
+- 
+-@@ -163,6 +171,8 @@ class MonitorRuleConfig:
+-                 "max_entry_vs_ma5_pct",
+-             ),
+-             runup_atr_max=_get_float("runup_atr_max", defaults.runup_atr_max),
+-+            runup_atr_vol_mult=_get_float("runup_atr_vol_mult", defaults.runup_atr_vol_mult),
+-+            runup_atr_max_cap=_get_float("runup_atr_max_cap", defaults.runup_atr_max_cap),
+-             runup_atr_tol=_get_float("runup_atr_tol", defaults.runup_atr_tol),
+-             pullback_runup_atr_max=_get_float(
+-                 "pullback_runup_atr_max", defaults.pullback_runup_atr_max
+-@@ -170,6 +180,15 @@ class MonitorRuleConfig:
+-             pullback_runup_dev_ma20_atr_min=_get_float(
+-                 "pullback_runup_dev_ma20_atr_min", defaults.pullback_runup_dev_ma20_atr_min
+-             ),
+-+            ma20_atr_tol_mult=_get_float("ma20_atr_tol_mult", defaults.ma20_atr_tol_mult),
+-+            ma20_dyn_min_pct=_normalize_ratio_pct(
+-+                _get_float("ma20_dyn_min_pct", defaults.ma20_dyn_min_pct),
+-+                "ma20_dyn_min_pct",
+-+            ),
+-+            ma20_prewarn_buffer_pct=_normalize_ratio_pct(
+-+                _get_float("ma20_prewarn_buffer_pct", defaults.ma20_prewarn_buffer_pct),
+-+                "ma20_prewarn_buffer_pct",
+-+            ),
+-             dev_ma5_atr_max=_get_float("dev_ma5_atr_max", defaults.dev_ma5_atr_max),
+-             dev_ma20_atr_max=_get_float("dev_ma20_atr_max", defaults.dev_ma20_atr_max),
+-             stop_atr_mult=_get_float("stop_atr_mult", defaults.stop_atr_mult),
+-@@ -193,6 +212,9 @@ class MonitorRuleConfig:
+-             enable_below_ma20=_get_bool("enable_below_ma20", defaults.enable_below_ma20),
+-             enable_limit_up=_get_bool("enable_limit_up", defaults.enable_limit_up),
+-             enable_runup_breach=_get_bool("enable_runup_breach", defaults.enable_runup_breach),
+-+            enable_ma20_prewarn=_get_bool(
+-+                "enable_ma20_prewarn", defaults.enable_ma20_prewarn
+-+            ),
+-             enable_signal_expired=_get_bool(
+-                 "enable_signal_expired", defaults.enable_signal_expired
+-             ),
+-@@ -236,6 +258,10 @@ class MonitorRuleConfig:
+-                 cfg.get("below_ma20_reason", defaults.below_ma20_reason)
+-             ).strip()
+-             or defaults.below_ma20_reason,
+-+            ma20_prewarn_reason=str(
+-+                cfg.get("ma20_prewarn_reason", defaults.ma20_prewarn_reason)
+-+            ).strip()
+-+            or defaults.ma20_prewarn_reason,
+-             limit_up_action=str(cfg.get("limit_up_action", defaults.limit_up_action)).strip()
+-             or defaults.limit_up_action,
+-             limit_up_reason=str(cfg.get("limit_up_reason", defaults.limit_up_reason)).strip()
+-@@ -264,6 +290,7 @@ class MonitorRuleConfig:
+-             sev_gap_up=int(cfg.get("sev_gap_up", defaults.sev_gap_up)),
+-             sev_gap_down=int(cfg.get("sev_gap_down", defaults.sev_gap_down)),
+-             sev_below_ma20=int(cfg.get("sev_below_ma20", defaults.sev_below_ma20)),
+-+            sev_ma20_prewarn=int(cfg.get("sev_ma20_prewarn", defaults.sev_ma20_prewarn)),
+-             sev_limit_up=int(cfg.get("sev_limit_up", defaults.sev_limit_up)),
+-             sev_runup_breach=int(cfg.get("sev_runup_breach", defaults.sev_runup_breach)),
+-         )
+-@@ -386,6 +413,19 @@ def build_default_monitor_rules(
+-                 action_override=config.gap_down_action,
+-             ),
+-         ),
+-+        Rule(
+-+            id="MA20_PREWARN",
+-+            category="ACTION",
+-+            severity=config.sev_ma20_prewarn,
+-+            predicate=lambda ctx: bool(
+-+                config.enable_ma20_prewarn
+-+                and getattr(ctx, "ma20_prewarn", False)
+-+            ),
+-+            effect=lambda ctx: RuleResult(
+-+                reason=getattr(ctx, "ma20_prewarn_reason", None)
+-+                or config.ma20_prewarn_reason,
+-+            ),
+-+        ),
+-         Rule(
+-             id="BELOW_MA20_REQ",
+-             category="ACTION",
+-diff --git a/ashare/open_monitor.py b/ashare/open_monitor.py
+-index b74f486..fe39dd8 100644
+---- a/ashare/open_monitor.py
+-+++ b/ashare/open_monitor.py
+-@@ -22,6 +22,7 @@ import datetime as dt
+- import json
+- import logging
+- import math
+-+import re
+- from dataclasses import dataclass, replace
+- from typing import Any, Callable, List
+- 
+-@@ -131,6 +132,98 @@ class OpenMonitorParams:
+-     live_retest_pct: float = 0.003
+-     live_retest_atr_mult: float = 0.5
+- 
+-+    def validate(self, logger: logging.Logger) -> "OpenMonitorParams":
+-+        params = self
+-+
+-+        def _reset(field: str, reason: str) -> None:
+-+            nonlocal params
+-+            default_val = getattr(OpenMonitorParams, field)
+-+            logger.warning(
+-+                "open_monitor param %s invalid (%s); fallback=%s",
+-+                field,
+-+                reason,
+-+                default_val,
+-+            )
+-+            params = replace(params, **{field: default_val})
+-+
+-+        def _ensure_min_int(field: str, min_val: int) -> None:
+-+            val = getattr(params, field)
+-+            try:
+-+                val_int = int(val)
+-+            except Exception:
+-+                _reset(field, "not int")
+-+                return
+-+            if val_int < min_val:
+-+                _reset(field, f"<{min_val}")
+-+                return
+-+            if val_int != val:
+-+                params = replace(params, **{field: val_int})
+-+
+-+        def _ensure_float_range(field: str, min_val: float, max_val: float) -> None:
+-+            val = getattr(params, field)
+-+            try:
+-+                val_float = float(val)
+-+            except Exception:
+-+                _reset(field, "not float")
+-+                return
+-+            if (not math.isfinite(val_float)) or val_float < min_val or val_float > max_val:
+-+                _reset(field, f"range {min_val}..{max_val}")
+-+                return
+-+            if val_float != val:
+-+                params = replace(params, **{field: val_float})
+-+
+-+        _ensure_min_int("signal_lookback_days", 1)
+-+        _ensure_min_int("interval_minutes", 1)
+-+        _ensure_min_int("run_id_minutes", 1)
+-+        _ensure_min_int("export_top_n", 0)
+-+
+-+        if params.run_id_minutes < params.interval_minutes:
+-+            logger.warning(
+-+                "open_monitor param run_id_minutes < interval_minutes; clamp to %s",
+-+                params.interval_minutes,
+-+            )
+-+            params = replace(params, run_id_minutes=params.interval_minutes)
+-+
+-+        mode = str(params.output_mode or "").strip().upper()
+-+        if mode not in {"FULL", "COMPACT"}:
+-+            _reset("output_mode", "invalid enum")
+-+        elif mode != params.output_mode:
+-+            params = replace(params, output_mode=mode)
+-+
+-+        quote_source = str(params.quote_source or "").strip().lower()
+-+        if quote_source == "auto":
+-+            logger.warning("open_monitor quote_source=auto; using eastmoney")
+-+            quote_source = "eastmoney"
+-+        if quote_source not in {"eastmoney", "akshare"}:
+-+            _reset("quote_source", "invalid enum")
+-+        elif quote_source != params.quote_source:
+-+            params = replace(params, quote_source=quote_source)
+-+
+-+        _ensure_float_range("live_breakout_high_eps", 0.0, 0.1)
+-+        _ensure_float_range("live_breakout_latest_eps", 0.0, 0.1)
+-+        _ensure_float_range("live_retest_pct", 0.0, 0.1)
+-+        _ensure_float_range("live_retest_atr_mult", 0.0, 10.0)
+-+
+-+        name_pattern = re.compile(r"^[A-Za-z0-9_]+$")
+-+        name_fields = [
+-+            "ready_signals_view",
+-+            "quote_table",
+-+            "output_table",
+-+            "run_table",
+-+            "open_monitor_view",
+-+            "open_monitor_wide_view",
+-+            "open_monitor_env_view",
+-+            "open_monitor_env_table",
+-+            "weekly_indicator_table",
+-+            "daily_indicator_table",
+-+        ]
+-+        for field in name_fields:
+-+            val = getattr(params, field)
+-+            if not isinstance(val, str) or not name_pattern.match(val):
+-+                _reset(field, "invalid name")
+-+
+-+        return params
+-+
+-     @classmethod
+-     def from_config(cls) -> "OpenMonitorParams":
+-         sec = get_section("open_monitor") or {}
+-@@ -169,8 +262,6 @@ class OpenMonitorParams:
+-                 return default
+- 
+-         quote_source = str(sec.get("quote_source", cls.quote_source)).strip().lower() or "auto"
+--        if quote_source == "auto":
+--            quote_source = "eastmoney"
+- 
+-         interval_minutes = _get_int("interval_minutes", cls.interval_minutes)
+- 
+-@@ -181,7 +272,7 @@ class OpenMonitorParams:
+-             else interval_minutes
+-         )
+- 
+--        return cls(
+-+        params = cls(
+-             enabled=_get_bool("enabled", cls.enabled),
+-             ready_signals_view=str(
+-                 sec.get("ready_signals_view", cls.ready_signals_view)
+-@@ -252,6 +343,7 @@ class OpenMonitorParams:
+-                 "live_retest_atr_mult", cls.live_retest_atr_mult
+-             ),
+-         )
+-+        return params.validate(logger)
+- 
+- 
+- class MA5MA20OpenMonitorRunner:
+-@@ -387,22 +479,6 @@ class MA5MA20OpenMonitorRunner:
+-             codes = signals["code"].dropna().astype(str).unique().tolist()
+-             asof_df = self.repo.load_latest_indicators(latest_trade_date, codes)
+-             if asof_df is not None and not asof_df.empty:
+--                asof_df = asof_df.copy()
+--                asof_df["code"] = asof_df["code"].astype(str)
+--                asof_df = asof_df.rename(
+--                    columns={
+--                        "trade_date": "asof_trade_date",
+--                        "close": "asof_close",
+--                        "ma5": "asof_ma5",
+--                        "ma20": "asof_ma20",
+--                        "ma60": "asof_ma60",
+--                        "ma250": "asof_ma250",
+--                        "vol_ratio": "asof_vol_ratio",
+--                        "macd_hist": "asof_macd_hist",
+--                        "atr14": "asof_atr14",
+--                        "avg_volume_20": "asof_avg_volume_20",
+--                    }
+--                )
+-                 signals = signals.merge(asof_df, on="code", how="left")
+-                 if "avg_volume_20" in signals.columns and "asof_avg_volume_20" in signals.columns:
+-                     signals["avg_volume_20"] = signals["avg_volume_20"].fillna(
+-@@ -535,6 +611,14 @@ class MA5MA20OpenMonitorRunner:
+-             "position_cap": env_context.get("env_final_cap_pct"),
+-             "reason": env_context.get("env_final_reason_json"),
+-         }
+-+        reason_matrix = None
+-+        if env_instruction.get("reason"):
+-+            try:
+-+                reason_payload = json.loads(env_instruction["reason"])
+-+                if isinstance(reason_payload, dict):
+-+                    reason_matrix = reason_payload.get("risk_emotion_matrix")
+-+            except Exception:
+-+                reason_matrix = None
+-         env_payload = {
+-             "env_final_gate_action": env_instruction.get("gate_status"),
+-             "env_final_cap_pct": env_instruction.get("position_cap"),
+-@@ -545,14 +629,20 @@ class MA5MA20OpenMonitorRunner:
+-             "weekly_scene_code": env_context.get("weekly_scene_code"),
+-             "index_score": env_context.get("index_score"),
+-             "regime": env_context.get("regime"),
+-+            "regime_raw": env_context.get("regime_raw"),
+-             "position_hint": env_context.get("position_hint"),
+-         }
+-         env_final_gate_action = env_instruction.get("gate_status")
+-         self.logger.info(
+--            "已构建环境快照（monitor_date=%s, run_id=%s, gate=%s）。",
+-+            "已构建环境快照（monitor_date=%s, run_id=%s, gate=%s, cap=%s, regime=%s(raw=%s), weekly_risk=%s, matrix=%s）。",
+-             monitor_date,
+-             run_id,
+-             env_final_gate_action,
+-+            env_instruction.get("position_cap"),
+-+            env_context.get("regime"),
+-+            env_context.get("regime_raw"),
+-+            env_context.get("weekly_risk_level"),
+-+            reason_matrix,
+-         )
+-         result = self.evaluator.evaluate(
+-             signals,
+-diff --git a/ashare/open_monitor_env.py b/ashare/open_monitor_env.py
+-index b599664..088ce64 100644
+---- a/ashare/open_monitor_env.py
+-+++ b/ashare/open_monitor_env.py
+-@@ -159,6 +159,9 @@ class OpenMonitorEnvService:
+-             "weekly_zone_reason": weekly_scenario.get("weekly_zone_reason"),
+-             "regime": (daily_env or {}).get("regime")
+-             or (env_view_row or {}).get("env_regime"),
+-+            "regime_raw": (daily_env or {}).get("regime_raw")
+-+            or (env_view_row or {}).get("env_regime_raw")
+-+            or (env_view_row or {}).get("env_regime"),
+-             "index_score": (daily_env or {}).get("score")
+-             or (env_view_row or {}).get("env_index_score"),
+-             "position_hint": (daily_env or {}).get("position_hint")
+-@@ -198,6 +201,8 @@ class OpenMonitorEnvService:
+-             "env_live_reason": row.get("env_live_reason"),
+-         }
+-         env_context["index_intraday"] = index_snapshot
+-+        if not env_context.get("regime_raw"):
+-+            env_context["regime_raw"] = env_context.get("regime")
+- 
+-         return env_context
+- 
+-@@ -308,6 +313,7 @@ class OpenMonitorEnvService:
+-             if daily_env
+-             else None,
+-             "regime": daily_env.get("regime") if daily_env else None,
+-+            "regime_raw": daily_env.get("regime_raw") if daily_env else None,
+-             "position_hint": _to_float(daily_env.get("position_hint"))
+-             if daily_env
+-             else None,
+-@@ -347,6 +353,8 @@ class OpenMonitorEnvService:
+-             if daily_env
+-             else None,
+-         }
+-+        if not env_context.get("regime_raw"):
+-+            env_context["regime_raw"] = env_context.get("regime")
+-         if not weekly_gate_policy:
+-             weekly_gate_policy = self.env_builder.resolve_env_weekly_gate_policy(env_context)
+-             env_context["weekly_gate_policy"] = weekly_gate_policy
+-@@ -752,14 +760,21 @@ class OpenMonitorEnvService:
+-             gate_reason = index_env_snapshot.get("env_index_gate_reason") or "-"
+-             live_pct = _to_float(index_env_snapshot.get("env_index_live_pct_change"))
+-             dev_ma20_atr = _to_float(index_env_snapshot.get("env_index_dev_ma20_atr"))
+-+            regime_eff = None
+-+            regime_raw = None
+-+            if isinstance(ctx, dict):
+-+                regime_eff = ctx.get("regime")
+-+                regime_raw = ctx.get("regime_raw") or regime_eff
+-             self.logger.info(
+--                "指数环境快照：%s asof=%s live=%s pct=%.2f%% dev_ma20_atr=%.2f gate=%s reason=%s",
+-+                "指数环境快照：%s asof=%s live=%s pct=%.2f%% dev_ma20_atr=%.2f index_gate=%s regime=%s(raw=%s) reason=%s",
+-                 index_env_snapshot.get("env_index_code"),
+-                 index_env_snapshot.get("env_index_asof_trade_date"),
+-                 index_env_snapshot.get("env_index_live_trade_date"),
+-                 live_pct if live_pct is not None else 0.0,
+-                 dev_ma20_atr if dev_ma20_atr is not None else 0.0,
+-                 gate_action,
+-+                regime_eff,
+-+                regime_raw,
+-                 gate_reason,
+-             )
+- 
+-diff --git a/ashare/open_monitor_eval.py b/ashare/open_monitor_eval.py
+-index d267751..ef51955 100644
+---- a/ashare/open_monitor_eval.py
+-+++ b/ashare/open_monitor_eval.py
+-@@ -5,6 +5,7 @@ from __future__ import annotations
+- import datetime as dt
+- import json
+- import math
+-+from time import perf_counter
+- from dataclasses import dataclass
+- from pathlib import Path
+- from typing import Any, List
+-@@ -12,6 +13,7 @@ from typing import Any, List
+- import pandas as pd
+- 
+- from .config import get_section
+-+from .open_monitor_df import coalesce_asof_from_sig
+- from .open_monitor_repo import calc_run_id, make_snapshot_hash
+- from .open_monitor_rules import DecisionContext, MarketEnvironment, RuleEngine
+- from .utils.convert import to_float as _to_float
+-@@ -360,9 +362,15 @@ class OpenMonitorEvaluator:
+-         limit_up_trigger = self.rule_config.limit_up_trigger_pct
+-         stop_atr_mult = self.rule_config.stop_atr_mult
+-         runup_atr_max = self.rule_config.runup_atr_max
+-+        runup_atr_vol_mult = self.rule_config.runup_atr_vol_mult
+-+        runup_atr_max_cap = self.rule_config.runup_atr_max_cap
+-         pullback_runup_atr_max = self.rule_config.pullback_runup_atr_max
+-         pullback_runup_dev_ma20_atr_min = self.rule_config.pullback_runup_dev_ma20_atr_min
+-         runup_atr_tol = self.rule_config.runup_atr_tol
+-+        ma20_atr_tol_mult = self.rule_config.ma20_atr_tol_mult
+-+        ma20_dyn_min_pct = self.rule_config.ma20_dyn_min_pct
+-+        ma20_prewarn_buffer_pct = self.rule_config.ma20_prewarn_buffer_pct
+-+        below_ma20_tol_pct = self.rule_config.below_ma20_tol_pct
+-         for _, row in merged.iterrows():
+-             sig_reason_text = str(row.get("sig_reason") or row.get("reason") or "")
+-             is_pullback = self._is_pullback_signal(sig_reason_text)
+-@@ -402,6 +410,9 @@ class OpenMonitorEvaluator:
+-             sig_ma5 = _to_float(row.get("sig_ma5"))
+-             sig_ma20 = _to_float(row.get("sig_ma20"))
+-             sig_atr14 = _to_float(row.get("sig_atr14"))
+-+            atr_pct = None
+-+            if sig_atr14 is not None and sig_ma20 is not None and sig_ma20 != 0:
+-+                atr_pct = sig_atr14 / sig_ma20
+- 
+-             dev_ma5 = None
+-             dev_ma20 = None
+-@@ -444,6 +455,29 @@ class OpenMonitorEvaluator:
+-                 threshold_gap_up = min(max_up, atr_gap)
+- 
+-             ma20_thresh = pullback_min_vs_ma20 if is_pullback else min_vs_ma20
+-+            if atr_pct is not None and ma20_atr_tol_mult is not None:
+-+                dyn_thresh = -ma20_atr_tol_mult * atr_pct
+-+                ma20_thresh = min(ma20_thresh, dyn_thresh)
+-+                if ma20_dyn_min_pct is not None:
+-+                    ma20_thresh = max(ma20_thresh, ma20_dyn_min_pct)
+-+
+-+            ma20_prewarn = False
+-+            ma20_prewarn_reason = None
+-+            if (
+-+                price_now is not None
+-+                and sig_ma20 is not None
+-+                and ma20_thresh is not None
+-+                and below_ma20_tol_pct is not None
+-+            ):
+-+                invalid_cut = sig_ma20 * (1 + ma20_thresh - below_ma20_tol_pct)
+-+                prewarn_cut = sig_ma20 * (
+-+                    1 + ma20_thresh - below_ma20_tol_pct + ma20_prewarn_buffer_pct
+-+                )
+-+                if price_now < prewarn_cut and price_now >= invalid_cut:
+-+                    ma20_prewarn = True
+-+                    ma20_prewarn_reason = (
+-+                        f"near_ma20_cut price={price_now:.2f} prewarn={prewarn_cut:.2f}"
+-+                    )
+- 
+-             chip_score = _to_float(row.get("sig_chip_score"))
+-             chip_reason = row.get("sig_chip_reason")
+-@@ -467,6 +501,10 @@ class OpenMonitorEvaluator:
+-             if price_now is not None:
+-                 dev_ma20_atr_val = dev_ma20_atr
+-                 runup_limit = pullback_runup_atr_max if is_pullback else runup_atr_max
+-+                if atr_pct is not None and runup_limit is not None and runup_atr_vol_mult is not None:
+-+                    runup_limit = runup_limit + runup_atr_vol_mult * atr_pct
+-+                    if runup_atr_max_cap is not None:
+-+                        runup_limit = min(runup_limit, runup_atr_max_cap)
+-                 breach, breach_reason = evaluate_runup_breach(
+-                     runup_metrics,
+-                     runup_atr_max=runup_limit,
+-@@ -502,6 +540,8 @@ class OpenMonitorEvaluator:
+-                 max_gap_down=max_down,
+-                 sig_ma20=sig_ma20,
+-                 ma20_thresh=ma20_thresh,
+-+                ma20_prewarn=ma20_prewarn,
+-+                ma20_prewarn_reason=ma20_prewarn_reason,
+-                 signal_age=signal_age,
+-                 limit_up_trigger=limit_up_trigger,
+-                 runup_breach=breach,
+-@@ -620,28 +660,7 @@ class OpenMonitorEvaluator:
+-         merged["strength_trend"] = strength_trend_list
+-         merged["strength_note"] = strength_note_list
+- 
+--        def _coalesce_numeric_into(target: str, fallback: str) -> None:
+--            if target not in merged.columns:
+--                merged[target] = None
+--            if fallback not in merged.columns:
+--                return
+--            left = pd.to_numeric(merged[target], errors="coerce")
+--            right = pd.to_numeric(merged[fallback], errors="coerce")
+--            merged[target] = left.fillna(right)
+--
+--        if "asof_trade_date" in merged.columns and "sig_date" in merged.columns:
+--            mask = merged["asof_trade_date"].notna()
+--            merged["asof_trade_date"] = merged["asof_trade_date"].where(mask, merged["sig_date"])
+--
+--        _coalesce_numeric_into("asof_close", "sig_close")
+--        _coalesce_numeric_into("asof_ma5", "sig_ma5")
+--        _coalesce_numeric_into("asof_ma20", "sig_ma20")
+--        _coalesce_numeric_into("asof_ma60", "sig_ma60")
+--        _coalesce_numeric_into("asof_ma250", "sig_ma250")
+--        _coalesce_numeric_into("asof_vol_ratio", "sig_vol_ratio")
+--        _coalesce_numeric_into("asof_macd_hist", "sig_macd_hist")
+--        _coalesce_numeric_into("asof_atr14", "sig_atr14")
+--        _coalesce_numeric_into("asof_stop_ref", "sig_stop_ref")
+-+        merged = coalesce_asof_from_sig(merged)
+- 
+-         full_keep_cols = [
+-             "monitor_date",
+-@@ -1054,6 +1073,7 @@ class OpenMonitorEvaluator:
+-     def export_csv(self, df: pd.DataFrame) -> None:
+-         if df.empty or (not self.params.export_csv):
+-             return
+-+        t0 = perf_counter()
+- 
+-         app_sec = get_section("app") or {}
+-         base_dir = "output"
+-@@ -1112,4 +1132,11 @@ class OpenMonitorEvaluator:
+-             export_df = export_df.head(self.params.export_top_n)
+- 
+-         export_df.to_csv(path, index=False, encoding="utf-8-sig")
+--        self.logger.info("开盘监测 CSV 已导出：%s", path)
+-+        elapsed = perf_counter() - t0
+-+        self.logger.info(
+-+            "open_monitor CSV exported: %s rows=%s top_n=%s elapsed=%.3fs",
+-+            path,
+-+            len(export_df),
+-+            self.params.export_top_n,
+-+            elapsed,
+-+        )
+-diff --git a/ashare/open_monitor_repo.py b/ashare/open_monitor_repo.py
+-index c2ff66b..2784322 100644
+---- a/ashare/open_monitor_repo.py
+-+++ b/ashare/open_monitor_repo.py
+-@@ -6,7 +6,7 @@ import datetime as dt
+- import hashlib
+- import json
+- import math
+--from typing import Any, Dict, List, Tuple
+-+from typing import Any, Dict, List, Tuple, TypedDict
+- 
+- import pandas as pd
+- from sqlalchemy import bindparam, text
+-@@ -17,6 +17,8 @@ from .config import get_section
+- from .db import DatabaseConfig, MySQLWriter
+- from .env_snapshot_utils import load_trading_calendar
+- from .ma5_ma20_trend_strategy import _atr, _macd
+-+from .open_monitor_df import normalize_asof_indicators
+-+from .open_monitor_persist import OpenMonitorPersister
+- from .utils.convert import to_float as _to_float
+- 
+- 
+-@@ -37,6 +39,14 @@ READY_SIGNALS_REQUIRED_COLS = (
+- )
+- 
+- 
+-+class RunContext(TypedDict):
+-+    run_pk: int | None
+-+    run_id: str | None
+-+    params_json: str | None
+-+    dedup_sig: Any
+-+    dedup_stage: Any
+-+
+-+
+- def _normalize_snapshot_value(value: Any) -> Any:  # noqa: ANN401
+-     if value is None:
+-         return None
+-@@ -102,7 +112,7 @@ def calc_run_id(ts: dt.datetime, run_id_minutes: int | None) -> str:
+-     return slot_text
+- 
+- 
+--class OpenMonitorRepository:
+-+class OpenMonitorSqlStore:
+-     """开盘监测数据访问层，集中管理 SQL 与表结构。"""
+- 
+-     def __init__(self, engine, logger, params) -> None:
+-@@ -748,10 +758,19 @@ class OpenMonitorRepository:
+-         stmt = (
+-             text(
+-                 f"""
+--                SELECT `trade_date`, `code`,
+--                       `close`, `avg_volume_20`,
+--                       `ma5`, `ma20`, `ma60`, `ma250`,
+--                       `vol_ratio`, `macd_hist`, `kdj_k`, `kdj_d`, `atr14`
+-+                SELECT `trade_date` AS `asof_trade_date`,
+-+                       `code`,
+-+                       `close` AS `asof_close`,
+-+                       `avg_volume_20` AS `asof_avg_volume_20`,
+-+                       `ma5` AS `asof_ma5`,
+-+                       `ma20` AS `asof_ma20`,
+-+                       `ma60` AS `asof_ma60`,
+-+                       `ma250` AS `asof_ma250`,
+-+                       `vol_ratio` AS `asof_vol_ratio`,
+-+                       `macd_hist` AS `asof_macd_hist`,
+-+                       `kdj_k` AS `asof_kdj_k`,
+-+                       `kdj_d` AS `asof_kdj_d`,
+-+                       `atr14` AS `asof_atr14`
+-                 FROM `{table}`
+-                 WHERE `trade_date` = :d AND `code` IN :codes
+-                 """
+-@@ -760,7 +779,13 @@ class OpenMonitorRepository:
+-         )
+-         try:
+-             with self.engine.begin() as conn:
+--                return pd.read_sql_query(stmt, conn, params={"d": latest_trade_date, "codes": codes})
+-+                df = pd.read_sql_query(
+-+                    stmt,
+-+                    conn,
+-+                    params={"d": latest_trade_date, "codes": codes},
+-+                )
+-+            df = normalize_asof_indicators(df)
+-+            return df
+-         except Exception as exc:  # noqa: BLE001
+-             self.logger.debug("读取指标表 %s 失败：%s", table, exc)
+-             return pd.DataFrame()
+-@@ -1010,9 +1035,17 @@ class OpenMonitorRepository:
+-             except Exception as exc:  # noqa: BLE001
+-                 self.logger.debug("读取 %s 失败：%s", table, exc)
+-                 continue
+--            if not df.empty:
+--                df["code"] = df["code"].astype(str)
+--                return df
+-+            if df.empty:
+-+                continue
+-+            if "code" not in df.columns:
+-+                self.logger.warning("Industry dim table %s missing code column; skipped.", table)
+-+                continue
+-+            df["code"] = df["code"].astype(str)
+-+            keep_cols = ["code", "name", "industry", "board_name", "board_code"]
+-+            existing = [c for c in keep_cols if c in df.columns]
+-+            if existing:
+-+                df = df[existing]
+-+            return df
+-         return pd.DataFrame()
+- 
+-     def load_board_constituent_dim(self) -> pd.DataFrame:
+-@@ -1035,14 +1068,25 @@ class OpenMonitorRepository:
+-         monitor_date: str,
+-         *,
+-         stage: str | None = None,
+--    ) -> dict[str, Any] | None:
+-+    ) -> RunContext | None:
+-         table = getattr(self.params, "run_table", None)
+-         if not (table and monitor_date and self._table_exists(table)):
+-             return None
+- 
+-+        parsed_monitor = pd.to_datetime(monitor_date, errors="coerce")
+-+        if pd.isna(parsed_monitor):
+-+            self.logger.debug("Ignoring invalid monitor_date for run_context: %s", monitor_date)
+-+            return None
+-+        monitor_date_val = parsed_monitor.date().isoformat()
+-+
+-+        allowed_stages = {"PREOPEN", "BREAK", "POSTCLOSE", "INTRADAY"}
+-         stage_norm = (str(stage).strip().upper() if stage else "") or None
+-+        if stage_norm and stage_norm not in allowed_stages:
+-+            self.logger.debug("Ignoring invalid run_stage for run_context: %s", stage_norm)
+-+            stage_norm = None
+-+
+-         where_clauses = ["`monitor_date` = :d"]
+--        params: dict[str, Any] = {"d": monitor_date}
+-+        params: dict[str, Any] = {"d": monitor_date_val}
+- 
+-         has_run_stage = self._column_exists(table, "run_stage")
+-         if stage_norm in {"PREOPEN", "BREAK", "POSTCLOSE", "INTRADAY"}:
+-@@ -1106,8 +1150,15 @@ class OpenMonitorRepository:
+-         if not isinstance(parsed, dict):
+-             parsed = {}
+- 
+-+        run_pk = None
+-+        if run_pk_val is not None:
+-+            try:
+-+                run_pk = int(run_pk_val)
+-+            except (TypeError, ValueError):
+-+                self.logger.debug("Invalid run_pk in run_context: %s", run_pk_val)
+-+
+-         return {
+--            "run_pk": int(run_pk_val) if run_pk_val is not None else None,
+-+            "run_pk": run_pk,
+-             "run_id": str(run_id_val) if run_id_val is not None else None,
+-             "params_json": params_json_raw,
+-             "dedup_sig": parsed.get("dedup_sig"),
+-@@ -1697,28 +1748,31 @@ class OpenMonitorRepository:
+-         if quotes.empty:
+-             return
+- 
+--        monitor_dates = quotes["monitor_date"].dropna().astype(str).unique().tolist()
+--        if self._table_exists(table) and monitor_dates:
+--            for monitor in monitor_dates:
+--                run_pks = (
+--                    quotes.loc[quotes["monitor_date"].astype(str) == monitor, "run_pk"]
+--                    .dropna()
+--                    .unique()
+--                    .tolist()
+-+        if self._table_exists(table):
+-+            quotes["monitor_date_str"] = quotes["monitor_date"].astype(str)
+-+            quotes["code_str"] = quotes["code"].astype(str)
+-+            delete_calls = 0
+-+            deleted_rows = 0
+-+            for (monitor_date_str, run_pk), group in quotes.groupby(
+-+                ["monitor_date_str", "run_pk"]
+-+            ):
+-+                run_pk_codes = group["code_str"].dropna().unique().tolist()
+-+                if not run_pk_codes:
+-+                    continue
+-+                deleted_rows += self._delete_existing_run_rows(
+-+                    table,
+-+                    monitor_date_str,
+-+                    int(run_pk),
+-+                    run_pk_codes,
+-                 )
+--                for run_pk in run_pks:
+--                    run_pk_codes = quotes.loc[
+--                        (quotes["monitor_date"].astype(str) == monitor)
+--                        & (quotes["run_pk"] == run_pk),
+--                        "code",
+--                    ].dropna().astype(str).unique().tolist()
+--                    if run_pk_codes:
+--                        self._delete_existing_run_rows(
+--                            table,
+--                            monitor,
+--                            int(run_pk),
+--                            run_pk_codes,
+--                        )
+-+                delete_calls += 1
+-+            if delete_calls:
+-+                self.logger.debug(
+-+                    "open_monitor quote snapshot delete calls=%s rows=%s",
+-+                    delete_calls,
+-+                    deleted_rows,
+-+                )
+-+            quotes = quotes.drop(columns=["monitor_date_str", "code_str"])
+- 
+-         try:
+-             self.db_writer.write_dataframe(quotes, table, if_exists="append")
+-@@ -1862,3 +1916,36 @@ class OpenMonitorRepository:
+-         except Exception as exc:  # noqa: BLE001
+-             self.logger.debug("读取开盘监测视图 %s 失败：%s", view, exc)
+-             return pd.DataFrame()
+-+ 
+-+ 
+-+class OpenMonitorRepository:
+-+    """Facade for open monitor SQL store and persister."""
+-+
+-+    def __init__(self, engine, logger, params) -> None:
+-+        self.store = OpenMonitorSqlStore(engine, logger, params)
+-+        self.engine = self.store.engine
+-+        self.logger = self.store.logger
+-+        self.params = self.store.params
+-+        self.db_writer = self.store.db_writer
+-+        self.persister = OpenMonitorPersister(
+-+            engine=self.engine,
+-+            logger=self.logger,
+-+            params=self.params,
+-+            db_writer=self.db_writer,
+-+            table_exists=self.store._table_exists,
+-+            get_table_columns=self.store._get_table_columns,
+-+            make_snapshot_hash=make_snapshot_hash,
+-+        )
+-+
+-+    @property
+-+    def ready_signals_used(self) -> bool:
+-+        return self.store.ready_signals_used
+-+
+-+    def persist_quote_snapshots(self, df: pd.DataFrame) -> None:
+-+        self.persister.persist_quote_snapshots(df)
+-+
+-+    def persist_results(self, df: pd.DataFrame) -> None:
+-+        self.persister.persist_results(df)
+-+
+-+    def __getattr__(self, name: str):  # noqa: ANN204
+-+        return getattr(self.store, name)
+-diff --git a/ashare/open_monitor_rules.py b/ashare/open_monitor_rules.py
+-index 42a0090..de4f66e 100644
+---- a/ashare/open_monitor_rules.py
+-+++ b/ashare/open_monitor_rules.py
+-@@ -184,6 +184,8 @@ class DecisionContext:
+-     max_gap_down: float | None = None
+-     sig_ma20: float | None = None
+-     ma20_thresh: float | None = None
+-+    ma20_prewarn: bool = False
+-+    ma20_prewarn_reason: str | None = None
+-     limit_up_trigger: float | None = None
+-     runup_breach: bool = False
+-     runup_breach_reason: str | None = None
+-diff --git a/ashare/schema_manager.py b/ashare/schema_manager.py
+-index d748641..f33c085 100644
+---- a/ashare/schema_manager.py
+-+++ b/ashare/schema_manager.py
+-@@ -131,6 +131,7 @@ class SchemaManager:
+- 
+-         self._ensure_history_daily_kline_table()
+-         self._ensure_history_index_daily_kline_table()
+-+        self._ensure_external_signal_tables()
+- 
+-         self._ensure_dim_stock_basic_view()
+-         self._ensure_fact_stock_daily_view()
+-@@ -687,6 +688,256 @@ class SchemaManager:
+-                 )
+-             self.logger.info("表 %s 已新增唯一索引 %s。", table, unique_index)
+- 
+-+    # ---------- External signal tables ----------
+-+    def _ensure_external_signal_tables(self) -> None:
+-+        self._ensure_lhb_detail_table()
+-+        self._ensure_margin_detail_table()
+-+        self._ensure_gdhs_tables()
+-+
+-+    def _ensure_yyyymmdd_date_column(
+-+        self, table: str, column: str, *, not_null: bool
+-+    ) -> None:
+-+        meta = self._column_meta(table)
+-+        info = meta.get(column)
+-+        target_def = "DATE NOT NULL" if not_null else "DATE NULL"
+-+        if not info:
+-+            self._add_missing_columns(table, {column: target_def})
+-+            return
+-+        if info["data_type"] == "date":
+-+            if not_null:
+-+                self._ensure_date_column(table, column, not_null=True)
+-+            return
+-+
+-+        invalid_stmt = text(
+-+            f"""
+-+            SELECT COUNT(*) AS cnt
+-+            FROM `{table}`
+-+            WHERE `{column}` IS NOT NULL
+-+              AND `{column}` NOT REGEXP '^[0-9]{{8}}$'
+-+              AND `{column}` NOT REGEXP '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}$'
+-+            """
+-+        )
+-+        with self.engine.connect() as conn:
+-+            row = conn.execute(invalid_stmt).mappings().first()
+-+        invalid = int(row.get("cnt") or 0) if row else 0
+-+        if invalid:
+-+            self.logger.warning(
+-+                "表 %s.%s 存在非日期值(%s)，已跳过 DATE 转换。",
+-+                table,
+-+                column,
+-+                invalid,
+-+            )
+-+            return
+-+
+-+        update_ymd = text(
+-+            f"""
+-+            UPDATE `{table}`
+-+            SET `{column}` = STR_TO_DATE(`{column}`, '%Y%m%d')
+-+            WHERE `{column}` REGEXP '^[0-9]{{8}}$'
+-+            """
+-+        )
+-+        update_iso = text(
+-+            f"""
+-+            UPDATE `{table}`
+-+            SET `{column}` = STR_TO_DATE(`{column}`, '%Y-%m-%d')
+-+            WHERE `{column}` REGEXP '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}$'
+-+            """
+-+        )
+-+        with self.engine.begin() as conn:
+-+            conn.execute(update_ymd)
+-+            conn.execute(update_iso)
+-+            conn.execute(text(f"ALTER TABLE `{table}` MODIFY COLUMN `{column}` {target_def}"))
+-+        self.logger.info("表 %s.%s 已调整为 %s。", table, column, target_def)
+-+
+-+    def _ensure_unique_index_if_clean(
+-+        self, table: str, index: str, columns: Iterable[str]
+-+    ) -> None:
+-+        if self._index_exists(table, index):
+-+            return
+-+        cols = [str(c) for c in columns if c]
+-+        if not cols:
+-+            return
+-+        col_sql = ", ".join(f"`{c}`" for c in cols)
+-+        dup_cols = ", ".join(f"`{c}`" for c in cols)
+-+        dup_stmt = text(
+-+            f"""
+-+            SELECT {dup_cols}, COUNT(*) AS cnt
+-+            FROM `{table}`
+-+            GROUP BY {dup_cols}
+-+            HAVING cnt > 1
+-+            LIMIT 1
+-+            """
+-+        )
+-+        with self.engine.connect() as conn:
+-+            dup_row = conn.execute(dup_stmt).mappings().first()
+-+        if dup_row:
+-+            self.logger.warning(
+-+                "表 %s 存在重复键，已跳过创建唯一索引 %s。", table, index
+-+            )
+-+            return
+-+        with self.engine.begin() as conn:
+-+            conn.execute(text(f"CREATE UNIQUE INDEX `{index}` ON `{table}` ({col_sql})"))
+-+        self.logger.info("表 %s 已新增唯一索引 %s。", table, index)
+-+
+-+    def _ensure_lhb_detail_table(self) -> None:
+-+        table = "a_share_lhb_detail"
+-+        columns = {
+-+            "序号": "BIGINT NULL",
+-+            "code": "VARCHAR(20) NOT NULL",
+-+            "名称": "VARCHAR(255) NULL",
+-+            "上榜日": "DATE NULL",
+-+            "解读": "VARCHAR(255) NULL",
+-+            "收盘价": "DOUBLE NULL",
+-+            "涨跌幅": "DOUBLE NULL",
+-+            "龙虎榜净买额": "DOUBLE NULL",
+-+            "龙虎榜买入额": "DOUBLE NULL",
+-+            "龙虎榜卖出额": "DOUBLE NULL",
+-+            "龙虎榜成交额": "DOUBLE NULL",
+-+            "市场总成交额": "DOUBLE NULL",
+-+            "净买额占总成交比": "DOUBLE NULL",
+-+            "成交额占总成交比": "DOUBLE NULL",
+-+            "换手率": "DOUBLE NULL",
+-+            "流通市值": "DOUBLE NULL",
+-+            "上榜原因": "VARCHAR(255) NULL",
+-+            "上榜后1日": "DOUBLE NULL",
+-+            "上榜后2日": "DOUBLE NULL",
+-+            "上榜后5日": "DOUBLE NULL",
+-+            "上榜后10日": "DOUBLE NULL",
+-+            "trade_date": "DATE NOT NULL",
+-+        }
+-+        if not self._table_exists(table):
+-+            self._create_table(table, columns)
+-+        else:
+-+            self._add_missing_columns(table, columns)
+-+        self._ensure_varchar_length(table, "code", 20)
+-+        self._ensure_varchar_length(table, "名称", 255)
+-+        self._ensure_varchar_length(table, "上榜原因", 255)
+-+        self._ensure_yyyymmdd_date_column(table, "trade_date", not_null=False)
+-+        self._ensure_yyyymmdd_date_column(table, "上榜日", not_null=False)
+-+
+-+        trade_idx = "idx_a_share_lhb_detail_trade_date"
+-+        if not self._index_exists(table, trade_idx):
+-+            with self.engine.begin() as conn:
+-+                conn.execute(text(f"CREATE INDEX `{trade_idx}` ON `{table}` (`trade_date`)"))
+-+            self.logger.info("表 %s 已新增索引 %s。", table, trade_idx)
+-+
+-+        code_trade_idx = "idx_a_share_lhb_detail_code_trade_date"
+-+        if not self._index_exists(table, code_trade_idx):
+-+            with self.engine.begin() as conn:
+-+                conn.execute(
+-+                    text(
+-+                        f"CREATE INDEX `{code_trade_idx}` ON `{table}` (`code`, `trade_date`)"
+-+                    )
+-+                )
+-+            self.logger.info("表 %s 已新增索引 %s。", table, code_trade_idx)
+-+
+-+    def _ensure_margin_detail_table(self) -> None:
+-+        table = "a_share_margin_detail"
+-+        columns = {
+-+            "信用交易日期": "DATE NULL",
+-+            "code": "VARCHAR(20) NOT NULL",
+-+            "标的证券简称": "VARCHAR(255) NULL",
+-+            "融资余额": "DOUBLE NULL",
+-+            "融资买入额": "DOUBLE NULL",
+-+            "融资偿还额": "DOUBLE NULL",
+-+            "融券余量": "DOUBLE NULL",
+-+            "融券卖出量": "DOUBLE NULL",
+-+            "融券偿还量": "DOUBLE NULL",
+-+            "trade_date": "DATE NOT NULL",
+-+            "exchange": "VARCHAR(8) NULL",
+-+            "证券简称": "VARCHAR(255) NULL",
+-+            "融券余额": "DOUBLE NULL",
+-+            "融资融券余额": "DOUBLE NULL",
+-+        }
+-+        if not self._table_exists(table):
+-+            self._create_table(table, columns)
+-+        else:
+-+            self._add_missing_columns(table, columns)
+-+        self._ensure_varchar_length(table, "code", 20)
+-+        self._ensure_varchar_length(table, "exchange", 8)
+-+        self._ensure_varchar_length(table, "标的证券简称", 255)
+-+        self._ensure_varchar_length(table, "证券简称", 255)
+-+        self._ensure_yyyymmdd_date_column(table, "trade_date", not_null=False)
+-+        self._ensure_yyyymmdd_date_column(table, "信用交易日期", not_null=False)
+-+
+-+        trade_idx = "idx_a_share_margin_detail_trade_date"
+-+        if not self._index_exists(table, trade_idx):
+-+            with self.engine.begin() as conn:
+-+                conn.execute(text(f"CREATE INDEX `{trade_idx}` ON `{table}` (`trade_date`)"))
+-+            self.logger.info("表 %s 已新增索引 %s。", table, trade_idx)
+-+
+-+        code_trade_idx = "idx_a_share_margin_detail_code_trade_date"
+-+        if not self._index_exists(table, code_trade_idx):
+-+            with self.engine.begin() as conn:
+-+                conn.execute(
+-+                    text(
+-+                        f"CREATE INDEX `{code_trade_idx}` ON `{table}` (`code`, `trade_date`)"
+-+                    )
+-+                )
+-+            self.logger.info("表 %s 已新增索引 %s。", table, code_trade_idx)
+-+
+-+        unique_idx = "ux_a_share_margin_detail_exchange_code_trade_date"
+-+        self._ensure_unique_index_if_clean(table, unique_idx, ("exchange", "code", "trade_date"))
+-+
+-+    def _ensure_gdhs_tables(self) -> None:
+-+        summary = "a_share_gdhs"
+-+        summary_cols = {
+-+            "code": "VARCHAR(20) NOT NULL",
+-+            "名称": "VARCHAR(255) NULL",
+-+            "最新价": "DOUBLE NULL",
+-+            "涨跌幅": "DOUBLE NULL",
+-+            "股东户数-本次": "BIGINT NULL",
+-+            "股东户数-上次": "BIGINT NULL",
+-+            "股东户数-增减": "BIGINT NULL",
+-+            "股东户数-增减比例": "DOUBLE NULL",
+-+            "区间涨跌幅": "DOUBLE NULL",
+-+            "period": "DATE NOT NULL",
+-+            "股东户数统计截止日-上次": "DATE NULL",
+-+            "户均持股市值": "DOUBLE NULL",
+-+            "户均持股数量": "DOUBLE NULL",
+-+            "总市值": "DOUBLE NULL",
+-+            "总股本": "DOUBLE NULL",
+-+            "公告日期": "DATE NULL",
+-+        }
+-+        if not self._table_exists(summary):
+-+            self._create_table(summary, summary_cols)
+-+        else:
+-+            self._add_missing_columns(summary, summary_cols)
+-+        self._ensure_varchar_length(summary, "code", 20)
+-+        self._ensure_varchar_length(summary, "名称", 255)
+-+        self._ensure_yyyymmdd_date_column(summary, "period", not_null=False)
+-+        self._ensure_yyyymmdd_date_column(summary, "股东户数统计截止日-上次", not_null=False)
+-+        self._ensure_yyyymmdd_date_column(summary, "公告日期", not_null=False)
+-+        self._ensure_unique_index_if_clean(summary, "ux_a_share_gdhs_code_period", ("code", "period"))
+-+
+-+        detail = "a_share_gdhs_detail"
+-+        detail_cols = {
+-+            "period": "DATE NOT NULL",
+-+            "区间涨跌幅": "DOUBLE NULL",
+-+            "股东户数-本次": "BIGINT NULL",
+-+            "股东户数-上次": "BIGINT NULL",
+-+            "股东户数-增减": "BIGINT NULL",
+-+            "股东户数-增减比例": "DOUBLE NULL",
+-+            "户均持股市值": "DOUBLE NULL",
+-+            "户均持股数量": "DOUBLE NULL",
+-+            "总市值": "DOUBLE NULL",
+-+            "总股本": "DOUBLE NULL",
+-+            "股本变动": "DOUBLE NULL",
+-+            "股本变动原因": "TEXT NULL",
+-+            "股东户数公告日期": "DATE NULL",
+-+            "code": "VARCHAR(20) NOT NULL",
+-+            "名称": "VARCHAR(255) NULL",
+-+        }
+-+        if not self._table_exists(detail):
+-+            self._create_table(detail, detail_cols)
+-+        else:
+-+            self._add_missing_columns(detail, detail_cols)
+-+        self._ensure_varchar_length(detail, "code", 20)
+-+        self._ensure_varchar_length(detail, "名称", 255)
+-+        self._ensure_yyyymmdd_date_column(detail, "period", not_null=False)
+-+        self._ensure_yyyymmdd_date_column(detail, "股东户数公告日期", not_null=False)
+-+        self._ensure_unique_index_if_clean(detail, "ux_a_share_gdhs_detail_code_period", ("code", "period"))
+-+
+-     # ---------- Base dims/facts ----------
+-     def _ensure_dim_stock_basic_view(self) -> None:
+-         source = "a_share_stock_list"
+-@@ -1986,19 +2237,27 @@ class SchemaManager:
+-               ELSE (q.`live_latest` - daily.`ma20`) / daily.`atr14`
+-             END
+-         """
+--        gate_action_expr = """
+-+        effective_regime_expr = """
+-+            CASE
+-+              WHEN UPPER(COALESCE(weekly.`weekly_risk_level`, '')) = 'HIGH'
+-+                AND UPPER(COALESCE(daily.`regime`, '')) = 'RISK_ON'
+-+                THEN 'RISK_OFF'
+-+              ELSE daily.`regime`
+-+            END
+-+        """
+-+        gate_action_expr = f"""
+-             CASE
+--              WHEN UPPER(COALESCE(daily.`regime`, '')) IN ('BREAKDOWN', 'BEAR_CONFIRMED')
+-+              WHEN UPPER(COALESCE({effective_regime_expr}, '')) IN ('BREAKDOWN', 'BEAR_CONFIRMED')
+-                 THEN 'STOP'
+--              WHEN UPPER(COALESCE(daily.`regime`, '')) = 'RISK_OFF'
+-+              WHEN UPPER(COALESCE({effective_regime_expr}, '')) = 'RISK_OFF'
+-                 THEN 'WAIT'
+--              WHEN UPPER(COALESCE(daily.`regime`, '')) = 'PULLBACK'
+-+              WHEN UPPER(COALESCE({effective_regime_expr}, '')) = 'PULLBACK'
+-                 THEN CASE
+-                   WHEN daily.`position_hint` IS NOT NULL AND daily.`position_hint` <= 0.3
+-                     THEN 'WAIT'
+-                   ELSE 'ALLOW'
+-                 END
+--              WHEN UPPER(COALESCE(daily.`regime`, '')) = 'RISK_ON'
+-+              WHEN UPPER(COALESCE({effective_regime_expr}, '')) = 'RISK_ON'
+-                 THEN 'ALLOW'
+-               WHEN daily.`position_hint` IS NOT NULL THEN CASE
+-                 WHEN daily.`position_hint` <= 0 THEN 'STOP'
+-@@ -2029,7 +2288,8 @@ class SchemaManager:
+-               env.`env_live_event_tags`,
+-               env.`env_live_reason`,
+-               daily.`score` AS `env_index_score`,
+--              daily.`regime` AS `env_regime`,
+-+              daily.`regime` AS `env_regime_raw`,
+-+              {effective_regime_expr} AS `env_regime`,
+-               daily.`position_hint` AS `env_position_hint`,
+-               weekly.`weekly_gate_policy` AS `env_weekly_gate_policy`,
+-               weekly.`weekly_risk_level` AS `env_weekly_risk_level`,
+-@@ -2072,7 +2332,7 @@ class SchemaManager:
+-               {gate_action_expr} AS `env_index_gate_action`,
+-               CONCAT(
+-                 'regime=',
+--                COALESCE(daily.`regime`, ''),
+-+                COALESCE({effective_regime_expr}, ''),
+-                 ' pos_hint=',
+-                 COALESCE(daily.`position_hint`, '')
+-               ) AS `env_index_gate_reason`,
+-diff --git a/ashare/weekly_env_builder.py b/ashare/weekly_env_builder.py
+-index b2b4020..62ed0ad 100644
+---- a/ashare/weekly_env_builder.py
+-+++ b/ashare/weekly_env_builder.py
+-@@ -757,6 +757,43 @@ class WeeklyEnvironmentBuilder:
+-             return "ALLOW"
+-         return None
+- 
+-+    @staticmethod
+-+    def _resolve_risk_emotion_policy(env_context: dict[str, Any]) -> dict[str, Any]:
+-+        risk_level = str(env_context.get("weekly_risk_level") or "").upper()
+-+        regime = str(env_context.get("regime") or "").upper()
+-+
+-+        # Risk (weekly) x Emotion (daily regime) matrix.
+-+        matrix = {
+-+            "HIGH": {
+-+                "RISK_ON": ("WAIT", 0.15, "HIGH_RISK_RISK_ON"),
+-+                "PULLBACK": ("WAIT", 0.15, "HIGH_RISK_PULLBACK"),
+-+                "RISK_OFF": ("STOP", 0.0, "HIGH_RISK_RISK_OFF"),
+-+                "BREAKDOWN": ("STOP", 0.0, "HIGH_RISK_BREAKDOWN"),
+-+                "BEAR_CONFIRMED": ("STOP", 0.0, "HIGH_RISK_BEAR"),
+-+            },
+-+            "MEDIUM": {
+-+                "RISK_ON": ("ALLOW_SMALL", 0.3, "MEDIUM_RISK_RISK_ON"),
+-+                "PULLBACK": ("ALLOW_SMALL", 0.25, "MEDIUM_RISK_PULLBACK"),
+-+                "RISK_OFF": ("WAIT", 0.15, "MEDIUM_RISK_RISK_OFF"),
+-+                "BREAKDOWN": ("WAIT", 0.15, "MEDIUM_RISK_BREAKDOWN"),
+-+            },
+-+            "LOW": {
+-+                "RISK_ON": ("ALLOW", 1.0, "LOW_RISK_RISK_ON"),
+-+                "PULLBACK": ("ALLOW_SMALL", 0.5, "LOW_RISK_PULLBACK"),
+-+                "RISK_OFF": ("WAIT", 0.25, "LOW_RISK_RISK_OFF"),
+-+            },
+-+        }
+-+
+-+        if not risk_level or not regime:
+-+            return {}
+-+
+-+        row = matrix.get(risk_level, {})
+-+        if regime not in row:
+-+            return {}
+-+
+-+        gate_action, cap_limit, tag = row[regime]
+-+        return {"gate_action": gate_action, "cap_limit": cap_limit, "matrix_tag": tag}
+-+
+-     @staticmethod
+-     def _resolve_weekly_zone(
+-         weekly_scenario: dict[str, Any] | None,
+-@@ -824,6 +861,8 @@ class WeeklyEnvironmentBuilder:
+-         if not isinstance(env_context, dict):
+-             return
+- 
+-+        risk_emotion = self._resolve_risk_emotion_policy(env_context)
+-+
+-         gate_candidates: list[str | None] = []
+-         reason_parts: dict[str, Any] = {}
+-         gate_norm = None
+-@@ -860,6 +899,18 @@ class WeeklyEnvironmentBuilder:
+-         if regime_gate:
+-             reason_parts["regime_gate_action"] = regime_gate
+- 
+-+        if risk_emotion:
+-+            matrix_gate = risk_emotion.get("gate_action")
+-+            if matrix_gate:
+-+                gate_candidates.append(matrix_gate)
+-+                reason_parts["risk_emotion_gate_action"] = matrix_gate
+-+            matrix_cap = risk_emotion.get("cap_limit")
+-+            if matrix_cap is not None:
+-+                reason_parts["risk_emotion_cap_limit"] = f"{matrix_cap:.2f}"
+-+            matrix_tag = risk_emotion.get("matrix_tag")
+-+            if matrix_tag:
+-+                reason_parts["risk_emotion_matrix"] = matrix_tag
+-+
+-         effective_weekly_gate = gate_norm
+-         live_unlock_gate = str(env_context.get("env_live_unlock_gate") or "").strip().upper()
+-         if (
+-@@ -926,6 +977,25 @@ class WeeklyEnvironmentBuilder:
+-         final_cap = base_cap * daily_cap_multiplier * breadth_factor * live_cap_multiplier
+-         final_cap = min(max(final_cap, 0.0), 1.0)
+-         small_cap_limit = 0.25
+-+        if risk_emotion and risk_emotion.get("cap_limit") is not None:
+-+            cap_limit = float(risk_emotion["cap_limit"])
+-+            if final_cap > cap_limit:
+-+                final_cap = cap_limit
+-+                reason_parts["gate_cap_limit"] = f"RISK_EMOTION_{cap_limit:.2f}"
+-+        weekly_risk_level = str(env_context.get("weekly_risk_level") or "").strip().upper()
+-+        weekly_scene = str(
+-+            env_context.get("weekly_scene_code") or env_context.get("weekly_scene") or ""
+-+        ).strip().upper()
+-+        breadth_saturation = reason_parts.get("breadth_saturation")
+-+        tier_cap = None
+-+        if weekly_risk_level == "HIGH":
+-+            if breadth_saturation == "RISK_ON_PEAK":
+-+                tier_cap = 0.05
+-+            elif weekly_scene.startswith("WEDGE"):
+-+                tier_cap = 0.08
+-+        if tier_cap is not None and final_cap > tier_cap:
+-+            final_cap = tier_cap
+-+            reason_parts["risk_tier_cap"] = f"{weekly_risk_level}_{tier_cap:.2f}"
+-         if effective_weekly_gate == "ALLOW_SMALL" and gate_norm == "WAIT":
+-             small_cap_limit = 0.15
+-             reason_parts["unlock_cap_limit"] = f"{small_cap_limit:.2f}"
+diff --git a/start.py b/start.py
+index 3334e70..0ee7b98 100644
+--- a/start.py
++++ b/start.py
+@@ -12,6 +12,8 @@ from ashare.ma5_ma20_trend_strategy import MA5MA20StrategyRunner
+ from ashare.open_monitor import MA5MA20OpenMonitorRunner
+ from ashare.schema_manager import ensure_schema
+ from run_index_weekly_channel import run_weekly_market_indicator
++from run_chip_filter import main as run_chip_filter
++from run_daily_market_indicator import run_daily_market_indicator
  
--        deduped = df.copy()
-+        deduped = df.drop_duplicates().copy()
-         if subset:
-             deduped.drop_duplicates(subset=list(subset), keep="last", inplace=True)
  
-@@ -221,6 +221,9 @@ class ExternalSignalManager:
-                 df[col] = df[col].apply(
-                     lambda x: self._to_yyyymmdd(x) or normalized_default
-                 )
-+        self._coerce_yyyymmdd_date_column(df, "trade_date")
-+        for col in ["上榜日", "信用交易日期", "日期", "交易日期"]:
-+            self._coerce_yyyymmdd_date_column(df, col)
+ def _parse_asof_date(raw: str | None) -> str | None:
+@@ -125,6 +127,8 @@ def main(
+     skip_fetch: bool = False,
+     skip_strategy: bool = False,
+     skip_weekly: bool = False,
++    skip_chip: bool = False,
++    skip_daily_indicator: bool = False,
+     asof_date: str | None = None,
+ ) -> None:
+     ensure_schema()
+@@ -141,6 +145,28 @@ def main(
+     ready_view = str(params.ready_signals_view or "").strip() or None
+     signal_table = str(getattr(strategy_runner.params, "signal_events_table", "") or "").strip()
  
-     def _normalize_period(self, df: pd.DataFrame, period: str | None = None) -> None:
-         self._rename_first(
-@@ -241,6 +244,7 @@ class ExternalSignalManager:
-             or fallback_period
-             or ("" if pd.isna(x) else str(x))
-         )
-+        self._coerce_yyyymmdd_date_column(df, "period")
- 
-     def _normalize_exchange(self, df: pd.DataFrame, exchange: str) -> None:
-         self._rename_first(df, ["exchange", "交易所"], "exchange")
-@@ -262,6 +266,28 @@ class ExternalSignalManager:
-             return code.split(".", 1)[1]
-         return code
- 
-+    def _coerce_yyyymmdd_date_column(self, df: pd.DataFrame, column: str) -> None:
-+        if column not in df.columns:
-+            return
-+        series = df[column].apply(lambda x: self._to_yyyymmdd(x))
-+        parsed = pd.to_datetime(series, format="%Y%m%d", errors="coerce")
-+        df[column] = parsed.dt.date
-+
-+    def _coerce_any_date_column(self, df: pd.DataFrame, column: str) -> None:
-+        if column not in df.columns:
-+            return
-+        df[column] = pd.to_datetime(df[column], errors="coerce").dt.date
-+
-+    def _normalize_security_name(self, df: pd.DataFrame) -> None:
-+        if "证券简称" not in df.columns and "标的证券简称" in df.columns:
-+            df.rename(columns={"标的证券简称": "证券简称"}, inplace=True)
-+            return
-+        if "证券简称" in df.columns and "标的证券简称" in df.columns:
-+            df["证券简称"] = df["证券简称"].where(
-+                df["证券简称"].notna(), df["标的证券简称"]
++    # 执行日线市场指标计算
++    daily_indicator_status: dict = {"written": 0}
++    if not skip_daily_indicator:
++        try:
++            daily_indicator_status = run_daily_market_indicator(
++                start_date=asof_date,
++                end_date=asof_date,
++                mode="incremental",
 +            )
-+            df.drop(columns=["标的证券简称"], inplace=True)
++            logging.info(f"[INFO] 日线市场指标计算完成，写入 {daily_indicator_status.get('written', 0)} 条记录。")
++        except Exception as exc:  # noqa: BLE001
++            logging.warning(f"[WARN] 日线市场指标计算失败：{exc}")
 +
-     # =========================
-     # Trade-date backoff (核心：取最近一次可用数据)
-     # =========================
-@@ -436,6 +462,8 @@ class ExternalSignalManager:
-         used_date_for_norm = used_iso or trade_date
-         self._normalize_code_column(df)
-         self._normalize_trade_date(df, used_date_for_norm)
-+        if "上榜日" not in df.columns and "trade_date" in df.columns:
-+            df["上榜日"] = df["trade_date"]
-         subset = [col for col in ["code", "trade_date", "上榜日", "上榜原因"] if col in df.columns]
-         self._upsert(df, "a_share_lhb_detail", subset=subset or None)
-         return df
-@@ -466,6 +494,9 @@ class ExternalSignalManager:
-             self._normalize_code_column(df)
-             self._normalize_trade_date(df, used_date_for_norm)
-             self._normalize_exchange(df, exchange)
-+            self._normalize_security_name(df)
-+            if "信用交易日期" in df.columns and "trade_date" in df.columns:
-+                df["信用交易日期"] = df["trade_date"]
-             frames.append(df)
++    # 执行筹码筛选计算
++    chip_filter_status: dict = {"processed": 0}
++    if not skip_chip:
++        try:
++            chip_filter_status["processed"] = run_chip_filter()
++            logging.info(f"[INFO] 筹码筛选计算完成，处理 {chip_filter_status.get('processed', 0)} 条记录。")
++        except Exception as exc:  # noqa: BLE001
++            logging.warning(f"[WARN] 筹码筛选计算失败：{exc}")
++
+     weekly_status: dict = {"written": 0}
+     skipped_weekly = bool(skip_weekly)
+     if not skipped_weekly:
+@@ -173,6 +199,8 @@ def main(
+         "buy_cnt_total_recent_n_days": buy_cnt_total_recent_n_days,
+         "buy_sig_date_breakdown": breakdown[:7],
+         "weekly_env_status": weekly_status if not skipped_weekly else {"skipped": True},
++        "daily_indicator_status": daily_indicator_status if not skip_daily_indicator else {"skipped": True},
++        "chip_filter_status": chip_filter_status if not skip_chip else {"skipped": True},
+     }
  
-         if not frames:
-@@ -494,6 +525,8 @@ class ExternalSignalManager:
-                 period = str(period_from_data.iloc[0])
-             self._normalize_code_column(summary_df)
-             self._normalize_period(summary_df, period)
-+            for col in ["股东户数统计截止日-上次", "公告日期"]:
-+                self._coerce_any_date_column(summary_df, col)
-             summary_subset = [col for col in ["code", "period"] if col in summary_df.columns]
-             self._upsert(summary_df, "a_share_gdhs", subset=summary_subset or None)
-         else:
-@@ -528,6 +561,7 @@ class ExternalSignalManager:
- 
-         self._normalize_period(detail_df, period)
-         self._normalize_code_column(detail_df)
-+        self._coerce_any_date_column(detail_df, "股东户数公告日期")
-         subset = [col for col in ["code", "period"] if col in detail_df.columns]
-         self._upsert(
-             detail_df,
-diff --git a/ashare/market_indicator_builder.py b/ashare/market_indicator_builder.py
-index 78f09dc..8dd19af 100644
---- a/ashare/market_indicator_builder.py
-+++ b/ashare/market_indicator_builder.py
-@@ -26,6 +26,7 @@ class MarketIndicatorBuilder:
-         self.env_builder = env_builder
-         self.logger = logger
-         self.market_regime = MarketRegimeClassifier()
-+        self.regime_confirm_days = 2
- 
-     @property
-     def index_codes(self) -> list[str]:
-@@ -269,6 +270,11 @@ class MarketIndicatorBuilder:
-             .reset_index()
-         )
-         day_summary = day_summary.sort_values("trade_date").reset_index(drop=True)
-+        if "regime" in day_summary.columns:
-+            day_summary["regime_raw"] = day_summary["regime"]
-+            day_summary = self._apply_regime_hysteresis(
-+                day_summary, confirm_days=self.regime_confirm_days
-+            )
-         if "position_hint" in day_summary.columns:
-             day_summary["position_hint_raw"] = day_summary["position_hint"]
-             pos = pd.to_numeric(day_summary["position_hint"], errors="coerce")
-@@ -428,9 +434,85 @@ class MarketIndicatorBuilder:
-                 "score": score,
-                 "regime": regime,
-                 "position_hint": position_hint,
-+                "pullback_fast": pullback_fast,
-             }
-         )
- 
-+    @staticmethod
-+    def _apply_regime_hysteresis(
-+        day_summary: pd.DataFrame, *, confirm_days: int
-+    ) -> pd.DataFrame:
-+        if day_summary.empty or "regime" not in day_summary.columns:
-+            return day_summary
-+
-+        confirm_days = max(int(confirm_days), 1)
-+        severe = {"BREAKDOWN", "BEAR_CONFIRMED"}
-+        position_hint_map = {
-+            "RISK_ON": 0.8,
-+            "PULLBACK": 0.4,
-+            "RISK_OFF": 0.1,
-+            "BREAKDOWN": 0.0,
-+            "BEAR_CONFIRMED": 0.0,
-+            "UNKNOWN": None,
-+        }
-+
-+        current = None
-+        pending = None
-+        pending_count = 0
-+
-+        smoothed = []
-+        for _, row in day_summary.iterrows():
-+            raw = str(row.get("regime") or "").upper()
-+            if raw == "UNKNOWN":
-+                smoothed.append(current or "UNKNOWN")
-+                continue
-+
-+            if current is None:
-+                current = raw
-+                pending = None
-+                pending_count = 0
-+                smoothed.append(current)
-+                continue
-+
-+            if raw == current:
-+                pending = None
-+                pending_count = 0
-+                smoothed.append(current)
-+                continue
-+
-+            if raw in severe:
-+                current = raw
-+                pending = None
-+                pending_count = 0
-+                smoothed.append(current)
-+                continue
-+
-+            if pending != raw:
-+                pending = raw
-+                pending_count = 1
-+            else:
-+                pending_count += 1
-+
-+            if pending_count >= confirm_days:
-+                current = pending
-+                pending = None
-+                pending_count = 0
-+
-+            smoothed.append(current)
-+
-+        day_summary = day_summary.copy()
-+        day_summary["regime"] = smoothed
-+
-+        def _recalc_hint(row: pd.Series) -> float | None:
-+            regime = str(row.get("regime") or "").upper()
-+            hint = position_hint_map.get(regime)
-+            if regime == "PULLBACK" and bool(row.get("pullback_fast")) and hint is not None:
-+                hint = min(hint, 0.3)
-+            return hint
-+
-+        day_summary["position_hint"] = day_summary.apply(_recalc_hint, axis=1)
-+        return day_summary
-+
-     @staticmethod
-     def _resolve_breadth_metrics(group: pd.DataFrame) -> pd.Series:
-         valid_ma20 = group["ma20"].notna()
-diff --git a/ashare/monitor_rules.py b/ashare/monitor_rules.py
-index 81532a9..0123bda 100644
---- a/ashare/monitor_rules.py
-+++ b/ashare/monitor_rules.py
-@@ -26,9 +26,14 @@ class MonitorRuleConfig:
-     limit_up_trigger_pct: float = 9.7
-     max_entry_vs_ma5_pct: float = 0.08
-     runup_atr_max: float = 1.2
-+    runup_atr_vol_mult: float = 1.2
-+    runup_atr_max_cap: float = 2.0
-     runup_atr_tol: float = 0.02
-     pullback_runup_atr_max: float = 1.5
-     pullback_runup_dev_ma20_atr_min: float = 1.0
-+    ma20_atr_tol_mult: float = 0.5
-+    ma20_dyn_min_pct: float = -0.03
-+    ma20_prewarn_buffer_pct: float = 0.005
-     dev_ma5_atr_max: float = 2.0
-     dev_ma20_atr_max: float = 2.5
-     stop_atr_mult: float = 2.0
-@@ -45,6 +50,7 @@ class MonitorRuleConfig:
-     enable_below_ma20: bool = True
-     enable_limit_up: bool = True
-     enable_runup_breach: bool = True
-+    enable_ma20_prewarn: bool = True
- 
-     enable_signal_expired: bool = True
- 
-@@ -67,6 +73,7 @@ class MonitorRuleConfig:
-     gap_down_reason: str = "低开破位"
-     below_ma20_action: str = "SKIP"
-     below_ma20_reason: str = "未站上MA20要求"
-+    ma20_prewarn_reason: str = "接近MA20阈值"
-     limit_up_action: str = "SKIP"
-     limit_up_reason: str = "涨停不可成交"
-     runup_breach_action: str = "WAIT"
-@@ -85,6 +92,7 @@ class MonitorRuleConfig:
-     sev_gap_up: int = 70
-     sev_gap_down: int = 70
-     sev_below_ma20: int = 60
-+    sev_ma20_prewarn: int = 10
-     sev_limit_up: int = 60
-     sev_runup_breach: int = 55
- 
-@@ -163,6 +171,8 @@ class MonitorRuleConfig:
-                 "max_entry_vs_ma5_pct",
-             ),
-             runup_atr_max=_get_float("runup_atr_max", defaults.runup_atr_max),
-+            runup_atr_vol_mult=_get_float("runup_atr_vol_mult", defaults.runup_atr_vol_mult),
-+            runup_atr_max_cap=_get_float("runup_atr_max_cap", defaults.runup_atr_max_cap),
-             runup_atr_tol=_get_float("runup_atr_tol", defaults.runup_atr_tol),
-             pullback_runup_atr_max=_get_float(
-                 "pullback_runup_atr_max", defaults.pullback_runup_atr_max
-@@ -170,6 +180,15 @@ class MonitorRuleConfig:
-             pullback_runup_dev_ma20_atr_min=_get_float(
-                 "pullback_runup_dev_ma20_atr_min", defaults.pullback_runup_dev_ma20_atr_min
-             ),
-+            ma20_atr_tol_mult=_get_float("ma20_atr_tol_mult", defaults.ma20_atr_tol_mult),
-+            ma20_dyn_min_pct=_normalize_ratio_pct(
-+                _get_float("ma20_dyn_min_pct", defaults.ma20_dyn_min_pct),
-+                "ma20_dyn_min_pct",
-+            ),
-+            ma20_prewarn_buffer_pct=_normalize_ratio_pct(
-+                _get_float("ma20_prewarn_buffer_pct", defaults.ma20_prewarn_buffer_pct),
-+                "ma20_prewarn_buffer_pct",
-+            ),
-             dev_ma5_atr_max=_get_float("dev_ma5_atr_max", defaults.dev_ma5_atr_max),
-             dev_ma20_atr_max=_get_float("dev_ma20_atr_max", defaults.dev_ma20_atr_max),
-             stop_atr_mult=_get_float("stop_atr_mult", defaults.stop_atr_mult),
-@@ -193,6 +212,9 @@ class MonitorRuleConfig:
-             enable_below_ma20=_get_bool("enable_below_ma20", defaults.enable_below_ma20),
-             enable_limit_up=_get_bool("enable_limit_up", defaults.enable_limit_up),
-             enable_runup_breach=_get_bool("enable_runup_breach", defaults.enable_runup_breach),
-+            enable_ma20_prewarn=_get_bool(
-+                "enable_ma20_prewarn", defaults.enable_ma20_prewarn
-+            ),
-             enable_signal_expired=_get_bool(
-                 "enable_signal_expired", defaults.enable_signal_expired
-             ),
-@@ -236,6 +258,10 @@ class MonitorRuleConfig:
-                 cfg.get("below_ma20_reason", defaults.below_ma20_reason)
-             ).strip()
-             or defaults.below_ma20_reason,
-+            ma20_prewarn_reason=str(
-+                cfg.get("ma20_prewarn_reason", defaults.ma20_prewarn_reason)
-+            ).strip()
-+            or defaults.ma20_prewarn_reason,
-             limit_up_action=str(cfg.get("limit_up_action", defaults.limit_up_action)).strip()
-             or defaults.limit_up_action,
-             limit_up_reason=str(cfg.get("limit_up_reason", defaults.limit_up_reason)).strip()
-@@ -264,6 +290,7 @@ class MonitorRuleConfig:
-             sev_gap_up=int(cfg.get("sev_gap_up", defaults.sev_gap_up)),
-             sev_gap_down=int(cfg.get("sev_gap_down", defaults.sev_gap_down)),
-             sev_below_ma20=int(cfg.get("sev_below_ma20", defaults.sev_below_ma20)),
-+            sev_ma20_prewarn=int(cfg.get("sev_ma20_prewarn", defaults.sev_ma20_prewarn)),
-             sev_limit_up=int(cfg.get("sev_limit_up", defaults.sev_limit_up)),
-             sev_runup_breach=int(cfg.get("sev_runup_breach", defaults.sev_runup_breach)),
-         )
-@@ -386,6 +413,19 @@ def build_default_monitor_rules(
-                 action_override=config.gap_down_action,
-             ),
-         ),
-+        Rule(
-+            id="MA20_PREWARN",
-+            category="ACTION",
-+            severity=config.sev_ma20_prewarn,
-+            predicate=lambda ctx: bool(
-+                config.enable_ma20_prewarn
-+                and getattr(ctx, "ma20_prewarn", False)
-+            ),
-+            effect=lambda ctx: RuleResult(
-+                reason=getattr(ctx, "ma20_prewarn_reason", None)
-+                or config.ma20_prewarn_reason,
-+            ),
-+        ),
-         Rule(
-             id="BELOW_MA20_REQ",
-             category="ACTION",
-diff --git a/ashare/open_monitor.py b/ashare/open_monitor.py
-index b74f486..fe39dd8 100644
---- a/ashare/open_monitor.py
-+++ b/ashare/open_monitor.py
-@@ -22,6 +22,7 @@ import datetime as dt
- import json
- import logging
- import math
-+import re
- from dataclasses import dataclass, replace
- from typing import Any, Callable, List
- 
-@@ -131,6 +132,98 @@ class OpenMonitorParams:
-     live_retest_pct: float = 0.003
-     live_retest_atr_mult: float = 0.5
- 
-+    def validate(self, logger: logging.Logger) -> "OpenMonitorParams":
-+        params = self
-+
-+        def _reset(field: str, reason: str) -> None:
-+            nonlocal params
-+            default_val = getattr(OpenMonitorParams, field)
-+            logger.warning(
-+                "open_monitor param %s invalid (%s); fallback=%s",
-+                field,
-+                reason,
-+                default_val,
-+            )
-+            params = replace(params, **{field: default_val})
-+
-+        def _ensure_min_int(field: str, min_val: int) -> None:
-+            val = getattr(params, field)
-+            try:
-+                val_int = int(val)
-+            except Exception:
-+                _reset(field, "not int")
-+                return
-+            if val_int < min_val:
-+                _reset(field, f"<{min_val}")
-+                return
-+            if val_int != val:
-+                params = replace(params, **{field: val_int})
-+
-+        def _ensure_float_range(field: str, min_val: float, max_val: float) -> None:
-+            val = getattr(params, field)
-+            try:
-+                val_float = float(val)
-+            except Exception:
-+                _reset(field, "not float")
-+                return
-+            if (not math.isfinite(val_float)) or val_float < min_val or val_float > max_val:
-+                _reset(field, f"range {min_val}..{max_val}")
-+                return
-+            if val_float != val:
-+                params = replace(params, **{field: val_float})
-+
-+        _ensure_min_int("signal_lookback_days", 1)
-+        _ensure_min_int("interval_minutes", 1)
-+        _ensure_min_int("run_id_minutes", 1)
-+        _ensure_min_int("export_top_n", 0)
-+
-+        if params.run_id_minutes < params.interval_minutes:
-+            logger.warning(
-+                "open_monitor param run_id_minutes < interval_minutes; clamp to %s",
-+                params.interval_minutes,
-+            )
-+            params = replace(params, run_id_minutes=params.interval_minutes)
-+
-+        mode = str(params.output_mode or "").strip().upper()
-+        if mode not in {"FULL", "COMPACT"}:
-+            _reset("output_mode", "invalid enum")
-+        elif mode != params.output_mode:
-+            params = replace(params, output_mode=mode)
-+
-+        quote_source = str(params.quote_source or "").strip().lower()
-+        if quote_source == "auto":
-+            logger.warning("open_monitor quote_source=auto; using eastmoney")
-+            quote_source = "eastmoney"
-+        if quote_source not in {"eastmoney", "akshare"}:
-+            _reset("quote_source", "invalid enum")
-+        elif quote_source != params.quote_source:
-+            params = replace(params, quote_source=quote_source)
-+
-+        _ensure_float_range("live_breakout_high_eps", 0.0, 0.1)
-+        _ensure_float_range("live_breakout_latest_eps", 0.0, 0.1)
-+        _ensure_float_range("live_retest_pct", 0.0, 0.1)
-+        _ensure_float_range("live_retest_atr_mult", 0.0, 10.0)
-+
-+        name_pattern = re.compile(r"^[A-Za-z0-9_]+$")
-+        name_fields = [
-+            "ready_signals_view",
-+            "quote_table",
-+            "output_table",
-+            "run_table",
-+            "open_monitor_view",
-+            "open_monitor_wide_view",
-+            "open_monitor_env_view",
-+            "open_monitor_env_table",
-+            "weekly_indicator_table",
-+            "daily_indicator_table",
-+        ]
-+        for field in name_fields:
-+            val = getattr(params, field)
-+            if not isinstance(val, str) or not name_pattern.match(val):
-+                _reset(field, "invalid name")
-+
-+        return params
-+
-     @classmethod
-     def from_config(cls) -> "OpenMonitorParams":
-         sec = get_section("open_monitor") or {}
-@@ -169,8 +262,6 @@ class OpenMonitorParams:
-                 return default
- 
-         quote_source = str(sec.get("quote_source", cls.quote_source)).strip().lower() or "auto"
--        if quote_source == "auto":
--            quote_source = "eastmoney"
- 
-         interval_minutes = _get_int("interval_minutes", cls.interval_minutes)
- 
-@@ -181,7 +272,7 @@ class OpenMonitorParams:
-             else interval_minutes
-         )
- 
--        return cls(
-+        params = cls(
-             enabled=_get_bool("enabled", cls.enabled),
-             ready_signals_view=str(
-                 sec.get("ready_signals_view", cls.ready_signals_view)
-@@ -252,6 +343,7 @@ class OpenMonitorParams:
-                 "live_retest_atr_mult", cls.live_retest_atr_mult
-             ),
-         )
-+        return params.validate(logger)
- 
- 
- class MA5MA20OpenMonitorRunner:
-@@ -387,22 +479,6 @@ class MA5MA20OpenMonitorRunner:
-             codes = signals["code"].dropna().astype(str).unique().tolist()
-             asof_df = self.repo.load_latest_indicators(latest_trade_date, codes)
-             if asof_df is not None and not asof_df.empty:
--                asof_df = asof_df.copy()
--                asof_df["code"] = asof_df["code"].astype(str)
--                asof_df = asof_df.rename(
--                    columns={
--                        "trade_date": "asof_trade_date",
--                        "close": "asof_close",
--                        "ma5": "asof_ma5",
--                        "ma20": "asof_ma20",
--                        "ma60": "asof_ma60",
--                        "ma250": "asof_ma250",
--                        "vol_ratio": "asof_vol_ratio",
--                        "macd_hist": "asof_macd_hist",
--                        "atr14": "asof_atr14",
--                        "avg_volume_20": "asof_avg_volume_20",
--                    }
--                )
-                 signals = signals.merge(asof_df, on="code", how="left")
-                 if "avg_volume_20" in signals.columns and "asof_avg_volume_20" in signals.columns:
-                     signals["avg_volume_20"] = signals["avg_volume_20"].fillna(
-@@ -535,6 +611,14 @@ class MA5MA20OpenMonitorRunner:
-             "position_cap": env_context.get("env_final_cap_pct"),
-             "reason": env_context.get("env_final_reason_json"),
-         }
-+        reason_matrix = None
-+        if env_instruction.get("reason"):
-+            try:
-+                reason_payload = json.loads(env_instruction["reason"])
-+                if isinstance(reason_payload, dict):
-+                    reason_matrix = reason_payload.get("risk_emotion_matrix")
-+            except Exception:
-+                reason_matrix = None
-         env_payload = {
-             "env_final_gate_action": env_instruction.get("gate_status"),
-             "env_final_cap_pct": env_instruction.get("position_cap"),
-@@ -545,14 +629,20 @@ class MA5MA20OpenMonitorRunner:
-             "weekly_scene_code": env_context.get("weekly_scene_code"),
-             "index_score": env_context.get("index_score"),
-             "regime": env_context.get("regime"),
-+            "regime_raw": env_context.get("regime_raw"),
-             "position_hint": env_context.get("position_hint"),
-         }
-         env_final_gate_action = env_instruction.get("gate_status")
-         self.logger.info(
--            "已构建环境快照（monitor_date=%s, run_id=%s, gate=%s）。",
-+            "已构建环境快照（monitor_date=%s, run_id=%s, gate=%s, cap=%s, regime=%s(raw=%s), weekly_risk=%s, matrix=%s）。",
-             monitor_date,
-             run_id,
-             env_final_gate_action,
-+            env_instruction.get("position_cap"),
-+            env_context.get("regime"),
-+            env_context.get("regime_raw"),
-+            env_context.get("weekly_risk_level"),
-+            reason_matrix,
-         )
-         result = self.evaluator.evaluate(
-             signals,
-diff --git a/ashare/open_monitor_env.py b/ashare/open_monitor_env.py
-index b599664..088ce64 100644
---- a/ashare/open_monitor_env.py
-+++ b/ashare/open_monitor_env.py
-@@ -159,6 +159,9 @@ class OpenMonitorEnvService:
-             "weekly_zone_reason": weekly_scenario.get("weekly_zone_reason"),
-             "regime": (daily_env or {}).get("regime")
-             or (env_view_row or {}).get("env_regime"),
-+            "regime_raw": (daily_env or {}).get("regime_raw")
-+            or (env_view_row or {}).get("env_regime_raw")
-+            or (env_view_row or {}).get("env_regime"),
-             "index_score": (daily_env or {}).get("score")
-             or (env_view_row or {}).get("env_index_score"),
-             "position_hint": (daily_env or {}).get("position_hint")
-@@ -198,6 +201,8 @@ class OpenMonitorEnvService:
-             "env_live_reason": row.get("env_live_reason"),
-         }
-         env_context["index_intraday"] = index_snapshot
-+        if not env_context.get("regime_raw"):
-+            env_context["regime_raw"] = env_context.get("regime")
- 
-         return env_context
- 
-@@ -308,6 +313,7 @@ class OpenMonitorEnvService:
-             if daily_env
-             else None,
-             "regime": daily_env.get("regime") if daily_env else None,
-+            "regime_raw": daily_env.get("regime_raw") if daily_env else None,
-             "position_hint": _to_float(daily_env.get("position_hint"))
-             if daily_env
-             else None,
-@@ -347,6 +353,8 @@ class OpenMonitorEnvService:
-             if daily_env
-             else None,
-         }
-+        if not env_context.get("regime_raw"):
-+            env_context["regime_raw"] = env_context.get("regime")
-         if not weekly_gate_policy:
-             weekly_gate_policy = self.env_builder.resolve_env_weekly_gate_policy(env_context)
-             env_context["weekly_gate_policy"] = weekly_gate_policy
-@@ -752,14 +760,21 @@ class OpenMonitorEnvService:
-             gate_reason = index_env_snapshot.get("env_index_gate_reason") or "-"
-             live_pct = _to_float(index_env_snapshot.get("env_index_live_pct_change"))
-             dev_ma20_atr = _to_float(index_env_snapshot.get("env_index_dev_ma20_atr"))
-+            regime_eff = None
-+            regime_raw = None
-+            if isinstance(ctx, dict):
-+                regime_eff = ctx.get("regime")
-+                regime_raw = ctx.get("regime_raw") or regime_eff
-             self.logger.info(
--                "指数环境快照：%s asof=%s live=%s pct=%.2f%% dev_ma20_atr=%.2f gate=%s reason=%s",
-+                "指数环境快照：%s asof=%s live=%s pct=%.2f%% dev_ma20_atr=%.2f index_gate=%s regime=%s(raw=%s) reason=%s",
-                 index_env_snapshot.get("env_index_code"),
-                 index_env_snapshot.get("env_index_asof_trade_date"),
-                 index_env_snapshot.get("env_index_live_trade_date"),
-                 live_pct if live_pct is not None else 0.0,
-                 dev_ma20_atr if dev_ma20_atr is not None else 0.0,
-                 gate_action,
-+                regime_eff,
-+                regime_raw,
-                 gate_reason,
-             )
- 
-diff --git a/ashare/open_monitor_eval.py b/ashare/open_monitor_eval.py
-index d267751..ef51955 100644
---- a/ashare/open_monitor_eval.py
-+++ b/ashare/open_monitor_eval.py
-@@ -5,6 +5,7 @@ from __future__ import annotations
- import datetime as dt
- import json
- import math
-+from time import perf_counter
- from dataclasses import dataclass
- from pathlib import Path
- from typing import Any, List
-@@ -12,6 +13,7 @@ from typing import Any, List
- import pandas as pd
- 
- from .config import get_section
-+from .open_monitor_df import coalesce_asof_from_sig
- from .open_monitor_repo import calc_run_id, make_snapshot_hash
- from .open_monitor_rules import DecisionContext, MarketEnvironment, RuleEngine
- from .utils.convert import to_float as _to_float
-@@ -360,9 +362,15 @@ class OpenMonitorEvaluator:
-         limit_up_trigger = self.rule_config.limit_up_trigger_pct
-         stop_atr_mult = self.rule_config.stop_atr_mult
-         runup_atr_max = self.rule_config.runup_atr_max
-+        runup_atr_vol_mult = self.rule_config.runup_atr_vol_mult
-+        runup_atr_max_cap = self.rule_config.runup_atr_max_cap
-         pullback_runup_atr_max = self.rule_config.pullback_runup_atr_max
-         pullback_runup_dev_ma20_atr_min = self.rule_config.pullback_runup_dev_ma20_atr_min
-         runup_atr_tol = self.rule_config.runup_atr_tol
-+        ma20_atr_tol_mult = self.rule_config.ma20_atr_tol_mult
-+        ma20_dyn_min_pct = self.rule_config.ma20_dyn_min_pct
-+        ma20_prewarn_buffer_pct = self.rule_config.ma20_prewarn_buffer_pct
-+        below_ma20_tol_pct = self.rule_config.below_ma20_tol_pct
-         for _, row in merged.iterrows():
-             sig_reason_text = str(row.get("sig_reason") or row.get("reason") or "")
-             is_pullback = self._is_pullback_signal(sig_reason_text)
-@@ -402,6 +410,9 @@ class OpenMonitorEvaluator:
-             sig_ma5 = _to_float(row.get("sig_ma5"))
-             sig_ma20 = _to_float(row.get("sig_ma20"))
-             sig_atr14 = _to_float(row.get("sig_atr14"))
-+            atr_pct = None
-+            if sig_atr14 is not None and sig_ma20 is not None and sig_ma20 != 0:
-+                atr_pct = sig_atr14 / sig_ma20
- 
-             dev_ma5 = None
-             dev_ma20 = None
-@@ -444,6 +455,29 @@ class OpenMonitorEvaluator:
-                 threshold_gap_up = min(max_up, atr_gap)
- 
-             ma20_thresh = pullback_min_vs_ma20 if is_pullback else min_vs_ma20
-+            if atr_pct is not None and ma20_atr_tol_mult is not None:
-+                dyn_thresh = -ma20_atr_tol_mult * atr_pct
-+                ma20_thresh = min(ma20_thresh, dyn_thresh)
-+                if ma20_dyn_min_pct is not None:
-+                    ma20_thresh = max(ma20_thresh, ma20_dyn_min_pct)
-+
-+            ma20_prewarn = False
-+            ma20_prewarn_reason = None
-+            if (
-+                price_now is not None
-+                and sig_ma20 is not None
-+                and ma20_thresh is not None
-+                and below_ma20_tol_pct is not None
-+            ):
-+                invalid_cut = sig_ma20 * (1 + ma20_thresh - below_ma20_tol_pct)
-+                prewarn_cut = sig_ma20 * (
-+                    1 + ma20_thresh - below_ma20_tol_pct + ma20_prewarn_buffer_pct
-+                )
-+                if price_now < prewarn_cut and price_now >= invalid_cut:
-+                    ma20_prewarn = True
-+                    ma20_prewarn_reason = (
-+                        f"near_ma20_cut price={price_now:.2f} prewarn={prewarn_cut:.2f}"
-+                    )
- 
-             chip_score = _to_float(row.get("sig_chip_score"))
-             chip_reason = row.get("sig_chip_reason")
-@@ -467,6 +501,10 @@ class OpenMonitorEvaluator:
-             if price_now is not None:
-                 dev_ma20_atr_val = dev_ma20_atr
-                 runup_limit = pullback_runup_atr_max if is_pullback else runup_atr_max
-+                if atr_pct is not None and runup_limit is not None and runup_atr_vol_mult is not None:
-+                    runup_limit = runup_limit + runup_atr_vol_mult * atr_pct
-+                    if runup_atr_max_cap is not None:
-+                        runup_limit = min(runup_limit, runup_atr_max_cap)
-                 breach, breach_reason = evaluate_runup_breach(
-                     runup_metrics,
-                     runup_atr_max=runup_limit,
-@@ -502,6 +540,8 @@ class OpenMonitorEvaluator:
-                 max_gap_down=max_down,
-                 sig_ma20=sig_ma20,
-                 ma20_thresh=ma20_thresh,
-+                ma20_prewarn=ma20_prewarn,
-+                ma20_prewarn_reason=ma20_prewarn_reason,
-                 signal_age=signal_age,
-                 limit_up_trigger=limit_up_trigger,
-                 runup_breach=breach,
-@@ -620,28 +660,7 @@ class OpenMonitorEvaluator:
-         merged["strength_trend"] = strength_trend_list
-         merged["strength_note"] = strength_note_list
- 
--        def _coalesce_numeric_into(target: str, fallback: str) -> None:
--            if target not in merged.columns:
--                merged[target] = None
--            if fallback not in merged.columns:
--                return
--            left = pd.to_numeric(merged[target], errors="coerce")
--            right = pd.to_numeric(merged[fallback], errors="coerce")
--            merged[target] = left.fillna(right)
--
--        if "asof_trade_date" in merged.columns and "sig_date" in merged.columns:
--            mask = merged["asof_trade_date"].notna()
--            merged["asof_trade_date"] = merged["asof_trade_date"].where(mask, merged["sig_date"])
--
--        _coalesce_numeric_into("asof_close", "sig_close")
--        _coalesce_numeric_into("asof_ma5", "sig_ma5")
--        _coalesce_numeric_into("asof_ma20", "sig_ma20")
--        _coalesce_numeric_into("asof_ma60", "sig_ma60")
--        _coalesce_numeric_into("asof_ma250", "sig_ma250")
--        _coalesce_numeric_into("asof_vol_ratio", "sig_vol_ratio")
--        _coalesce_numeric_into("asof_macd_hist", "sig_macd_hist")
--        _coalesce_numeric_into("asof_atr14", "sig_atr14")
--        _coalesce_numeric_into("asof_stop_ref", "sig_stop_ref")
-+        merged = coalesce_asof_from_sig(merged)
- 
-         full_keep_cols = [
-             "monitor_date",
-@@ -1054,6 +1073,7 @@ class OpenMonitorEvaluator:
-     def export_csv(self, df: pd.DataFrame) -> None:
-         if df.empty or (not self.params.export_csv):
-             return
-+        t0 = perf_counter()
- 
-         app_sec = get_section("app") or {}
-         base_dir = "output"
-@@ -1112,4 +1132,11 @@ class OpenMonitorEvaluator:
-             export_df = export_df.head(self.params.export_top_n)
- 
-         export_df.to_csv(path, index=False, encoding="utf-8-sig")
--        self.logger.info("开盘监测 CSV 已导出：%s", path)
-+        elapsed = perf_counter() - t0
-+        self.logger.info(
-+            "open_monitor CSV exported: %s rows=%s top_n=%s elapsed=%.3fs",
-+            path,
-+            len(export_df),
-+            self.params.export_top_n,
-+            elapsed,
-+        )
-diff --git a/ashare/open_monitor_repo.py b/ashare/open_monitor_repo.py
-index c2ff66b..2784322 100644
---- a/ashare/open_monitor_repo.py
-+++ b/ashare/open_monitor_repo.py
-@@ -6,7 +6,7 @@ import datetime as dt
- import hashlib
- import json
- import math
--from typing import Any, Dict, List, Tuple
-+from typing import Any, Dict, List, Tuple, TypedDict
- 
- import pandas as pd
- from sqlalchemy import bindparam, text
-@@ -17,6 +17,8 @@ from .config import get_section
- from .db import DatabaseConfig, MySQLWriter
- from .env_snapshot_utils import load_trading_calendar
- from .ma5_ma20_trend_strategy import _atr, _macd
-+from .open_monitor_df import normalize_asof_indicators
-+from .open_monitor_persist import OpenMonitorPersister
- from .utils.convert import to_float as _to_float
- 
- 
-@@ -37,6 +39,14 @@ READY_SIGNALS_REQUIRED_COLS = (
- )
- 
- 
-+class RunContext(TypedDict):
-+    run_pk: int | None
-+    run_id: str | None
-+    params_json: str | None
-+    dedup_sig: Any
-+    dedup_stage: Any
-+
-+
- def _normalize_snapshot_value(value: Any) -> Any:  # noqa: ANN401
-     if value is None:
-         return None
-@@ -102,7 +112,7 @@ def calc_run_id(ts: dt.datetime, run_id_minutes: int | None) -> str:
-     return slot_text
- 
- 
--class OpenMonitorRepository:
-+class OpenMonitorSqlStore:
-     """开盘监测数据访问层，集中管理 SQL 与表结构。"""
- 
-     def __init__(self, engine, logger, params) -> None:
-@@ -748,10 +758,19 @@ class OpenMonitorRepository:
-         stmt = (
-             text(
-                 f"""
--                SELECT `trade_date`, `code`,
--                       `close`, `avg_volume_20`,
--                       `ma5`, `ma20`, `ma60`, `ma250`,
--                       `vol_ratio`, `macd_hist`, `kdj_k`, `kdj_d`, `atr14`
-+                SELECT `trade_date` AS `asof_trade_date`,
-+                       `code`,
-+                       `close` AS `asof_close`,
-+                       `avg_volume_20` AS `asof_avg_volume_20`,
-+                       `ma5` AS `asof_ma5`,
-+                       `ma20` AS `asof_ma20`,
-+                       `ma60` AS `asof_ma60`,
-+                       `ma250` AS `asof_ma250`,
-+                       `vol_ratio` AS `asof_vol_ratio`,
-+                       `macd_hist` AS `asof_macd_hist`,
-+                       `kdj_k` AS `asof_kdj_k`,
-+                       `kdj_d` AS `asof_kdj_d`,
-+                       `atr14` AS `asof_atr14`
-                 FROM `{table}`
-                 WHERE `trade_date` = :d AND `code` IN :codes
-                 """
-@@ -760,7 +779,13 @@ class OpenMonitorRepository:
-         )
-         try:
-             with self.engine.begin() as conn:
--                return pd.read_sql_query(stmt, conn, params={"d": latest_trade_date, "codes": codes})
-+                df = pd.read_sql_query(
-+                    stmt,
-+                    conn,
-+                    params={"d": latest_trade_date, "codes": codes},
-+                )
-+            df = normalize_asof_indicators(df)
-+            return df
-         except Exception as exc:  # noqa: BLE001
-             self.logger.debug("读取指标表 %s 失败：%s", table, exc)
-             return pd.DataFrame()
-@@ -1010,9 +1035,17 @@ class OpenMonitorRepository:
-             except Exception as exc:  # noqa: BLE001
-                 self.logger.debug("读取 %s 失败：%s", table, exc)
-                 continue
--            if not df.empty:
--                df["code"] = df["code"].astype(str)
--                return df
-+            if df.empty:
-+                continue
-+            if "code" not in df.columns:
-+                self.logger.warning("Industry dim table %s missing code column; skipped.", table)
-+                continue
-+            df["code"] = df["code"].astype(str)
-+            keep_cols = ["code", "name", "industry", "board_name", "board_code"]
-+            existing = [c for c in keep_cols if c in df.columns]
-+            if existing:
-+                df = df[existing]
-+            return df
-         return pd.DataFrame()
- 
-     def load_board_constituent_dim(self) -> pd.DataFrame:
-@@ -1035,14 +1068,25 @@ class OpenMonitorRepository:
-         monitor_date: str,
-         *,
-         stage: str | None = None,
--    ) -> dict[str, Any] | None:
-+    ) -> RunContext | None:
-         table = getattr(self.params, "run_table", None)
-         if not (table and monitor_date and self._table_exists(table)):
-             return None
- 
-+        parsed_monitor = pd.to_datetime(monitor_date, errors="coerce")
-+        if pd.isna(parsed_monitor):
-+            self.logger.debug("Ignoring invalid monitor_date for run_context: %s", monitor_date)
-+            return None
-+        monitor_date_val = parsed_monitor.date().isoformat()
-+
-+        allowed_stages = {"PREOPEN", "BREAK", "POSTCLOSE", "INTRADAY"}
-         stage_norm = (str(stage).strip().upper() if stage else "") or None
-+        if stage_norm and stage_norm not in allowed_stages:
-+            self.logger.debug("Ignoring invalid run_stage for run_context: %s", stage_norm)
-+            stage_norm = None
-+
-         where_clauses = ["`monitor_date` = :d"]
--        params: dict[str, Any] = {"d": monitor_date}
-+        params: dict[str, Any] = {"d": monitor_date_val}
- 
-         has_run_stage = self._column_exists(table, "run_stage")
-         if stage_norm in {"PREOPEN", "BREAK", "POSTCLOSE", "INTRADAY"}:
-@@ -1106,8 +1150,15 @@ class OpenMonitorRepository:
-         if not isinstance(parsed, dict):
-             parsed = {}
- 
-+        run_pk = None
-+        if run_pk_val is not None:
-+            try:
-+                run_pk = int(run_pk_val)
-+            except (TypeError, ValueError):
-+                self.logger.debug("Invalid run_pk in run_context: %s", run_pk_val)
-+
-         return {
--            "run_pk": int(run_pk_val) if run_pk_val is not None else None,
-+            "run_pk": run_pk,
-             "run_id": str(run_id_val) if run_id_val is not None else None,
-             "params_json": params_json_raw,
-             "dedup_sig": parsed.get("dedup_sig"),
-@@ -1697,28 +1748,31 @@ class OpenMonitorRepository:
-         if quotes.empty:
-             return
- 
--        monitor_dates = quotes["monitor_date"].dropna().astype(str).unique().tolist()
--        if self._table_exists(table) and monitor_dates:
--            for monitor in monitor_dates:
--                run_pks = (
--                    quotes.loc[quotes["monitor_date"].astype(str) == monitor, "run_pk"]
--                    .dropna()
--                    .unique()
--                    .tolist()
-+        if self._table_exists(table):
-+            quotes["monitor_date_str"] = quotes["monitor_date"].astype(str)
-+            quotes["code_str"] = quotes["code"].astype(str)
-+            delete_calls = 0
-+            deleted_rows = 0
-+            for (monitor_date_str, run_pk), group in quotes.groupby(
-+                ["monitor_date_str", "run_pk"]
-+            ):
-+                run_pk_codes = group["code_str"].dropna().unique().tolist()
-+                if not run_pk_codes:
-+                    continue
-+                deleted_rows += self._delete_existing_run_rows(
-+                    table,
-+                    monitor_date_str,
-+                    int(run_pk),
-+                    run_pk_codes,
-                 )
--                for run_pk in run_pks:
--                    run_pk_codes = quotes.loc[
--                        (quotes["monitor_date"].astype(str) == monitor)
--                        & (quotes["run_pk"] == run_pk),
--                        "code",
--                    ].dropna().astype(str).unique().tolist()
--                    if run_pk_codes:
--                        self._delete_existing_run_rows(
--                            table,
--                            monitor,
--                            int(run_pk),
--                            run_pk_codes,
--                        )
-+                delete_calls += 1
-+            if delete_calls:
-+                self.logger.debug(
-+                    "open_monitor quote snapshot delete calls=%s rows=%s",
-+                    delete_calls,
-+                    deleted_rows,
-+                )
-+            quotes = quotes.drop(columns=["monitor_date_str", "code_str"])
- 
-         try:
-             self.db_writer.write_dataframe(quotes, table, if_exists="append")
-@@ -1862,3 +1916,36 @@ class OpenMonitorRepository:
-         except Exception as exc:  # noqa: BLE001
-             self.logger.debug("读取开盘监测视图 %s 失败：%s", view, exc)
-             return pd.DataFrame()
-+ 
-+ 
-+class OpenMonitorRepository:
-+    """Facade for open monitor SQL store and persister."""
-+
-+    def __init__(self, engine, logger, params) -> None:
-+        self.store = OpenMonitorSqlStore(engine, logger, params)
-+        self.engine = self.store.engine
-+        self.logger = self.store.logger
-+        self.params = self.store.params
-+        self.db_writer = self.store.db_writer
-+        self.persister = OpenMonitorPersister(
-+            engine=self.engine,
-+            logger=self.logger,
-+            params=self.params,
-+            db_writer=self.db_writer,
-+            table_exists=self.store._table_exists,
-+            get_table_columns=self.store._get_table_columns,
-+            make_snapshot_hash=make_snapshot_hash,
-+        )
-+
-+    @property
-+    def ready_signals_used(self) -> bool:
-+        return self.store.ready_signals_used
-+
-+    def persist_quote_snapshots(self, df: pd.DataFrame) -> None:
-+        self.persister.persist_quote_snapshots(df)
-+
-+    def persist_results(self, df: pd.DataFrame) -> None:
-+        self.persister.persist_results(df)
-+
-+    def __getattr__(self, name: str):  # noqa: ANN204
-+        return getattr(self.store, name)
-diff --git a/ashare/open_monitor_rules.py b/ashare/open_monitor_rules.py
-index 42a0090..de4f66e 100644
---- a/ashare/open_monitor_rules.py
-+++ b/ashare/open_monitor_rules.py
-@@ -184,6 +184,8 @@ class DecisionContext:
-     max_gap_down: float | None = None
-     sig_ma20: float | None = None
-     ma20_thresh: float | None = None
-+    ma20_prewarn: bool = False
-+    ma20_prewarn_reason: str | None = None
-     limit_up_trigger: float | None = None
-     runup_breach: bool = False
-     runup_breach_reason: str | None = None
-diff --git a/ashare/schema_manager.py b/ashare/schema_manager.py
-index d748641..f33c085 100644
---- a/ashare/schema_manager.py
-+++ b/ashare/schema_manager.py
-@@ -131,6 +131,7 @@ class SchemaManager:
- 
-         self._ensure_history_daily_kline_table()
-         self._ensure_history_index_daily_kline_table()
-+        self._ensure_external_signal_tables()
- 
-         self._ensure_dim_stock_basic_view()
-         self._ensure_fact_stock_daily_view()
-@@ -687,6 +688,256 @@ class SchemaManager:
-                 )
-             self.logger.info("表 %s 已新增唯一索引 %s。", table, unique_index)
- 
-+    # ---------- External signal tables ----------
-+    def _ensure_external_signal_tables(self) -> None:
-+        self._ensure_lhb_detail_table()
-+        self._ensure_margin_detail_table()
-+        self._ensure_gdhs_tables()
-+
-+    def _ensure_yyyymmdd_date_column(
-+        self, table: str, column: str, *, not_null: bool
-+    ) -> None:
-+        meta = self._column_meta(table)
-+        info = meta.get(column)
-+        target_def = "DATE NOT NULL" if not_null else "DATE NULL"
-+        if not info:
-+            self._add_missing_columns(table, {column: target_def})
-+            return
-+        if info["data_type"] == "date":
-+            if not_null:
-+                self._ensure_date_column(table, column, not_null=True)
-+            return
-+
-+        invalid_stmt = text(
-+            f"""
-+            SELECT COUNT(*) AS cnt
-+            FROM `{table}`
-+            WHERE `{column}` IS NOT NULL
-+              AND `{column}` NOT REGEXP '^[0-9]{{8}}$'
-+              AND `{column}` NOT REGEXP '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}$'
-+            """
-+        )
-+        with self.engine.connect() as conn:
-+            row = conn.execute(invalid_stmt).mappings().first()
-+        invalid = int(row.get("cnt") or 0) if row else 0
-+        if invalid:
-+            self.logger.warning(
-+                "表 %s.%s 存在非日期值(%s)，已跳过 DATE 转换。",
-+                table,
-+                column,
-+                invalid,
-+            )
-+            return
-+
-+        update_ymd = text(
-+            f"""
-+            UPDATE `{table}`
-+            SET `{column}` = STR_TO_DATE(`{column}`, '%Y%m%d')
-+            WHERE `{column}` REGEXP '^[0-9]{{8}}$'
-+            """
-+        )
-+        update_iso = text(
-+            f"""
-+            UPDATE `{table}`
-+            SET `{column}` = STR_TO_DATE(`{column}`, '%Y-%m-%d')
-+            WHERE `{column}` REGEXP '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}$'
-+            """
-+        )
-+        with self.engine.begin() as conn:
-+            conn.execute(update_ymd)
-+            conn.execute(update_iso)
-+            conn.execute(text(f"ALTER TABLE `{table}` MODIFY COLUMN `{column}` {target_def}"))
-+        self.logger.info("表 %s.%s 已调整为 %s。", table, column, target_def)
-+
-+    def _ensure_unique_index_if_clean(
-+        self, table: str, index: str, columns: Iterable[str]
-+    ) -> None:
-+        if self._index_exists(table, index):
-+            return
-+        cols = [str(c) for c in columns if c]
-+        if not cols:
-+            return
-+        col_sql = ", ".join(f"`{c}`" for c in cols)
-+        dup_cols = ", ".join(f"`{c}`" for c in cols)
-+        dup_stmt = text(
-+            f"""
-+            SELECT {dup_cols}, COUNT(*) AS cnt
-+            FROM `{table}`
-+            GROUP BY {dup_cols}
-+            HAVING cnt > 1
-+            LIMIT 1
-+            """
-+        )
-+        with self.engine.connect() as conn:
-+            dup_row = conn.execute(dup_stmt).mappings().first()
-+        if dup_row:
-+            self.logger.warning(
-+                "表 %s 存在重复键，已跳过创建唯一索引 %s。", table, index
-+            )
-+            return
-+        with self.engine.begin() as conn:
-+            conn.execute(text(f"CREATE UNIQUE INDEX `{index}` ON `{table}` ({col_sql})"))
-+        self.logger.info("表 %s 已新增唯一索引 %s。", table, index)
-+
-+    def _ensure_lhb_detail_table(self) -> None:
-+        table = "a_share_lhb_detail"
-+        columns = {
-+            "序号": "BIGINT NULL",
-+            "code": "VARCHAR(20) NOT NULL",
-+            "名称": "VARCHAR(255) NULL",
-+            "上榜日": "DATE NULL",
-+            "解读": "VARCHAR(255) NULL",
-+            "收盘价": "DOUBLE NULL",
-+            "涨跌幅": "DOUBLE NULL",
-+            "龙虎榜净买额": "DOUBLE NULL",
-+            "龙虎榜买入额": "DOUBLE NULL",
-+            "龙虎榜卖出额": "DOUBLE NULL",
-+            "龙虎榜成交额": "DOUBLE NULL",
-+            "市场总成交额": "DOUBLE NULL",
-+            "净买额占总成交比": "DOUBLE NULL",
-+            "成交额占总成交比": "DOUBLE NULL",
-+            "换手率": "DOUBLE NULL",
-+            "流通市值": "DOUBLE NULL",
-+            "上榜原因": "VARCHAR(255) NULL",
-+            "上榜后1日": "DOUBLE NULL",
-+            "上榜后2日": "DOUBLE NULL",
-+            "上榜后5日": "DOUBLE NULL",
-+            "上榜后10日": "DOUBLE NULL",
-+            "trade_date": "DATE NOT NULL",
-+        }
-+        if not self._table_exists(table):
-+            self._create_table(table, columns)
-+        else:
-+            self._add_missing_columns(table, columns)
-+        self._ensure_varchar_length(table, "code", 20)
-+        self._ensure_varchar_length(table, "名称", 255)
-+        self._ensure_varchar_length(table, "上榜原因", 255)
-+        self._ensure_yyyymmdd_date_column(table, "trade_date", not_null=False)
-+        self._ensure_yyyymmdd_date_column(table, "上榜日", not_null=False)
-+
-+        trade_idx = "idx_a_share_lhb_detail_trade_date"
-+        if not self._index_exists(table, trade_idx):
-+            with self.engine.begin() as conn:
-+                conn.execute(text(f"CREATE INDEX `{trade_idx}` ON `{table}` (`trade_date`)"))
-+            self.logger.info("表 %s 已新增索引 %s。", table, trade_idx)
-+
-+        code_trade_idx = "idx_a_share_lhb_detail_code_trade_date"
-+        if not self._index_exists(table, code_trade_idx):
-+            with self.engine.begin() as conn:
-+                conn.execute(
-+                    text(
-+                        f"CREATE INDEX `{code_trade_idx}` ON `{table}` (`code`, `trade_date`)"
-+                    )
-+                )
-+            self.logger.info("表 %s 已新增索引 %s。", table, code_trade_idx)
-+
-+    def _ensure_margin_detail_table(self) -> None:
-+        table = "a_share_margin_detail"
-+        columns = {
-+            "信用交易日期": "DATE NULL",
-+            "code": "VARCHAR(20) NOT NULL",
-+            "标的证券简称": "VARCHAR(255) NULL",
-+            "融资余额": "DOUBLE NULL",
-+            "融资买入额": "DOUBLE NULL",
-+            "融资偿还额": "DOUBLE NULL",
-+            "融券余量": "DOUBLE NULL",
-+            "融券卖出量": "DOUBLE NULL",
-+            "融券偿还量": "DOUBLE NULL",
-+            "trade_date": "DATE NOT NULL",
-+            "exchange": "VARCHAR(8) NULL",
-+            "证券简称": "VARCHAR(255) NULL",
-+            "融券余额": "DOUBLE NULL",
-+            "融资融券余额": "DOUBLE NULL",
-+        }
-+        if not self._table_exists(table):
-+            self._create_table(table, columns)
-+        else:
-+            self._add_missing_columns(table, columns)
-+        self._ensure_varchar_length(table, "code", 20)
-+        self._ensure_varchar_length(table, "exchange", 8)
-+        self._ensure_varchar_length(table, "标的证券简称", 255)
-+        self._ensure_varchar_length(table, "证券简称", 255)
-+        self._ensure_yyyymmdd_date_column(table, "trade_date", not_null=False)
-+        self._ensure_yyyymmdd_date_column(table, "信用交易日期", not_null=False)
-+
-+        trade_idx = "idx_a_share_margin_detail_trade_date"
-+        if not self._index_exists(table, trade_idx):
-+            with self.engine.begin() as conn:
-+                conn.execute(text(f"CREATE INDEX `{trade_idx}` ON `{table}` (`trade_date`)"))
-+            self.logger.info("表 %s 已新增索引 %s。", table, trade_idx)
-+
-+        code_trade_idx = "idx_a_share_margin_detail_code_trade_date"
-+        if not self._index_exists(table, code_trade_idx):
-+            with self.engine.begin() as conn:
-+                conn.execute(
-+                    text(
-+                        f"CREATE INDEX `{code_trade_idx}` ON `{table}` (`code`, `trade_date`)"
-+                    )
-+                )
-+            self.logger.info("表 %s 已新增索引 %s。", table, code_trade_idx)
-+
-+        unique_idx = "ux_a_share_margin_detail_exchange_code_trade_date"
-+        self._ensure_unique_index_if_clean(table, unique_idx, ("exchange", "code", "trade_date"))
-+
-+    def _ensure_gdhs_tables(self) -> None:
-+        summary = "a_share_gdhs"
-+        summary_cols = {
-+            "code": "VARCHAR(20) NOT NULL",
-+            "名称": "VARCHAR(255) NULL",
-+            "最新价": "DOUBLE NULL",
-+            "涨跌幅": "DOUBLE NULL",
-+            "股东户数-本次": "BIGINT NULL",
-+            "股东户数-上次": "BIGINT NULL",
-+            "股东户数-增减": "BIGINT NULL",
-+            "股东户数-增减比例": "DOUBLE NULL",
-+            "区间涨跌幅": "DOUBLE NULL",
-+            "period": "DATE NOT NULL",
-+            "股东户数统计截止日-上次": "DATE NULL",
-+            "户均持股市值": "DOUBLE NULL",
-+            "户均持股数量": "DOUBLE NULL",
-+            "总市值": "DOUBLE NULL",
-+            "总股本": "DOUBLE NULL",
-+            "公告日期": "DATE NULL",
-+        }
-+        if not self._table_exists(summary):
-+            self._create_table(summary, summary_cols)
-+        else:
-+            self._add_missing_columns(summary, summary_cols)
-+        self._ensure_varchar_length(summary, "code", 20)
-+        self._ensure_varchar_length(summary, "名称", 255)
-+        self._ensure_yyyymmdd_date_column(summary, "period", not_null=False)
-+        self._ensure_yyyymmdd_date_column(summary, "股东户数统计截止日-上次", not_null=False)
-+        self._ensure_yyyymmdd_date_column(summary, "公告日期", not_null=False)
-+        self._ensure_unique_index_if_clean(summary, "ux_a_share_gdhs_code_period", ("code", "period"))
-+
-+        detail = "a_share_gdhs_detail"
-+        detail_cols = {
-+            "period": "DATE NOT NULL",
-+            "区间涨跌幅": "DOUBLE NULL",
-+            "股东户数-本次": "BIGINT NULL",
-+            "股东户数-上次": "BIGINT NULL",
-+            "股东户数-增减": "BIGINT NULL",
-+            "股东户数-增减比例": "DOUBLE NULL",
-+            "户均持股市值": "DOUBLE NULL",
-+            "户均持股数量": "DOUBLE NULL",
-+            "总市值": "DOUBLE NULL",
-+            "总股本": "DOUBLE NULL",
-+            "股本变动": "DOUBLE NULL",
-+            "股本变动原因": "TEXT NULL",
-+            "股东户数公告日期": "DATE NULL",
-+            "code": "VARCHAR(20) NOT NULL",
-+            "名称": "VARCHAR(255) NULL",
-+        }
-+        if not self._table_exists(detail):
-+            self._create_table(detail, detail_cols)
-+        else:
-+            self._add_missing_columns(detail, detail_cols)
-+        self._ensure_varchar_length(detail, "code", 20)
-+        self._ensure_varchar_length(detail, "名称", 255)
-+        self._ensure_yyyymmdd_date_column(detail, "period", not_null=False)
-+        self._ensure_yyyymmdd_date_column(detail, "股东户数公告日期", not_null=False)
-+        self._ensure_unique_index_if_clean(detail, "ux_a_share_gdhs_detail_code_period", ("code", "period"))
-+
-     # ---------- Base dims/facts ----------
-     def _ensure_dim_stock_basic_view(self) -> None:
-         source = "a_share_stock_list"
-@@ -1986,19 +2237,27 @@ class SchemaManager:
-               ELSE (q.`live_latest` - daily.`ma20`) / daily.`atr14`
-             END
-         """
--        gate_action_expr = """
-+        effective_regime_expr = """
-+            CASE
-+              WHEN UPPER(COALESCE(weekly.`weekly_risk_level`, '')) = 'HIGH'
-+                AND UPPER(COALESCE(daily.`regime`, '')) = 'RISK_ON'
-+                THEN 'RISK_OFF'
-+              ELSE daily.`regime`
-+            END
-+        """
-+        gate_action_expr = f"""
-             CASE
--              WHEN UPPER(COALESCE(daily.`regime`, '')) IN ('BREAKDOWN', 'BEAR_CONFIRMED')
-+              WHEN UPPER(COALESCE({effective_regime_expr}, '')) IN ('BREAKDOWN', 'BEAR_CONFIRMED')
-                 THEN 'STOP'
--              WHEN UPPER(COALESCE(daily.`regime`, '')) = 'RISK_OFF'
-+              WHEN UPPER(COALESCE({effective_regime_expr}, '')) = 'RISK_OFF'
-                 THEN 'WAIT'
--              WHEN UPPER(COALESCE(daily.`regime`, '')) = 'PULLBACK'
-+              WHEN UPPER(COALESCE({effective_regime_expr}, '')) = 'PULLBACK'
-                 THEN CASE
-                   WHEN daily.`position_hint` IS NOT NULL AND daily.`position_hint` <= 0.3
-                     THEN 'WAIT'
-                   ELSE 'ALLOW'
-                 END
--              WHEN UPPER(COALESCE(daily.`regime`, '')) = 'RISK_ON'
-+              WHEN UPPER(COALESCE({effective_regime_expr}, '')) = 'RISK_ON'
-                 THEN 'ALLOW'
-               WHEN daily.`position_hint` IS NOT NULL THEN CASE
-                 WHEN daily.`position_hint` <= 0 THEN 'STOP'
-@@ -2029,7 +2288,8 @@ class SchemaManager:
-               env.`env_live_event_tags`,
-               env.`env_live_reason`,
-               daily.`score` AS `env_index_score`,
--              daily.`regime` AS `env_regime`,
-+              daily.`regime` AS `env_regime_raw`,
-+              {effective_regime_expr} AS `env_regime`,
-               daily.`position_hint` AS `env_position_hint`,
-               weekly.`weekly_gate_policy` AS `env_weekly_gate_policy`,
-               weekly.`weekly_risk_level` AS `env_weekly_risk_level`,
-@@ -2072,7 +2332,7 @@ class SchemaManager:
-               {gate_action_expr} AS `env_index_gate_action`,
-               CONCAT(
-                 'regime=',
--                COALESCE(daily.`regime`, ''),
-+                COALESCE({effective_regime_expr}, ''),
-                 ' pos_hint=',
-                 COALESCE(daily.`position_hint`, '')
-               ) AS `env_index_gate_reason`,
-diff --git a/ashare/weekly_env_builder.py b/ashare/weekly_env_builder.py
-index b2b4020..62ed0ad 100644
---- a/ashare/weekly_env_builder.py
-+++ b/ashare/weekly_env_builder.py
-@@ -757,6 +757,43 @@ class WeeklyEnvironmentBuilder:
-             return "ALLOW"
-         return None
- 
-+    @staticmethod
-+    def _resolve_risk_emotion_policy(env_context: dict[str, Any]) -> dict[str, Any]:
-+        risk_level = str(env_context.get("weekly_risk_level") or "").upper()
-+        regime = str(env_context.get("regime") or "").upper()
-+
-+        # Risk (weekly) x Emotion (daily regime) matrix.
-+        matrix = {
-+            "HIGH": {
-+                "RISK_ON": ("WAIT", 0.15, "HIGH_RISK_RISK_ON"),
-+                "PULLBACK": ("WAIT", 0.15, "HIGH_RISK_PULLBACK"),
-+                "RISK_OFF": ("STOP", 0.0, "HIGH_RISK_RISK_OFF"),
-+                "BREAKDOWN": ("STOP", 0.0, "HIGH_RISK_BREAKDOWN"),
-+                "BEAR_CONFIRMED": ("STOP", 0.0, "HIGH_RISK_BEAR"),
-+            },
-+            "MEDIUM": {
-+                "RISK_ON": ("ALLOW_SMALL", 0.3, "MEDIUM_RISK_RISK_ON"),
-+                "PULLBACK": ("ALLOW_SMALL", 0.25, "MEDIUM_RISK_PULLBACK"),
-+                "RISK_OFF": ("WAIT", 0.15, "MEDIUM_RISK_RISK_OFF"),
-+                "BREAKDOWN": ("WAIT", 0.15, "MEDIUM_RISK_BREAKDOWN"),
-+            },
-+            "LOW": {
-+                "RISK_ON": ("ALLOW", 1.0, "LOW_RISK_RISK_ON"),
-+                "PULLBACK": ("ALLOW_SMALL", 0.5, "LOW_RISK_PULLBACK"),
-+                "RISK_OFF": ("WAIT", 0.25, "LOW_RISK_RISK_OFF"),
-+            },
-+        }
-+
-+        if not risk_level or not regime:
-+            return {}
-+
-+        row = matrix.get(risk_level, {})
-+        if regime not in row:
-+            return {}
-+
-+        gate_action, cap_limit, tag = row[regime]
-+        return {"gate_action": gate_action, "cap_limit": cap_limit, "matrix_tag": tag}
-+
-     @staticmethod
-     def _resolve_weekly_zone(
-         weekly_scenario: dict[str, Any] | None,
-@@ -824,6 +861,8 @@ class WeeklyEnvironmentBuilder:
-         if not isinstance(env_context, dict):
-             return
- 
-+        risk_emotion = self._resolve_risk_emotion_policy(env_context)
-+
-         gate_candidates: list[str | None] = []
-         reason_parts: dict[str, Any] = {}
-         gate_norm = None
-@@ -860,6 +899,18 @@ class WeeklyEnvironmentBuilder:
-         if regime_gate:
-             reason_parts["regime_gate_action"] = regime_gate
- 
-+        if risk_emotion:
-+            matrix_gate = risk_emotion.get("gate_action")
-+            if matrix_gate:
-+                gate_candidates.append(matrix_gate)
-+                reason_parts["risk_emotion_gate_action"] = matrix_gate
-+            matrix_cap = risk_emotion.get("cap_limit")
-+            if matrix_cap is not None:
-+                reason_parts["risk_emotion_cap_limit"] = f"{matrix_cap:.2f}"
-+            matrix_tag = risk_emotion.get("matrix_tag")
-+            if matrix_tag:
-+                reason_parts["risk_emotion_matrix"] = matrix_tag
-+
-         effective_weekly_gate = gate_norm
-         live_unlock_gate = str(env_context.get("env_live_unlock_gate") or "").strip().upper()
-         if (
-@@ -926,6 +977,25 @@ class WeeklyEnvironmentBuilder:
-         final_cap = base_cap * daily_cap_multiplier * breadth_factor * live_cap_multiplier
-         final_cap = min(max(final_cap, 0.0), 1.0)
-         small_cap_limit = 0.25
-+        if risk_emotion and risk_emotion.get("cap_limit") is not None:
-+            cap_limit = float(risk_emotion["cap_limit"])
-+            if final_cap > cap_limit:
-+                final_cap = cap_limit
-+                reason_parts["gate_cap_limit"] = f"RISK_EMOTION_{cap_limit:.2f}"
-+        weekly_risk_level = str(env_context.get("weekly_risk_level") or "").strip().upper()
-+        weekly_scene = str(
-+            env_context.get("weekly_scene_code") or env_context.get("weekly_scene") or ""
-+        ).strip().upper()
-+        breadth_saturation = reason_parts.get("breadth_saturation")
-+        tier_cap = None
-+        if weekly_risk_level == "HIGH":
-+            if breadth_saturation == "RISK_ON_PEAK":
-+                tier_cap = 0.05
-+            elif weekly_scene.startswith("WEDGE"):
-+                tier_cap = 0.08
-+        if tier_cap is not None and final_cap > tier_cap:
-+            final_cap = tier_cap
-+            reason_parts["risk_tier_cap"] = f"{weekly_risk_level}_{tier_cap:.2f}"
-         if effective_weekly_gate == "ALLOW_SMALL" and gate_norm == "WAIT":
-             small_cap_limit = 0.15
-             reason_parts["unlock_cap_limit"] = f"{small_cap_limit:.2f}"
+     output_dir = Path("output")
