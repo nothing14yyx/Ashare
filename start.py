@@ -12,6 +12,8 @@ from ashare.ma5_ma20_trend_strategy import MA5MA20StrategyRunner
 from ashare.open_monitor import MA5MA20OpenMonitorRunner
 from ashare.schema_manager import ensure_schema
 from run_index_weekly_channel import run_weekly_market_indicator
+from run_chip_filter import main as run_chip_filter
+from run_daily_market_indicator import run_daily_market_indicator
 
 
 def _parse_asof_date(raw: str | None) -> str | None:
@@ -125,6 +127,8 @@ def main(
     skip_fetch: bool = False,
     skip_strategy: bool = False,
     skip_weekly: bool = False,
+    skip_chip: bool = False,
+    skip_daily_indicator: bool = False,
     asof_date: str | None = None,
 ) -> None:
     ensure_schema()
@@ -140,6 +144,28 @@ def main(
     params = monitor_runner.params
     ready_view = str(params.ready_signals_view or "").strip() or None
     signal_table = str(getattr(strategy_runner.params, "signal_events_table", "") or "").strip()
+
+    # 执行日线市场指标计算
+    daily_indicator_status: dict = {"written": 0}
+    if not skip_daily_indicator:
+        try:
+            daily_indicator_status = run_daily_market_indicator(
+                start_date=asof_date,
+                end_date=asof_date,
+                mode="incremental",
+            )
+            logging.info(f"[INFO] 日线市场指标计算完成，写入 {daily_indicator_status.get('written', 0)} 条记录。")
+        except Exception as exc:  # noqa: BLE001
+            logging.warning(f"[WARN] 日线市场指标计算失败：{exc}")
+
+    # 执行筹码筛选计算
+    chip_filter_status: dict = {"processed": 0}
+    if not skip_chip:
+        try:
+            chip_filter_status["processed"] = run_chip_filter()
+            logging.info(f"[INFO] 筹码筛选计算完成，处理 {chip_filter_status.get('processed', 0)} 条记录。")
+        except Exception as exc:  # noqa: BLE001
+            logging.warning(f"[WARN] 筹码筛选计算失败：{exc}")
 
     weekly_status: dict = {"written": 0}
     skipped_weekly = bool(skip_weekly)
@@ -173,6 +199,8 @@ def main(
         "buy_cnt_total_recent_n_days": buy_cnt_total_recent_n_days,
         "buy_sig_date_breakdown": breakdown[:7],
         "weekly_env_status": weekly_status if not skipped_weekly else {"skipped": True},
+        "daily_indicator_status": daily_indicator_status if not skip_daily_indicator else {"skipped": True},
+        "chip_filter_status": chip_filter_status if not skip_chip else {"skipped": True},
     }
 
     output_dir = Path("output")
