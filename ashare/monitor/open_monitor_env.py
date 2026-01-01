@@ -364,15 +364,40 @@ class OpenMonitorEnvService:
         )
 
         # 补充板块强弱映射：用于展示/排序的 board_status（不影响 gate/action/入库）
+        # 优先使用已计算好的板块轮动数据
         board_map: dict[str, dict[str, Any]] = {}
         try:
-            from ashare.monitor.open_monitor_eval import OpenMonitorEvaluator
-
-            board_strength = self.env_builder.load_board_spot_strength(
-                latest_trade_date, checked_at
-            )
-            board_map = OpenMonitorEvaluator.build_board_map_from_strength(board_strength)
-        except Exception:  # noqa: BLE001
+            # key: board_name/board_code, value: {rotation_phase, trend_score, mom_score}
+            rotation_info = self.repo.load_board_rotation_info(latest_trade_date)
+            
+            # 将 rotation_info 转换为 evaluator 需要的格式
+            # evaluator 需要: status (strong/neutral/weak), rank (optional), chg_pct (optional)
+            for key, info in rotation_info.items():
+                phase = info.get("rotation_phase")
+                status = "neutral"
+                if phase == "leading":
+                    status = "strong"
+                elif phase == "lagging":
+                    status = "weak"
+                elif phase == "weakening" and (info.get("mom_score") or 0) < 0.2:
+                    status = "weak"
+                
+                board_map[key] = {
+                    "status": status,
+                    "rank": int((1.0 - (info.get("trend_score") or 0.5)) * 100),  # 模拟 rank
+                    "chg_pct": None,
+                    "rotation_phase": phase
+                }
+                
+            # 如果没有轮动数据，回退到实时快照（旧逻辑）
+            if not board_map:
+                from ashare.monitor.open_monitor_eval import OpenMonitorEvaluator
+                board_strength = self.env_builder.load_board_spot_strength(
+                    latest_trade_date, checked_at
+                )
+                board_map = OpenMonitorEvaluator.build_board_map_from_strength(board_strength)
+        except Exception as exc:  # noqa: BLE001
+            self.logger.warning("构建板块映射失败：%s", exc)
             board_map = {}
 
         env_context["boards"] = board_map

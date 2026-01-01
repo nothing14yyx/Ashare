@@ -167,6 +167,8 @@ class SchemaManager:
             tables.open_monitor_quote_table,
         )
 
+        self._ensure_board_rotation_table()
+
         self._ensure_open_monitor_view(
             tables.open_monitor_view,
             tables.open_monitor_wide_view,
@@ -2657,6 +2659,37 @@ class SchemaManager:
             with self.engine.begin() as conn:
                 conn.execute(compact_stmt)
             self.logger.info("已创建/更新开盘监测精简视图 %s。", view)
+
+    def _ensure_board_rotation_table(self) -> None:
+        table = "strategy_board_rotation"
+        self._rename_table_if_needed("board_rotation_daily", table)
+        columns = {
+            "date": "DATE NOT NULL",
+            "board_code": "VARCHAR(20) NULL",
+            "board_name": "VARCHAR(255) NOT NULL",
+            "ret_20d": "DOUBLE NULL",
+            "ret_5d": "DOUBLE NULL",
+            "rank_trend": "DOUBLE NULL",
+            "rank_mom": "DOUBLE NULL",
+            "rotation_phase": "VARCHAR(32) NULL",
+            "created_at": "DATETIME(6) NULL",
+        }
+        if not self._table_exists(table):
+            self._create_table(table, columns, primary_key=("date", "board_name"))
+        else:
+            self._add_missing_columns(table, columns)
+
+        self._ensure_varchar_length(table, "board_name", 255)
+        self._ensure_varchar_length(table, "rotation_phase", 32)
+        self._ensure_datetime_column(table, "created_at")
+        self._ensure_varchar_length(table, "board_code", 20)
+
+        # Index on date for cleanup
+        idx = "idx_strategy_board_rotation_date"
+        if not self._index_exists(table, idx):
+            with self.engine.begin() as conn:
+                conn.execute(text(f"CREATE INDEX `{idx}` ON `{table}` (`date`)"))
+
 
 
 def ensure_schema() -> None:

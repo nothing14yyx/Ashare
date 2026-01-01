@@ -6,10 +6,8 @@ import logging
 from typing import Any, Dict, List
 
 import pandas as pd
-from sqlalchemy import bindparam, text
-
-from ashare.indicators.indicator_utils import consecutive_true
-from ashare.strategies.ma5_ma20_trend_strategy import _atr, _macd
+from ashare.indicators.indicator_repo import IndicatorRepository
+from ashare.indicators.indicator_utils import atr, consecutive_true, macd
 from ashare.indicators.market_regime import MarketRegimeClassifier
 from ashare.indicators.weekly_env_builder import WeeklyEnvironmentBuilder
 
@@ -27,6 +25,7 @@ class MarketIndicatorBuilder:
         self.logger = logger
         self.market_regime = MarketRegimeClassifier()
         self.regime_confirm_days = 2
+        self.repo = IndicatorRepository(self.env_builder.db_writer, self.logger)
 
     @property
     def index_codes(self) -> list[str]:
@@ -81,32 +80,64 @@ class MarketIndicatorBuilder:
             }
         ]
 
+    def compute_and_persist_board_rotation(self, trade_date: str) -> None:
+        """计算并持久化指定日期的板块轮动指标。"""
+        # 1. 读取历史行情
+        df = self.repo.fetch_board_history(trade_date, lookback_days=90)
+
+        if df.empty:
+            return
+
+        # 2. 计算指标
+        pivot_df = df.pivot_table(index="date", columns="board_name", values="close").ffill()
+        if len(pivot_df) < 21:
+            return
+
+        ret_20d = pivot_df.pct_change(20).iloc[-1]
+        ret_5d = pivot_df.pct_change(5).iloc[-1]
+        
+        metrics = pd.DataFrame({"ret_20d": ret_20d, "ret_5d": ret_5d}).dropna()
+        if metrics.empty:
+            return
+            
+        metrics["rank_trend"] = metrics["ret_20d"].rank(pct=True)
+        metrics["rank_mom"] = metrics["ret_5d"].rank(pct=True)
+
+        def _classify(row: pd.Series) -> str:
+            strong_trend = row["rank_trend"] >= 0.5
+            strong_mom = row["rank_mom"] >= 0.5
+            if strong_trend and strong_mom:
+                return "leading"
+            if not strong_trend and strong_mom:
+                return "improving"
+            if strong_trend and not strong_mom:
+                return "weakening"
+            return "lagging"
+
+        metrics["rotation_phase"] = metrics.apply(_classify, axis=1)
+
+        # 3. 准备入库数据
+        df_to_save = metrics.copy()
+        df_to_save["board_name"] = df_to_save.index
+        df_to_save["date"] = trade_date
+        df_to_save["created_at"] = dt.datetime.now()
+        df_to_save["board_code"] = None  # 暂不关联 code，如果需要可以从 spot 表补
+
+        # 尝试补全 board_code
+        spot_df = self.repo.fetch_board_spot()
+        if not spot_df.empty:
+            mapping = spot_df.set_index("board_name")["board_code"].to_dict()
+            df_to_save["board_code"] = df_to_save["board_name"].map(mapping)
+
+        # 4. 持久化
+        self.repo.persist_board_rotation(trade_date, df_to_save)
+        self.logger.info("已更新 %s 板块轮动数据 (%s 条)", trade_date, len(df_to_save))
+
     def resolve_weekly_asof_dates(
         self, start_date: dt.date, end_date: dt.date
     ) -> list[dt.date]:
         primary_code = (self.index_codes or ["sh.000001"])[0]
-        stmt = text(
-            """
-            SELECT CAST(`date` AS CHAR) AS trade_date
-            FROM history_index_daily_kline
-            WHERE `code` = :code AND `date` BETWEEN :start_date AND :end_date
-            ORDER BY `date`
-            """
-        )
-        try:
-            with self.env_builder.db_writer.engine.begin() as conn:
-                df = pd.read_sql_query(
-                    stmt,
-                    conn,
-                    params={
-                        "code": primary_code,
-                        "start_date": start_date.isoformat(),
-                        "end_date": end_date.isoformat(),
-                    },
-                )
-        except Exception as exc:  # noqa: BLE001
-            self.logger.warning("读取周线交易日失败：%s", exc)
-            return []
+        df = self.repo.fetch_index_trade_dates(primary_code, start_date, end_date)
 
         if df.empty or "trade_date" not in df.columns:
             return []
@@ -129,30 +160,9 @@ class MarketIndicatorBuilder:
             return []
 
         lookback_start = start_date - dt.timedelta(days=400)
-        stmt = (
-            text(
-                """
-                SELECT `code`,`date`,`open`,`high`,`low`,`close`,`volume`,`amount`
-                FROM history_index_daily_kline
-                WHERE `code` IN :codes AND `date` BETWEEN :start_date AND :end_date
-                ORDER BY `code`, `date`
-                """
-            ).bindparams(bindparam("codes", expanding=True))
+        df = self.repo.fetch_index_daily_kline(
+            index_codes, lookback_start, end_date
         )
-        try:
-            with self.env_builder.db_writer.engine.begin() as conn:
-                df = pd.read_sql_query(
-                    stmt,
-                    conn,
-                    params={
-                        "codes": index_codes,
-                        "start_date": lookback_start.isoformat(),
-                        "end_date": end_date.isoformat(),
-                    },
-                )
-        except Exception as exc:  # noqa: BLE001
-            self.logger.warning("读取指数日线指标失败：%s", exc)
-            return []
 
         if df.empty:
             return []
@@ -186,10 +196,10 @@ class MarketIndicatorBuilder:
             zero_mid = grp["bb_mid"] == 0
             if zero_mid.any():
                 grp.loc[zero_mid, "bb_width"] = None
-            dif, dea, hist = _macd(close)
+            dif, dea, hist = macd(close)
             grp["macd_hist"] = hist
             preclose = close.shift(1)
-            grp["atr14"] = _atr(grp["high"], grp["low"], preclose)
+            grp["atr14"] = atr(grp["high"], grp["low"], preclose)
             grp["dev_ma20_atr"] = (close - grp["ma20"]) / grp["atr14"]
 
             rolling_low = close.rolling(

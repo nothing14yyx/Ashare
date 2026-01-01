@@ -6,8 +6,8 @@ from zoneinfo import ZoneInfo
 ts = datetime.now(ZoneInfo("Asia/Singapore")).strftime("%Y%m%d_%H%M%S")
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = SCRIPT_DIR.parent
-OUTPUT_DIR = SCRIPT_DIR / "output"
+PROJECT_ROOT = SCRIPT_DIR.parents[1]
+OUTPUT_DIR = PROJECT_ROOT / "tool" / "output"
 OUTPUT_FILE = OUTPUT_DIR / f"project_for_llm_{ts}.txt"
 
 # 想导出的文件后缀（按需增减）

@@ -149,25 +149,14 @@ def zip_write_file(zf: ZipFile, project_root: Path, file_path: Path) -> FileEntr
 
 def build_manifest(entries: list[FileEntry], project_root: Path, out_zip: Path) -> dict:
     return {
-        "tool": "tool/export_zip_project.py",
+        "tool": ".ai/skills/project_zip_exporter.py",
         "root": str(project_root.resolve()),
-        "zip": str(out_zip.resolve()),
-        "created_at": datetime.now(ZoneInfo("Asia/Singapore")).isoformat(),
-        "python": sys.version,
-        "include_ext": sorted(INCLUDE_EXT),
-        "exclude_dirs": sorted(EXCLUDE_DIRS),
-        "total_files": len(entries),
-        "files": [
-            {"path": e.rel_path, "size": e.size, "mtime": e.mtime, "sha256": e.sha256}
-            for e in entries
-        ],
-    }
-
-
+        "zip": str(out_zip.resolve()),}
+# ... (lines skipped) ...
 def main() -> int:
-    script_dir = Path(__file__).resolve().parent      # .../tool
-    project_root = script_dir.parent                  # 项目根
-    output_dir = script_dir / "output"                # tool/output
+    script_dir = Path(__file__).resolve().parent      # .../.ai/skills
+    project_root = script_dir.parents[1]              # 项目根
+    output_dir = project_root / "tool" / "output"     # tool/output
 
     ts = datetime.now(ZoneInfo("Asia/Singapore")).strftime("%Y%m%d_%H%M%S")
     default_out_zip = output_dir / f"project_export_{ts}.zip"

@@ -6,11 +6,11 @@ from typing import Iterable, List, Tuple
 import numpy as np
 
 import pandas as pd
-from sqlalchemy import bindparam, inspect, text
 
 from ashare.core.db import DatabaseConfig, MySQLWriter
 from ashare.core.schema_manager import TABLE_STRATEGY_CHIP_FILTER
 from ashare.utils import setup_logger
+from ashare.strategies.chip_filter_repo import ChipFilterRepository
 
 
 class ChipFilter:
@@ -20,42 +20,15 @@ class ChipFilter:
         self.logger = setup_logger()
         self.db_writer = MySQLWriter(DatabaseConfig.from_env())
         self.table = TABLE_STRATEGY_CHIP_FILTER
+        self.repo = ChipFilterRepository(self.db_writer, self.logger)
 
     def _table_exists(self, table: str) -> bool:
-        try:
-            with self.db_writer.engine.begin() as conn:
-                conn.execute(text(f"SELECT 1 FROM `{table}` LIMIT 1"))
-            return True
-        except Exception:
-            return False
+        return self.repo.table_exists(table)
 
     def _resolve_gdhs_columns(
         self, table: str
     ) -> Tuple[str | None, str | None, str | None, str | None]:
-        stmt = text(f"SELECT * FROM `{table}` LIMIT 0")
-        with self.db_writer.engine.begin() as conn:
-            meta_df = pd.read_sql_query(stmt, conn)
-        columns = set(meta_df.columns)
-        code_col = "code" if "code" in columns else None
-        announce_candidates = [
-            "公告日期",
-            "股东户数公告日期",
-            "股东户数统计截止日",
-            "period",
-        ]
-        delta_pct_candidates = [
-            "股东户数-增减比例",
-            "增减比例",
-            "holder_change_ratio",
-        ]
-        announce_col = next((c for c in announce_candidates if c in columns), None)
-        delta_pct_col = next((c for c in delta_pct_candidates if c in columns), None)
-        delta_abs_col = None
-        if "股东户数-变动数量" in columns:
-            delta_abs_col = "股东户数-变动数量"
-        elif "holder_change" in columns:
-            delta_abs_col = "holder_change"
-        return code_col, announce_col, delta_pct_col, delta_abs_col
+        return self.repo.resolve_gdhs_columns(table)
 
     def _load_gdhs_detail(
         self, codes: Iterable[str], latest_date: str | dt.date, table: str
@@ -64,25 +37,11 @@ class ChipFilter:
         if code_col is None or announce_col is None:
             return pd.DataFrame()
 
-        select_cols = [code_col, announce_col]
-        for col in [delta_pct_col, delta_abs_col]:
-            if col:
-                select_cols.append(col)
-
-        stmt = (
-            text(
-                f"""
-                SELECT {",".join(f"`{c}`" for c in select_cols)}
-                FROM `{table}`
-                WHERE `{code_col}` IN :codes
-                """
-            ).bindparams(bindparam("codes", expanding=True))
+        df = self.repo.load_gdhs_detail(
+            table, codes, code_col, announce_col, delta_pct_col, delta_abs_col
         )
-        with self.db_writer.engine.begin() as conn:
-            try:
-                df = pd.read_sql_query(stmt, conn, params={"codes": list(codes)})
-            except Exception:
-                return pd.DataFrame()
+        if df.empty:
+            return pd.DataFrame()
 
         rename_map = {code_col: "code", announce_col: "announce_date"}
         if delta_pct_col:
@@ -104,30 +63,14 @@ class ChipFilter:
         if df.empty or not self._table_exists(self.table):
             return
         sig_dates = df["sig_date"].dropna().unique().tolist()
-        try:
-            table_columns = {
-                col.get("name")
-                for col in inspect(self.db_writer.engine).get_columns(self.table)
-                if isinstance(col, dict)
-            }
-        except Exception:
-            table_columns = set()
+        table_columns = self.repo.get_table_columns(self.table)
         if sig_dates:
-            delete_stmt = (
-                text(
-                    f"""
-                    DELETE FROM `{self.table}`
-                    WHERE `sig_date` IN :dates AND `code` IN :codes
-                    """
-                ).bindparams(bindparam("dates", expanding=True), bindparam("codes", expanding=True))
-            )
-            with self.db_writer.engine.begin() as conn:
-                codes = df["code"].dropna().astype(str).unique().tolist()
-                conn.execute(delete_stmt, {"dates": sig_dates, "codes": codes})
+            codes = df["code"].dropna().astype(str).unique().tolist()
+            self.repo.delete_existing(self.table, sig_dates, codes)
         aligned = df.copy()
         if table_columns:
             aligned = aligned[[c for c in aligned.columns if c in table_columns]].copy()
-        self.db_writer.write_dataframe(aligned, self.table, if_exists="append")
+        self.repo.write_dataframe(aligned, self.table)
 
     def apply(
         self,

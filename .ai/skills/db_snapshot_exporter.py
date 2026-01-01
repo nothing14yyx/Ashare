@@ -54,8 +54,8 @@ class DBConfig:
 
 
 def _project_root() -> Path:
-    # .../AShare/tool/export_db_snapshot.py -> parents[1] == .../AShare
-    return Path(__file__).resolve().parents[1]
+    # .../AShare/.ai/skills/db_snapshot_exporter.py -> parents[2] == .../AShare
+    return Path(__file__).resolve().parents[2]
 
 
 def _default_config_path() -> Path:
@@ -64,6 +64,13 @@ def _default_config_path() -> Path:
     p1 = root / "config.yaml"
     p2 = root / "config.yml"
     return p1 if p1.exists() else p2
+# ... (lines skipped) ...
+    parser.add_argument(
+        "--outdir",
+        type=str,
+        default=str(_project_root() / "tool" / "output"),
+        help="输出目录（默认：tool/output）",
+    )
 
 
 def _load_yaml(path: Path) -> Dict[str, Any]:
@@ -429,7 +436,7 @@ def main() -> None:
     # Markdown
     _write_markdown(md_path, meta, enriched)
 
-    print("\n✅ 导出完成")
+    print("\nExport completed.")
     print(f"- Markdown: {md_path}")
     print(f"- JSON:     {json_path}")
 

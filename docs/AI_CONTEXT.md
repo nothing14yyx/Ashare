@@ -78,6 +78,37 @@ The agent is equipped with custom tools in `.ai/skills/` to handle specific task
 *   **Command**: `python .ai/skills/db_query.py "<SQL_QUERY>"`
 *   **Note**: The script connects using `ashare.core.db`. `SELECT` queries limit to 20 rows by default unless specified.
 
+#### **Database Snapshot Exporter (`db_snapshot_exporter`)**
+*   **Purpose**: Export database schema/row counts/sample data into Markdown/JSON for analysis.
+*   **Command**: `python .ai/skills/db_snapshot_exporter.py`
+*   **Output**: `tool/output/db_snapshot_YYYYMMDD_HHMMSS.md` and `.json`
+
+#### **Market Environment Analyzer (`market_env_analyzer`)**
+*   **Purpose**: Build and print a weekly market environment report for a target date.
+*   **Command**: `python .ai/skills/market_env_analyzer.py [YYYY-MM-DD]`
+
+#### **Sector Rotation Analyzer (`sector_rotation_analyzer`)**
+*   **Purpose**: Analyze sector rotation based on recent board industry history.
+*   **Command**: `python .ai/skills/sector_rotation_analyzer.py [YYYY-MM-DD]`
+
+#### **Network Tester - AkShare (`network_tester_akshare`)**
+*   **Purpose**: Test AkShare and Eastmoney push2 connectivity and latency.
+*   **Command**: `python .ai/skills/network_tester_akshare.py [options]`
+
+#### **Network Tester - Baostock (`network_tester_baostock`)**
+*   **Purpose**: Test Baostock core API availability and latency.
+*   **Command**: `python .ai/skills/network_tester_baostock.py [options]`
+
+#### **Project Exporter (`project_exporter`)**
+*   **Purpose**: Dump project files into a single text file for LLM review.
+*   **Command**: `python .ai/skills/project_exporter.py`
+*   **Output**: `tool/output/project_for_llm_YYYYMMDD_HHMMSS.txt`
+
+#### **Project Zip Exporter (`project_zip_exporter`)**
+*   **Purpose**: Package project files into a zip with file manifest.
+*   **Command**: `python .ai/skills/project_zip_exporter.py [options]`
+*   **Output**: zip and manifest under `tool/output/` (see script help)
+
 ### Running Scripts
 To avoid `ModuleNotFoundError`, always run scripts as modules from the project root:
 

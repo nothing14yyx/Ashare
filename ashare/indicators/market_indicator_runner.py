@@ -91,6 +91,12 @@ class MarketIndicatorRunner:
         rows = self.repo.attach_cycle_phase_from_weekly(rows)
         if rows:
             dates = [row.get("asof_trade_date") for row in rows]
+            # 计算并持久化每日板块轮动
+            distinct_dates = sorted(list(set(dates)))
+            for d in distinct_dates:
+                if d:
+                    self.builder.compute_and_persist_board_rotation(str(d))
+
             counts = pd.Series(dates).value_counts()
             if (counts > 1).any():
                 self.logger.warning("daily env 输出存在重复交易日：%s", counts[counts > 1])

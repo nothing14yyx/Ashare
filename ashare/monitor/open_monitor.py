@@ -649,6 +649,9 @@ class MA5MA20OpenMonitorRunner:
             env_context.get("weekly_risk_level"),
             reason_matrix,
         )
+        prev_strength_map = self.repo.load_previous_strength_by_monitor_date(
+            codes, monitor_date
+        )
         result = self.evaluator.evaluate(
             signals,
             quotes,
@@ -658,6 +661,7 @@ class MA5MA20OpenMonitorRunner:
             run_id=run_id,
             run_pk=run_pk,
             ready_signals_used=self.repo.ready_signals_used,
+            previous_strength_map=prev_strength_map,
         )
 
         if result.empty:

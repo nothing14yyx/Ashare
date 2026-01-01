@@ -502,13 +502,88 @@ class WeeklyEnvironmentBuilder:
 
         return scenario
 
+    def load_board_rotation_metrics(self, latest_trade_date: str) -> pd.DataFrame:
+        """从数据库读取或计算板块轮动指标。"""
+        if not self.board_env_enabled:
+            return pd.DataFrame()
+
+        # 优先直接读取已生成的指标表
+        if self._table_exists("strategy_board_rotation"):
+            try:
+                stmt = text("SELECT * FROM strategy_board_rotation WHERE `date` = :d")
+                with self.db_writer.engine.begin() as conn:
+                    df = pd.read_sql_query(stmt, conn, params={"d": latest_trade_date})
+                if not df.empty:
+                    # 适配返回格式：Index=board_name
+                    if "board_name" in df.columns:
+                        df = df.set_index("board_name")
+                    return df
+            except Exception as exc:  # noqa: BLE001
+                self.logger.debug("读取 strategy_board_rotation 失败：%s", exc)
+
+        if not self._table_exists("board_industry_hist_daily"):
+            return pd.DataFrame()
+
+        # 读取最近约 60 个交易日的数据以确保有足够窗口计算 20d 收益
+        stmt = text(
+            """
+            SELECT `date`, `board_name`, `收盘` AS `close`
+            FROM board_industry_hist_daily
+            WHERE `date` >= DATE_SUB(:d, INTERVAL 90 DAY)
+              AND `date` <= :d
+            ORDER BY `date` ASC
+            """
+        )
+        try:
+            with self.db_writer.engine.begin() as conn:
+                df = pd.read_sql_query(stmt, conn, params={"d": latest_trade_date})
+            if df.empty:
+                return pd.DataFrame()
+
+            # 数据透视：行=日期，列=板块
+            pivot_df = df.pivot_table(index="date", columns="board_name", values="close").ffill()
+            if len(pivot_df) < 21:
+                return pd.DataFrame()
+
+            # 计算收益率
+            ret_20d = pivot_df.pct_change(20).iloc[-1]
+            ret_5d = pivot_df.pct_change(5).iloc[-1]
+
+            metrics = pd.DataFrame({"ret_20d": ret_20d, "ret_5d": ret_5d}).dropna()
+            # 排名百分比 (0~1)
+            metrics["rank_trend"] = metrics["ret_20d"].rank(pct=True)
+            metrics["rank_mom"] = metrics["ret_5d"].rank(pct=True)
+
+            def _classify(row):
+                strong_trend = row["rank_trend"] >= 0.5
+                strong_mom = row["rank_mom"] >= 0.5
+                if strong_trend and strong_mom:
+                    return "leading"
+                if not strong_trend and strong_mom:
+                    return "improving"
+                if strong_trend and not strong_mom:
+                    return "weakening"
+                return "lagging"
+
+            metrics["rotation_phase"] = metrics.apply(_classify, axis=1)
+            return metrics
+        except Exception as exc:  # noqa: BLE001
+            self.logger.debug("计算板块轮动指标失败：%s", exc)
+            return pd.DataFrame()
+
+
     def build_environment_context(
         self, latest_trade_date: str, *, checked_at: dt.datetime | None = None
     ) -> dict[str, Any]:
         index_trend = self.load_index_trend(latest_trade_date)
         weekly_channel = self.load_index_weekly_channel(latest_trade_date)
         weekly_scenario = self.build_weekly_scenario(weekly_channel, index_trend)
+        
+        # 1. 获取基础行情快照
         board_strength = self.load_board_spot_strength(latest_trade_date, checked_at)
+        # 2. 获取轮动指标
+        rotation_metrics = self.load_board_rotation_metrics(latest_trade_date)
+        
         board_map: dict[str, Any] = {}
         if not board_strength.empty and "board_name" in board_strength.columns:
             total = len(board_strength)
@@ -517,13 +592,43 @@ class WeeklyEnvironmentBuilder:
                 code = str(row.get("board_code") or "").strip()
                 rank = row.get("rank")
                 pct = row.get("chg_pct")
+                
+                # 初始状态
                 status = "neutral"
                 if total > 0 and rank:
                     if rank <= max(1, int(total * 0.2)):
                         status = "strong"
                     elif rank >= max(1, int(total * 0.8)):
                         status = "weak"
-                payload = {"rank": rank, "chg_pct": pct, "status": status}
+                
+                # 整合轮动数据
+                phase = None
+                trend_score = None
+                mom_score = None
+                if not rotation_metrics.empty and name in rotation_metrics.index:
+                    m = rotation_metrics.loc[name]
+                    phase = m["rotation_phase"]
+                    trend_score = m["rank_trend"]
+                    mom_score = m["rank_mom"]
+                    
+                    # 如果是领涨象限，强制提升为 strong
+                    if phase == "leading":
+                        status = "strong"
+                    # 如果是滞后象限，强制降级为 weak
+                    elif phase == "lagging":
+                        status = "weak"
+                    # 如果是转弱象限且动量评分极低，降级为 weak
+                    elif phase == "weakening" and mom_score < 0.2:
+                        status = "weak"
+
+                payload = {
+                    "rank": rank, 
+                    "chg_pct": pct, 
+                    "status": status,
+                    "rotation_phase": phase,
+                    "trend_score": trend_score,
+                    "mom_score": mom_score
+                }
                 for key in [name, code]:
                     key_norm = str(key).strip()
                     if key_norm:

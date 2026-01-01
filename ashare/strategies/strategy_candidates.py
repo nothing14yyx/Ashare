@@ -8,12 +8,12 @@ from dataclasses import dataclass
 from typing import List
 
 import pandas as pd
-from sqlalchemy import inspect, text
 
 from ashare.core.config import get_section
 from ashare.core.db import DatabaseConfig, MySQLWriter
-from ashare.core.schema_manager import SchemaManager, TABLE_STRATEGY_CANDIDATES
+from ashare.core.schema_manager import SchemaManager
 from ashare.strategies.ma5_ma20_params import MA5MA20Params
+from ashare.strategies.strategy_candidates_repo import StrategyCandidatesRepository
 
 
 @dataclass(frozen=True)
@@ -46,6 +46,7 @@ class StrategyCandidatesService:
         self.db_writer = db_writer or MySQLWriter(DatabaseConfig.from_env())
         self.logger = logger or logging.getLogger(__name__)
         self.params = StrategyCandidatesConfig.from_config()
+        self.repo = StrategyCandidatesRepository(self.db_writer, self.logger)
         db_name = getattr(self.db_writer.config, "db_name", None)
         self.table_names = SchemaManager(
             self.db_writer.engine,
@@ -84,6 +85,11 @@ class StrategyCandidatesService:
             snapshot_only,
         )
 
+    def load_candidates(self, asof_trade_date: dt.date) -> pd.DataFrame:
+        """读取指定交易日的候选池快照。"""
+        asof_date = self._normalize_date(asof_trade_date)
+        return self.repo.load_candidates(asof_date)
+
     def _normalize_date(self, raw: dt.date | str) -> dt.date:
         if isinstance(raw, dt.date):
             return raw
@@ -93,24 +99,10 @@ class StrategyCandidatesService:
         return parsed.date()
 
     def _table_exists(self, table: str) -> bool:
-        if not table:
-            return False
-        try:
-            with self.db_writer.engine.begin() as conn:
-                conn.execute(text(f"SELECT 1 FROM `{table}` LIMIT 1"))
-            return True
-        except Exception:
-            return False
+        return self.repo.table_exists(table)
 
     def _column_exists(self, table: str, column: str) -> bool:
-        if not table or not column:
-            return False
-        try:
-            inspector = inspect(self.db_writer.engine)
-            cols = inspector.get_columns(table)
-        except Exception:
-            return False
-        return any(col.get("name") == column for col in cols if isinstance(col, dict))
+        return self.repo.column_exists(table, column)
 
     def _load_trade_dates(self, latest_date: dt.date, limit: int) -> List[str]:
         lookback_days = max(int(limit), 1)
@@ -124,22 +116,9 @@ class StrategyCandidatesService:
             else:
                 base_table = self.table_names.signal_events_table
                 date_col = "sig_date"
-
-        stmt = text(
-            f"""
-            SELECT DISTINCT CAST(`{date_col}` AS CHAR) AS d
-            FROM `{base_table}`
-            WHERE `{date_col}` <= :base_date
-            ORDER BY d DESC
-            LIMIT {lookback_days}
-            """
+        return self.repo.fetch_trade_dates(
+            base_table, date_col, latest_date, lookback_days
         )
-        with self.db_writer.engine.begin() as conn:
-            df = pd.read_sql_query(stmt, conn, params={"base_date": latest_date.isoformat()})
-
-        if df is None or df.empty:
-            return []
-        return df["d"].dropna().astype(str).str[:10].tolist()
 
     def _load_max_valid_days(self, latest_date: dt.date) -> int | None:
         table = self.table_names.signal_events_table
@@ -152,27 +131,7 @@ class StrategyCandidatesService:
         if not recent_dates:
             return None
         min_date = recent_dates[-1]
-
-        stmt = text(
-            f"""
-            SELECT MAX(`valid_days`) AS max_valid_days
-            FROM `{table}`
-            WHERE `sig_date` >= :min_date
-            """
-        )
-        with self.db_writer.engine.begin() as conn:
-            row = conn.execute(stmt, {"min_date": min_date}).mappings().first()
-
-        if not row:
-            return None
-        raw = row.get("max_valid_days")
-        if raw is None or pd.isna(raw):
-            return None
-        try:
-            max_days = int(raw)
-        except Exception:
-            return None
-        return max_days if max_days > 0 else None
+        return self.repo.fetch_max_valid_days(table, min_date)
 
     def _resolve_scan_days(self, latest_date: dt.date) -> int:
         lookback = int(self.params.signal_lookback_days)
@@ -183,18 +142,7 @@ class StrategyCandidatesService:
         return max(int(scan_days), 1)
 
     def _load_liquidity_codes(self, asof_date: dt.date) -> List[str]:
-        stmt = text(
-            """
-            SELECT `code`
-            FROM `a_share_top_liquidity`
-            WHERE `date` = :d
-            """
-        )
-        with self.db_writer.engine.begin() as conn:
-            df = pd.read_sql_query(stmt, conn, params={"d": asof_date})
-        if df.empty or "code" not in df.columns:
-            return []
-        return df["code"].dropna().astype(str).tolist()
+        return self.repo.fetch_liquidity_codes(asof_date)
 
     def _load_signal_candidates(self, asof_date: dt.date) -> pd.DataFrame:
         table = self.table_names.signal_events_table
@@ -221,20 +169,7 @@ class StrategyCandidatesService:
         ]
 
         # 包含BUY/BUY_CONFIRM信号的股票
-        stmt = text(
-            f"""
-            SELECT {", ".join(select_cols)}
-            FROM `{table}`
-            WHERE `sig_date` BETWEEN :earliest AND :latest
-              AND UPPER(COALESCE(`final_action`, `signal`)) IN ('BUY','BUY_CONFIRM')
-            """
-        )
-        with self.db_writer.engine.begin() as conn:
-            df = pd.read_sql_query(
-                stmt,
-                conn,
-                params={"earliest": earliest, "latest": latest},
-            )
+        df = self.repo.fetch_signal_candidates(table, earliest, latest)
 
         # 添加接近信号的股票
         near_signal_df = self._load_near_signal_candidates(asof_date)
@@ -312,54 +247,14 @@ class StrategyCandidatesService:
         if near_signal_macd_required:
             macd_clause = " AND a.macd_hist IS NOT NULL AND a.macd_hist > 0"
 
-        stmt = text(
-            f"""
-            SELECT
-                a.code,
-                a.trade_date as sig_date,
-                'MA5_MA20_TREND' as strategy_code,
-                'NEAR_SIGNAL' as action,
-                1 as valid_days
-            FROM `{indicator_table}` a
-            JOIN `{indicator_table}` b
-              ON a.code = b.code
-             AND b.trade_date = :prev_date
-            WHERE a.trade_date = :latest_date
-              AND a.close IS NOT NULL
-              AND a.ma20 IS NOT NULL
-              AND a.ma5 IS NOT NULL
-              AND b.ma20 IS NOT NULL
-              AND b.ma5 IS NOT NULL
-              AND ABS((a.close - a.ma20) / a.ma20) <= :near_ma20_band
-              AND (
-                    (
-                        a.ma5 > a.ma20
-                        AND (a.ma5 - a.ma20) >= (b.ma5 - b.ma20)
-                        AND a.ma5 > b.ma5
-                    )
-                 OR (
-                        a.ma5 <= a.ma20
-                        AND ABS((a.ma5 - a.ma20) / a.ma20) <= :near_cross_gap_band
-                        AND (a.ma5 - a.ma20) > (b.ma5 - b.ma20)
-                        AND a.ma5 > b.ma5
-                    )
-                  )
-              {macd_clause}
-            """
+        return self.repo.fetch_near_signal_candidates(
+            indicator_table,
+            latest_date,
+            prev_date,
+            near_ma20_band,
+            near_cross_gap_band,
+            near_signal_macd_required,
         )
-        with self.db_writer.engine.begin() as conn:
-            df = pd.read_sql_query(
-                stmt,
-                conn,
-                params={
-                    "latest_date": latest_date,
-                    "prev_date": prev_date,
-                    "near_ma20_band": near_ma20_band,
-                    "near_cross_gap_band": near_cross_gap_band,
-                },
-            )
-
-        return df
 
     def _merge_candidates(
         self,
@@ -423,19 +318,9 @@ class StrategyCandidatesService:
         ]
 
     def _write_candidates(self, asof_date: dt.date, df: pd.DataFrame) -> None:
-        delete_stmt = text(
-            f"DELETE FROM `{TABLE_STRATEGY_CANDIDATES}` WHERE `asof_trade_date` = :d"
-        )
-        with self.db_writer.engine.begin() as conn:
-            conn.execute(delete_stmt, {"d": asof_date})
-
+        self.repo.write_candidates(asof_date, df)
         if df.empty:
             self.logger.warning(
                 "strategy_candidates asof=%s 无可写入候选（已清空旧数据）。",
                 asof_date,
             )
-            return
-
-        df = df.copy()
-        df["code"] = df["code"].astype(str)
-        self.db_writer.write_dataframe(df, TABLE_STRATEGY_CANDIDATES, if_exists="append")

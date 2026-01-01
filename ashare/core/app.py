@@ -15,6 +15,12 @@ from typing import Callable, Iterable, Tuple
 import pandas as pd
 from sqlalchemy import bindparam, inspect, text
 
+from ashare.core.app_services import (
+    DataIngestService,
+    FundamentalService,
+    HistoryKlineService,
+    UniverseService,
+)
 from ashare.data.akshare_fetcher import AkshareDataFetcher
 from ashare.data.baostock_core import ADJUSTFLAG_NONE, BaostockDataFetcher
 from ashare.data.baostock_session import BaostockSession
@@ -22,7 +28,7 @@ from ashare.core.config import ProxyConfig, get_section
 from ashare.core.db import DatabaseConfig, MySQLWriter
 from ashare.data.external_signal_manager import ExternalSignalManager
 from ashare.data.fundamental_manager import FundamentalDataManager
-from ashare.core.schema_manager import TABLE_A_SHARE_UNIVERSE, SchemaManager
+from ashare.core.schema_manager import SchemaManager
 from ashare.data.universe import AshareUniverseBuilder
 from ashare.utils import setup_logger
 
@@ -1800,90 +1806,11 @@ class AshareApp:
         recent_df, recent_table = self._slice_recent_window(base_table, end_day, window_days)
         self._refresh_history_calendar_view(base_table, end_day, slice_window_days=window_days)
         return recent_df, recent_table
-    def _extract_focus_codes(self, df: pd.DataFrame) -> list[str]:
-        if df.empty:
-            return []
-        if "code" not in df.columns:
-            return []
-        codes = df["code"].astype(str).dropna().tolist()
-        return codes
-
-    def _sync_external_signals(
-        self, latest_trade_day: str, focus_df: pd.DataFrame
-    ) -> None:
-        if self.external_signal_manager is None:
-            self.logger.info("Akshare 行为证据层未启用，跳过外部信号同步。")
-            return
-
-        focus_codes = self._extract_focus_codes(focus_df)
-        try:
-            self.external_signal_manager.sync_daily_signals(
-                latest_trade_day, focus_codes
-            )
-        except Exception as exc:  # noqa: BLE001
-            self.logger.warning("行为证据同步阶段出现异常: %s", exc)
-
     def _print_preview(self, interfaces: Iterable[str]) -> None:
         preview = list(interfaces)
         self.logger.info("已发现 %s 个项目组件，前 10 个预览：", len(preview))
         for name in preview[:10]:
             self.logger.info(" - %s", name)
-
-    def _apply_fundamental_filters(
-        self, universe_df: pd.DataFrame, fundamentals_df: pd.DataFrame
-    ) -> pd.DataFrame:
-        if fundamentals_df.empty:
-            self.logger.info("未生成财务宽表，跳过基本面过滤。")
-            return universe_df
-
-        merged = universe_df.merge(fundamentals_df, on="code", how="left")
-
-        def _select_column(df: pd.DataFrame, candidates: list[str]) -> str | None:
-            for col in candidates:
-                if col in df.columns:
-                    return col
-            return None
-
-        def _filter_numeric(
-            df: pd.DataFrame, candidates: list[str], predicate, desc: str
-        ) -> pd.DataFrame:
-            target_col = _select_column(df, candidates)
-            if target_col is None:
-                self.logger.info("缺少 %s 指标列，跳过该条件。", desc)
-                return df
-
-            series = pd.to_numeric(df[target_col], errors="coerce")
-            before = len(df)
-            df = df[predicate(series)]
-            self.logger.info("%s 过滤：%s -> %s", desc, before, len(df))
-            return df
-
-        merged = _filter_numeric(
-            merged,
-            ["profit_roeAvg", "profit_roe", "dupont_dupontROE"],
-            lambda s: s > 0,
-            "ROE 为正",
-        )
-        merged = _filter_numeric(
-            merged,
-            ["balance_liabilityToAsset", "balance_assetLiabRatio"],
-            lambda s: s < 0.75,
-            "资产负债率 < 75%",
-        )
-        merged = _filter_numeric(
-            merged,
-            ["cash_flow_CFOToNP", "cash_flow_CFOToOR", "cash_flow_CFOToGr"],
-            lambda s: s > 0,
-            "经营现金流为正（按 CFO 比率代理）",
-        )
-        merged = _filter_numeric(
-            merged,
-            ["growth_YOYNI", "growth_YOYPNI", "growth_YOYEPSBasic"],
-            lambda s: s > 0,
-            "净利润或 EPS 同比为正",
-        )
-
-        return merged
 
     def run(self) -> None:
         """执行 Baostock 数据导出与候选池筛选示例。"""
@@ -1901,137 +1828,37 @@ class AshareApp:
 
             SchemaManager(self.db_writer.engine, db_name=self.db_writer.config.db_name).ensure_all()
 
+            ingest = DataIngestService(self)
+            fundamental = FundamentalService(self)
+            history = HistoryKlineService(self)
+            universe = UniverseService(self)
+
             # 2) 获取最近交易日并导出股票列表/元数据（允许离线）
-            if self.use_baostock:
-                latest_trade_day = self.fetcher.get_latest_trading_date()
-            else:
-                latest_trade_day = self._infer_latest_trade_day_from_db(
-                    base_table="history_daily_kline"
-                )
+            latest_trade_day = ingest.resolve_latest_trade_day()
             self.logger.info("最近交易日：%s", latest_trade_day)
 
-            try:
-                self._export_index_daily_history(latest_trade_day)
-            except Exception as exc:  # noqa: BLE001
-                self.logger.warning("拉取指数日线失败：%s", exc)
+            ingest.export_index_daily_history(latest_trade_day)
 
             # 股票列表（至少要拿到 code）
-            if self.fetch_stock_meta:
-                try:
-                    stock_df = self._export_stock_list(latest_trade_day)
-                except RuntimeError as exc:
-                    self.logger.error("导出股票列表失败: %s", exc)
-                    return
-            else:
-                stock_df = self._load_table("a_share_stock_list")
-                if stock_df.empty:
-                    stock_df = self._build_stock_list_from_history(
-                        base_table="history_daily_kline",
-                        trade_day=latest_trade_day,
-                    )
-                if stock_df.empty:
-                    self.logger.error(
-                        "股票列表为空：已关闭 Baostock 元数据拉取，但数据库中也没有可用的 a_share_stock_list/history_daily_kline。"
-                    )
-                    return
-
-            stock_basic_df = None
-            if self.fetch_stock_meta:
-                try:
-                    stock_basic_df = self._export_stock_basic()
-                except RuntimeError as exc:
-                    self.logger.warning(
-                        "导出证券基本资料失败: %s，将跳过上市状态与上市天数过滤。",
-                        exc,
-                    )
-                    stock_basic_df = None
-            else:
-                stock_basic_df = self._load_table("a_share_stock_basic")
-                if stock_basic_df.empty:
-                    self.logger.warning(
-                        "已关闭 Baostock 元数据拉取，且数据库中未找到 a_share_stock_basic，将跳过上市状态与上市天数过滤。"
-                    )
-                    stock_basic_df = None
-
-            industry_df = pd.DataFrame()
-            if self.fetch_stock_meta:
-                try:
-                    industry_df = self._export_stock_industry()
-                except RuntimeError as exc:
-                    self.logger.warning(
-                        "导出行业分类数据失败: %s，将继续主流程（不做行业映射）。",
-                        exc,
-                    )
-                    industry_df = pd.DataFrame()
-            else:
-                industry_df = self._load_table("a_share_stock_industry")
-
-            board_spot = pd.DataFrame()
-            if self.board_industry_enabled:
-                try:
-                    board_spot = self._export_board_industry_spot()
-                except Exception as exc:  # noqa: BLE001
-                    self.logger.warning("板块快照刷新失败：%s", exc)
-                try:
-                    self._export_board_industry_constituents(board_spot)
-                except Exception as exc:  # noqa: BLE001
-                    self.logger.warning("板块成份股维表刷新失败：%s", exc)
-                try:
-                    self._export_board_industry_history(latest_trade_day, spot=board_spot)
-                except Exception as exc:  # noqa: BLE001
-                    self.logger.warning("板块数据刷新失败：%s", exc)
-
-            if self.fetch_stock_meta:
-                index_membership = self._export_index_members(latest_trade_day)
-            else:
-                index_membership = self._load_index_membership_from_db()
-            fundamentals_wide = pd.DataFrame()
             try:
-                if self.refresh_fundamentals:
-                    fundamental_codes: set[str] = set().union(
-                        *index_membership.values()
-                    )
-                    if not fundamental_codes:
-                        fallback_count = min(
-                            self.universe_builder.top_liquidity_count, len(stock_df)
-                        )
-                        fundamental_codes = set(
-                            stock_df["code"].head(fallback_count)
-                        )
+                stock_df = ingest.load_stock_list(latest_trade_day)
+            except RuntimeError:
+                return
 
-                    self.logger.info(
-                        "基础面刷新开关已开启，本次将对 %s 支股票刷新季频财务数据。",
-                        len(fundamental_codes),
-                    )
-                    fundamentals_wide = self.fundamental_manager.refresh_all(
-                        sorted(fundamental_codes),
-                        latest_trade_day,
-                        quarterly_lookback=4,
-                        report_lookback_years=0,
-                        adjust_lookback_years=0,
-                        update_reports=False,
-                        update_corporate_actions=False,
-                        update_macro=False,
-                    )
-                else:
-                    self.logger.info(
-                        "基础面刷新开关已关闭，本次仅使用数据库中已有的财务表构建宽表。"
-                    )
-                    fundamentals_wide = self.fundamental_manager.build_latest_wide()
-            except Exception as exc:  # noqa: BLE001
-                self.logger.warning(
-                    "基础面阶段出现异常，将继续主流程（只使用技术面过滤）: %s",
-                    exc,
-                )
+            stock_basic_df = ingest.load_stock_basic()
+
+            industry_df = ingest.load_stock_industry()
+
+            ingest.refresh_board_industry(latest_trade_day)
+            index_membership = ingest.load_index_membership(latest_trade_day)
+            fundamentals_wide = fundamental.load_fundamentals(
+                latest_trade_day, index_membership, stock_df
+            )
 
             # 3) 导出最近 N 日历史日线（增量模式）
             try:
-                history_df, history_table = self._export_daily_history_incremental(
-                    stock_df,
-                    latest_trade_day,
-                    base_table="history_daily_kline",
-                    window_days=self.history_days,
-                    fetch_enabled=self.fetch_daily_kline,
+                history_df, history_table = history.export_daily_history(
+                    stock_df, latest_trade_day
                 )
             except RuntimeError as exc:
                 self.logger.error(
@@ -2045,7 +1872,7 @@ class AshareApp:
 
             # 4) 构建候选池并挑选成交额前 N 名
             try:
-                universe_df = self.universe_builder.build_universe(
+                universe_df = universe.build_universe(
                     stock_df,
                     history_df,
                     stock_basic_df=stock_basic_df,
@@ -2057,92 +1884,17 @@ class AshareApp:
                 return
 
             try:
-                universe_df = self._apply_fundamental_filters(
+                universe_df = universe.apply_fundamental_filters(
                     universe_df, fundamentals_wide
                 )
             except Exception as exc:  # noqa: BLE001
                 self.logger.warning("基本面过滤阶段出现异常，保留未过滤结果: %s", exc)
 
-            universe_snapshot_table = TABLE_A_SHARE_UNIVERSE
-            self.logger.info(
-                "已生成候选池 表=%s 行数=%s",
-                universe_snapshot_table,
-                len(universe_df),
-            )
-
-            # 4.1) 将候选池写入 Universe 表快照（按 date 覆盖；避免 replace 破坏索引/主键）
-            if universe_df.empty:
-                self.logger.warning("候选池为空，跳过 Universe 表落库与后续选股。")
+            if not universe.persist_universe_snapshot(universe_df):
                 return
-
-            if not self._table_exists(universe_snapshot_table):
-                self.logger.error(
-                    "Universe 表 %s 不存在（SchemaManager 未完成建表？），跳过落库与后续选股。",
-                    universe_snapshot_table,
-                )
-                return
-
-            df = universe_df.copy()
-            if "tradestatus" in df.columns and "tradeStatus" not in df.columns:
-                df = df.rename(columns={"tradestatus": "tradeStatus"})
-
-            universe_columns = [
-                "date",
-                "code",
-                "code_name",
-                "tradeStatus",
-                "amount",
-                "volume",
-                "open",
-                "high",
-                "low",
-                "close",
-                "ipoDate",
-                "type",
-                "status",
-                "in_hs300",
-                "in_zz500",
-                "in_sz50",
-            ]
-            for col in universe_columns:
-                if col not in df.columns:
-                    df[col] = None
-            df = df[universe_columns]
-
-            df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
-            df["ipoDate"] = pd.to_datetime(df["ipoDate"], errors="coerce").dt.date
-
-            dates = sorted(set(df["date"].dropna().astype(str)))
-            if not dates:
-                self.logger.warning(
-                    "候选池缺少有效 date 字段，跳过 Universe 表落库与后续选股。"
-                )
-                return
-
-            delete_stmt = text(
-                f"DELETE FROM `{universe_snapshot_table}` WHERE `date` IN :dates"
-            ).bindparams(bindparam("dates", expanding=True))
-
-            with self.db_writer.engine.begin() as conn:
-                conn.execute(delete_stmt, {"dates": dates})
-                df.to_sql(
-                    universe_snapshot_table,
-                    conn,
-                    if_exists="append",
-                    index=False,
-                    method="multi",
-                    chunksize=1000,
-                )
-
-            self.logger.info(
-                "Universe 表快照已写入 %s：rows=%s, dates=%s",
-                universe_snapshot_table,
-                len(df),
-                dates,
-            )
 
             try:
-                top_liquidity = self.universe_builder.pick_top_liquidity(universe_df)
+                top_liquidity = universe.pick_top_liquidity(universe_df)
             except RuntimeError as exc:
                 self.logger.error(
                     "挑选成交额前 %s 名失败: %s",
@@ -2159,7 +1911,7 @@ class AshareApp:
                 top_liquidity_table,
             )
 
-            self._sync_external_signals(latest_trade_day, top_liquidity)
+            universe.sync_external_signals(latest_trade_day, top_liquidity)
 
             # 5) 提示历史日线路径
             self.logger.debug(

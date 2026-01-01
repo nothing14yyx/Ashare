@@ -8,7 +8,7 @@ import math
 from time import perf_counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, List
+from typing import Any, Dict, List
 
 import pandas as pd
 
@@ -274,6 +274,7 @@ class OpenMonitorEvaluator:
         run_id: str | None = None,
         run_pk: int | None = None,
         ready_signals_used: bool = False,
+        previous_strength_map: Dict[str, float] | None = None,
     ) -> pd.DataFrame:
         if signals.empty:
             return pd.DataFrame()
@@ -619,6 +620,21 @@ class OpenMonitorEvaluator:
             )
             strength_delta = None
             strength_trend = None
+            if previous_strength_map:
+                code = str(row.get("code") or "")
+                prev_strength = previous_strength_map.get(code)
+                if prev_strength is not None and strength is not None:
+                    try:
+                        strength_delta = float(strength) - float(prev_strength)
+                    except Exception:
+                        strength_delta = None
+                    if strength_delta is not None:
+                        if abs(strength_delta) < 1e-6:
+                            strength_trend = "FLAT"
+                        elif strength_delta > 0:
+                            strength_trend = "UP"
+                        else:
+                            strength_trend = "DOWN"
 
             states.append(state)
             status_reasons.append(status_reason)

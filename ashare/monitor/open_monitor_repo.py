@@ -16,9 +16,10 @@ from ashare.data.baostock_session import BaostockSession
 from ashare.core.config import get_section
 from ashare.core.db import DatabaseConfig, MySQLWriter
 from ashare.core.env_snapshot_utils import load_trading_calendar
-from ashare.strategies.ma5_ma20_trend_strategy import _atr, _macd
+from ashare.indicators.indicator_utils import atr, macd
 from ashare.monitor.open_monitor_df import normalize_asof_indicators
 from ashare.monitor.open_monitor_persist import OpenMonitorPersister
+from ashare.monitor.open_monitor_data_repo import OpenMonitorDataRepository
 from ashare.utils.convert import to_float as _to_float
 
 
@@ -129,6 +130,7 @@ class OpenMonitorSqlStore:
         self.params = params
         self.db_writer = MySQLWriter(DatabaseConfig.from_env())
         self.db_name = self.db_writer.config.db_name
+        self.repo = OpenMonitorDataRepository(self.db_writer, self.logger)
 
         self._ready_signals_used: bool = False
         self._recent_buy_signals_cache_key = None
@@ -170,50 +172,13 @@ class OpenMonitorSqlStore:
         return view
 
     def _table_exists(self, table: str) -> bool:
-        try:
-            with self.engine.begin() as conn:
-                df = pd.read_sql_query(text("SHOW TABLES LIKE :t"), conn, params={"t": table})
-            return not df.empty
-        except Exception:
-            return False
+        return self.repo.table_exists(table)
 
     def _column_exists(self, table: str, column: str) -> bool:
-        try:
-            stmt = text(
-                """
-                SELECT COUNT(*) AS cnt
-                FROM information_schema.columns
-                WHERE table_schema = :schema AND table_name = :table AND column_name = :column
-                """
-            )
-            with self.engine.begin() as conn:
-                df = pd.read_sql_query(
-                    stmt,
-                    conn,
-                    params={
-                        "schema": self.db_name,
-                        "table": table,
-                        "column": column,
-                    },
-                )
-            return not df.empty and bool(df.iloc[0].get("cnt", 0))
-        except Exception as exc:  # noqa: BLE001
-            self.logger.debug("检查列 %s.%s 是否存在失败：%s", table, column, exc)
-            return False
+        return self.repo.column_exists(table, column, self.db_name)
 
     def _get_table_columns(self, table: str) -> List[str]:
-        stmt = text(
-            """
-            SELECT COLUMN_NAME FROM information_schema.COLUMNS
-            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = :t
-            """
-        )
-        try:
-            with self.engine.begin() as conn:
-                return pd.read_sql(stmt, conn, params={"t": table})["COLUMN_NAME"].tolist()
-        except Exception as exc:  # noqa: BLE001
-            self.logger.warning("无法获取 %s 列信息：%s", table, exc)
-            return []
+        return self.repo.get_table_columns(table)
 
     def _daily_table(self) -> str:
         """获取日线数据表名（用于补充计算“信号日涨幅”等信息）。"""
@@ -577,6 +542,38 @@ class OpenMonitorSqlStore:
         events_df["code"] = events_df["code"].astype(str)
         events_df["sig_date"] = pd.to_datetime(events_df["sig_date"], errors="coerce")
 
+        # 尝试补充板块信息（若 view 中缺失）
+        dim_df = self.load_board_constituent_dim()
+        if not dim_df.empty:
+            if "code" in dim_df.columns:
+                dim_df["code"] = dim_df["code"].astype(str)
+            cols_to_merge = ["code"]
+            if "board_name" in dim_df.columns:
+                cols_to_merge.append("board_name")
+            if "board_code" in dim_df.columns:
+                cols_to_merge.append("board_code")
+            
+            if len(cols_to_merge) > 1:
+                dim_subset = dim_df[cols_to_merge].copy()
+                events_df = events_df.merge(
+                    dim_subset, on="code", how="left", suffixes=("", "_dim")
+                )
+                if "board_name" not in events_df.columns:
+                    events_df["board_name"] = events_df.get("board_name_dim")
+                else:
+                    events_df["board_name"] = events_df["board_name"].fillna(
+                        events_df.get("board_name_dim")
+                    )
+                if "board_code" not in events_df.columns:
+                    events_df["board_code"] = events_df.get("board_code_dim")
+                else:
+                    events_df["board_code"] = events_df["board_code"].fillna(
+                        events_df.get("board_code_dim")
+                    )
+                events_df = events_df.drop(
+                    columns=["board_name_dim", "board_code_dim"], errors="ignore"
+                )
+
         base_cols = [
             "sig_date",
             "code",
@@ -860,9 +857,9 @@ class OpenMonitorSqlStore:
         if "preclose" not in df.columns:
             df["preclose"] = df["close"].shift(1)
 
-        dif, dea, hist = _macd(df["close"])
+        dif, dea, hist = macd(df["close"])
         df["macd_hist"] = hist
-        df["atr14"] = _atr(df["high"], df["low"], df["preclose"])
+        df["atr14"] = atr(df["high"], df["low"], df["preclose"])
         df["ma20"] = df["close"].rolling(20, min_periods=1).mean()
         df["ma60"] = df["close"].rolling(60, min_periods=1).mean()
 
@@ -1018,6 +1015,63 @@ class OpenMonitorSqlStore:
                 df = pd.read_sql_query(stmt, conn, params=params)
         except Exception as exc:  # noqa: BLE001
             self.logger.debug("读取历史信号强度失败，将跳过强度对比：%s", exc)
+            return {}
+
+        if df.empty or "code" not in df.columns:
+            return {}
+
+        df["code"] = df["code"].astype(str)
+        strength_map: Dict[str, float] = {}
+        for _, row in df.iterrows():
+            score = _to_float(row.get("signal_strength"))
+            if score is None:
+                continue
+            strength_map[str(row.get("code"))] = score
+        return strength_map
+
+    def load_previous_strength_by_monitor_date(
+        self, codes: List[str], monitor_date: str | None
+    ) -> Dict[str, float]:
+        table = self.params.output_table
+        if not codes or not monitor_date or not self._table_exists(table):
+            return {}
+        if not self._column_exists(table, "signal_strength") or not self._column_exists(
+            table, "monitor_date"
+        ):
+            return {}
+
+        parsed_date = pd.to_datetime(monitor_date, errors="coerce")
+        if pd.isna(parsed_date):
+            return {}
+        monitor_date_str = parsed_date.date().isoformat()
+
+        stmt = text(
+            f"""
+            SELECT t1.`code`, t1.`signal_strength`
+            FROM `{table}` t1
+            JOIN (
+                SELECT `code`, MAX(`monitor_date`) AS prev_date
+                FROM `{table}`
+                WHERE `code` IN :codes
+                  AND `signal_strength` IS NOT NULL
+                  AND `monitor_date` < :monitor_date
+                GROUP BY `code`
+            ) t2
+              ON t1.`code` = t2.`code` AND t1.`monitor_date` = t2.`prev_date`
+            WHERE t1.`code` IN :codes
+              AND t1.`signal_strength` IS NOT NULL
+            """
+        ).bindparams(bindparam("codes", expanding=True))
+
+        try:
+            with self.engine.begin() as conn:
+                df = pd.read_sql_query(
+                    stmt,
+                    conn,
+                    params={"codes": codes, "monitor_date": monitor_date_str},
+                )
+        except Exception as exc:  # noqa: BLE001
+            self.logger.debug("读取上一交易日信号强度失败，将跳过强度对比：%s", exc)
             return {}
 
         if df.empty or "code" not in df.columns:
@@ -1299,6 +1353,43 @@ class OpenMonitorSqlStore:
 
         return df.iloc[0].to_dict()
 
+    def load_board_rotation_info(self, latest_trade_date: str) -> dict[str, dict[str, Any]]:
+        table = "strategy_board_rotation"
+        if not (table and latest_trade_date and self._table_exists(table)):
+            return {}
+
+        stmt = text(
+            f"""
+            SELECT `board_name`, `board_code`, `rotation_phase`, `rank_trend`, `rank_mom`
+            FROM `{table}`
+            WHERE `date` = :d
+            """
+        )
+        try:
+            with self.engine.begin() as conn:
+                df = pd.read_sql_query(stmt, conn, params={"d": latest_trade_date})
+        except Exception as exc:  # noqa: BLE001
+            self.logger.debug("读取板块轮动数据失败：%s", exc)
+            return {}
+
+        if df.empty:
+            return {}
+
+        result = {}
+        for _, row in df.iterrows():
+            name = str(row.get("board_name") or "").strip()
+            code = str(row.get("board_code") or "").strip()
+            payload = {
+                "rotation_phase": row.get("rotation_phase"),
+                "trend_score": _to_float(row.get("rank_trend")),
+                "mom_score": _to_float(row.get("rank_mom")),
+            }
+            if name:
+                result[name] = payload
+            if code:
+                result[code] = payload
+        return result
+
     def get_latest_weekly_indicator_date(self) -> dt.date | None:
         table = self.params.weekly_indicator_table
         if not (table and self._table_exists(table)):
@@ -1471,7 +1562,18 @@ class OpenMonitorSqlStore:
             ON DUPLICATE KEY UPDATE {", ".join(f"`{c}` = VALUES(`{c}`)" for c in update_cols)}
             """
         )
+        df = df.astype(object).where(pd.notna(df), None)
         payloads = df.to_dict(orient="records")
+        for payload in payloads:
+            for key, value in payload.items():
+                try:
+                    if pd.isna(value):
+                        payload[key] = None
+                        continue
+                except Exception:
+                    pass
+                if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
+                    payload[key] = None
         try:
             with self.engine.begin() as conn:
                 conn.execute(stmt, payloads)
@@ -1945,6 +2047,9 @@ class OpenMonitorRepository:
             make_snapshot_hash=make_snapshot_hash,
         )
 
+    def __getattr__(self, name):
+        return getattr(self.store, name)
+
     @property
     def ready_signals_used(self) -> bool:
         return self.store.ready_signals_used
@@ -1955,5 +2060,8 @@ class OpenMonitorRepository:
     def persist_results(self, df: pd.DataFrame) -> None:
         self.persister.persist_results(df)
 
-    def __getattr__(self, name: str):  # noqa: ANN204
-        return getattr(self.store, name)
+    def load_board_rotation_info(self, latest_trade_date: str) -> dict[str, dict[str, Any]]:
+        return self.store.load_board_rotation_info(latest_trade_date)
+
+    def load_board_constituent_dim(self) -> pd.DataFrame:
+        return self.store.load_board_constituent_dim()

@@ -237,8 +237,8 @@ def main(argv: List[str] | None = None) -> None:
     print(df.groupby(["case", "status"]).size())
 
     base_dir = Path(__file__).resolve().parent
-    out_dir = base_dir / "output"
-    out_dir.mkdir(exist_ok=True)
+    out_dir = base_dir.parents[1] / "tool" / "output"
+    out_dir.mkdir(exist_ok=True, parents=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_path = out_dir / f"baostock_core_ashare_test_{ts}.csv"
     df.to_csv(out_path, index=False, encoding="utf-8-sig")
