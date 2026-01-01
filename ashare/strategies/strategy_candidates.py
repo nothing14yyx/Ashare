@@ -13,6 +13,7 @@ from sqlalchemy import inspect, text
 from ashare.core.config import get_section
 from ashare.core.db import DatabaseConfig, MySQLWriter
 from ashare.core.schema_manager import SchemaManager, TABLE_STRATEGY_CANDIDATES
+from ashare.strategies.ma5_ma20_trend_strategy import MA5MA20Params
 
 
 @dataclass(frozen=True)
@@ -262,7 +263,7 @@ class StrategyCandidatesService:
         if all_signals_df.empty:
             return all_signals_df
 
-        action_priority = {"BUY": 1, "BUY_CONFIRM": 2, "NEAR_SIGNAL": 3}
+        action_priority = {"BUY": 3, "BUY_CONFIRM": 2, "NEAR_SIGNAL": 1}
         all_signals_df["action_priority"] = all_signals_df["action"].map(action_priority).fillna(0).astype(int)
         all_signals_df = all_signals_df.sort_values(
             ["code", "sig_date", "action_priority"],
@@ -288,32 +289,75 @@ class StrategyCandidatesService:
             return pd.DataFrame()
 
         # 获取最近的交易日数据
-        trade_dates = self._load_trade_dates(asof_date, 1)
+        trade_dates = self._load_trade_dates(asof_date, 2)
         if not trade_dates:
             return pd.DataFrame()
 
         latest_date = trade_dates[0]
+        if len(trade_dates) < 2:
+            self.logger.warning(
+                "near_signal skipped: prev_date missing (trade_dates=%s).",
+                trade_dates,
+            )
+            return pd.DataFrame()
+        prev_date = trade_dates[1]
+
+        p = MA5MA20Params.from_config()
+        near_ma20_band = float(getattr(p, "near_ma20_band", 0.02))
+        near_cross_gap_band = float(getattr(p, "near_cross_gap_band", 0.005))
+        near_signal_macd_required = bool(getattr(p, "near_signal_macd_required", False))
 
         # 查找接近MA20的股票
+        macd_clause = ""
+        if near_signal_macd_required:
+            macd_clause = " AND a.macd_hist IS NOT NULL AND a.macd_hist > 0"
+
         stmt = text(
             f"""
             SELECT
-                code,
-                trade_date as sig_date,
+                a.code,
+                a.trade_date as sig_date,
                 'MA5_MA20_TREND' as strategy_code,
                 'NEAR_SIGNAL' as action,
                 1 as valid_days
-            FROM `{indicator_table}`
-            WHERE trade_date = :latest_date
-              AND close IS NOT NULL
-              AND ma20 IS NOT NULL
-              AND ABS((close - ma20) / ma20) <= 0.02  -- 接近MA20阈值2%
-              AND ma5 IS NOT NULL
-              AND ma5 > ma20  -- MA5在MA20之上，显示潜在买入机会
+            FROM `{indicator_table}` a
+            JOIN `{indicator_table}` b
+              ON a.code = b.code
+             AND b.trade_date = :prev_date
+            WHERE a.trade_date = :latest_date
+              AND a.close IS NOT NULL
+              AND a.ma20 IS NOT NULL
+              AND a.ma5 IS NOT NULL
+              AND b.ma20 IS NOT NULL
+              AND b.ma5 IS NOT NULL
+              AND ABS((a.close - a.ma20) / a.ma20) <= :near_ma20_band
+              AND (
+                    (
+                        a.ma5 > a.ma20
+                        AND (a.ma5 - a.ma20) >= (b.ma5 - b.ma20)
+                        AND a.ma5 > b.ma5
+                    )
+                 OR (
+                        a.ma5 <= a.ma20
+                        AND ABS((a.ma5 - a.ma20) / a.ma20) <= :near_cross_gap_band
+                        AND (a.ma5 - a.ma20) > (b.ma5 - b.ma20)
+                        AND a.ma5 > b.ma5
+                    )
+                  )
+              {macd_clause}
             """
         )
         with self.db_writer.engine.begin() as conn:
-            df = pd.read_sql_query(stmt, conn, params={"latest_date": latest_date})
+            df = pd.read_sql_query(
+                stmt,
+                conn,
+                params={
+                    "latest_date": latest_date,
+                    "prev_date": prev_date,
+                    "near_ma20_band": near_ma20_band,
+                    "near_cross_gap_band": near_cross_gap_band,
+                },
+            )
 
         return df
 

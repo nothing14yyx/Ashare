@@ -67,9 +67,16 @@ class MA5MA20Params:
 
     # 回踩买点：close 与 MA20 偏离比例
     pullback_band: float = 0.01
+    # 接近买点预警（NEAR_SIGNAL）
+    near_ma20_band: float = 0.02
+    near_cross_gap_band: float = 0.005
+    near_signal_macd_required: bool = False
 
     # KDJ 低位阈值（可选增强：只做 reason 标记，不强制）
     kdj_low_threshold: float = 30.0
+
+    # BUY_CONFIRM 收紧开关：要求 MA5 >= MA20
+    buy_confirm_require_ma5_ge_ma20: bool = True
 
     # 输出表/视图
     indicator_table: str = TABLE_STRATEGY_INDICATOR_DAILY
@@ -604,21 +611,30 @@ class MA5MA20StrategyRunner:
         # 6) 趋势回踩（close 接近 MA20 + MA5 向上）
         pullback_band = float(p.pullback_band)
         pullback_near = ((df["close"] - df["ma20"]).abs() / df["ma20"]) <= pullback_band
-        ma5_up = (df["ma5"] - df["ma5"].groupby(df["code"]).shift(1)) > 0
+        prev_ma5 = df.groupby("code")["ma5"].shift(1)
+        prev_ma20 = df.groupby("code")["ma20"].shift(1)
+        ma5_delta = df["ma5"] - prev_ma5
+        ma5_up = ma5_delta > 0
 
         buy_cross = trend_ok & cross_up & vol_ok & macd_ok
         buy_pullback = trend_ok & pullback_near & ma5_up & macd_ok
         buy_macd_confirm = hist_cross_up & (df["close"] >= df["ma20"])
+        if bool(getattr(p, "buy_confirm_require_ma5_ge_ma20", True)):
+            buy_macd_confirm = buy_macd_confirm & (df["ma5"] >= df["ma20"])
         pattern_series = self._detect_price_patterns(df)
         buy_pattern = (pattern_series == "W_BOTTOM_CONFIRMED") & (df["close"] > df["ma20"])
 
         # 卖出：死叉 或 跌破 MA20 且放量（趋势破坏）
         sell_without_hist = cross_down | ((df["close"] < df["ma20"]) & vol_ok)
         sell = sell_without_hist | hist_cross_down
-        prev_ma5 = df.groupby("code")["ma5"].shift(1)
-        prev_ma20 = df.groupby("code")["ma20"].shift(1)
-        dead_cross = (df["ma5"] < df["ma20"]) & (prev_ma5 > prev_ma20) & (df["vol_ratio"] < 1.0)
-        reduce_mask = (df["ma5"] < df["ma20"]) & (df["vol_ratio"] < 1.0) & (~dead_cross)
+        dead_cross = (df["ma5"] < df["ma20"]) & (prev_ma5 > prev_ma20)
+        dead_cross_low_vol = dead_cross & (df["vol_ratio"] < 1.0)
+        reduce_mask = (
+            (df["ma5"] < df["ma20"])
+            & (df["close"] < df["ma20"])
+            & (df["vol_ratio"] < 1.0)
+            & (~dead_cross)
+        )
 
         # 用 pandas Series 拼接原因，避免 numpy.ndarray 没有 strip 的问题
         reason = pd.Series("", index=df.index, dtype="object")
@@ -634,10 +650,25 @@ class MA5MA20StrategyRunner:
         reason = _append(reason, buy_pattern, "W底突破")
 
         # 识别接近信号：价格接近MA20但尚未触发买入条件
-        near_ma20 = ((df["close"] - df["ma20"]).abs() / df["ma20"]) <= 0.02  # 价格在MA20的2%范围内
-        ma5_above_ma20 = df["ma5"] > df["ma20"]  # MA5在MA20之上
-        ma5_approaching_ma20 = (df["ma5"] - df["ma5"].groupby(df["code"]).shift(1)) > 0  # MA5向上接近
-        near_signal_condition = near_ma20 & ma5_above_ma20 & ma5_approaching_ma20
+        near_ma20_band = float(getattr(p, "near_ma20_band", 0.02))
+        near_cross_gap_band = float(getattr(p, "near_cross_gap_band", 0.005))
+        near_ma20 = ((df["close"] - df["ma20"]).abs() / df["ma20"]) <= near_ma20_band
+        gap = df["ma5"] - df["ma20"]
+        prev_gap = prev_ma5 - prev_ma20
+        gap_delta = gap - prev_gap
+        gap_ratio = gap.abs() / df["ma20"].replace(0, np.nan)
+
+        near_buy_pullback = near_ma20 & (gap > 0) & (ma5_delta > 0) & (gap_delta >= 0)
+        near_buy_cross = (
+            near_ma20
+            & (gap <= 0)
+            & (gap_ratio <= near_cross_gap_band)
+            & (ma5_delta > 0)
+            & (gap_delta > 0)
+        )
+        near_signal_condition = near_buy_pullback | near_buy_cross
+        if bool(getattr(p, "near_signal_macd_required", False)):
+            near_signal_condition = near_signal_condition & macd_ok
 
         signal = np.select(
             [sell | dead_cross, reduce_mask, buy_cross | buy_pullback | buy_pattern, buy_macd_confirm, near_signal_condition],
@@ -650,11 +681,12 @@ class MA5MA20StrategyRunner:
         out["reason"] = reason.to_numpy()
 
         # 更新reason以包含接近信号
-        out["reason"] = np.where(
-            out["signal"] == "NEAR_SIGNAL",
-            "价格接近MA20（接近信号）",
-            out["reason"]
+        near_reason = np.select(
+            [near_buy_pullback, near_buy_cross],
+            ["接近回踩买点", "接近金叉"],
+            default="价格接近MA20",
         )
+        out["reason"] = np.where(out["signal"] == "NEAR_SIGNAL", near_reason, out["reason"])
 
         # 卖出原因优先覆盖
         out["reason"] = np.where(
@@ -667,11 +699,8 @@ class MA5MA20StrategyRunner:
             "MACD柱翻绿/死叉",
             out["reason"]
         )
-        out["reason"] = np.where(
-            dead_cross,
-            "死叉+缩量清",
-            out["reason"]
-        )
+        out["reason"] = np.where(dead_cross, "死叉", out["reason"])
+        out["reason"] = np.where(dead_cross_low_vol, "死叉+缩量", out["reason"])
         out["reason"] = np.where(
             reduce_mask,
             "弱势缩量减仓",

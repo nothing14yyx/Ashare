@@ -8,3 +8,4 @@ ashare.log
 gha-creds-*.json
 .codex/
 diff_output.txt
+output/

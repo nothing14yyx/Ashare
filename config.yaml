@@ -131,7 +131,15 @@ strategy_ma5_ma20_trend:
   volume_ma_window: 5
 
   pullback_band: 0.01
+  # NEAR_SIGNAL: close around MA20
+  near_ma20_band: 0.02
+  # NEAR_SIGNAL: cross-up gap band (ma5 below ma20 but close)
+  near_cross_gap_band: 0.005
+  # NEAR_SIGNAL: require macd_hist > 0
+  near_signal_macd_required: false
   kdj_low_threshold: 30
+  # BUY_CONFIRM: require MA5 >= MA20
+  buy_confirm_require_ma5_ge_ma20: true
 
   indicator_table: strategy_indicator_daily
   signal_events_table: strategy_signal_events
