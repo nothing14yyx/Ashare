@@ -136,3 +136,52 @@ class StrategyDataRepository:
                 exc,
             )
             return pd.DataFrame()
+
+    def load_indicator_daily(
+        self,
+        codes: List[str],
+        latest_date: dt.date,
+        lookback: int = 100,
+        table: str = "strategy_indicator_daily",
+    ) -> pd.DataFrame:
+        """从数据库加载预计算好的技术指标。"""
+        if not codes:
+            return pd.DataFrame()
+
+        start_date = latest_date - dt.timedelta(days=lookback * 2) # 留出足够的日历日
+        
+        stmt = (
+            text(
+                f"""
+                SELECT *
+                FROM `{table}`
+                WHERE `code` IN :codes AND `trade_date` BETWEEN :start_date AND :latest_date
+                ORDER BY `code`, `trade_date`
+                """
+            )
+            .bindparams(bindparam("codes", expanding=True))
+        )
+        
+        try:
+            with self.db_writer.engine.begin() as conn:
+                df = pd.read_sql(
+                    stmt,
+                    conn,
+                    params={
+                        "codes": codes,
+                        "start_date": start_date.isoformat(),
+                        "latest_date": latest_date.isoformat(),
+                    },
+                )
+            
+            if df.empty:
+                return df
+                
+            # 统一字段名，确保兼容旧代码中的 'date' 引用
+            df = df.rename(columns={"trade_date": "date"})
+            df["date"] = pd.to_datetime(df["date"])
+            return df
+            
+        except Exception as exc:
+            self.logger.error("加载预计算指标表 %s 失败: %s", table, exc)
+            return pd.DataFrame()

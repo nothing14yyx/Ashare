@@ -467,4 +467,32 @@ def build_default_monitor_rules(
                 action_override=config.runup_breach_action,
             ),
         ),
+        # === 核心增强：开盘五句口诀 ===
+        Rule(
+            id="OPEN_FORMULA_GAP_DOWN",
+            category="ACTION",
+            severity=85, # 高优先级
+            predicate=lambda ctx: bool(
+                getattr(ctx, "live_gap", 0) <= -0.03 
+                and getattr(ctx, "live_pct", 0) < 0 # 未翻红
+            ),
+            effect=lambda ctx: RuleResult(
+                reason="口诀：低开3%未翻红->跑",
+                action_override="STOP",
+            ),
+        ),
+        Rule(
+            id="OPEN_FORMULA_GAP_UP_FAIL",
+            category="ACTION",
+            severity=80,
+            predicate=lambda ctx: bool(
+                getattr(ctx, "live_gap", 0) >= 0.05 
+                and getattr(ctx, "live_pct", 0) < 0.095 # 未封板
+                and getattr(ctx, "minutes_since_open", 0) > 60 # 开盘一小时后
+            ),
+            effect=lambda ctx: RuleResult(
+                reason="口诀：高开5%一小时不封板->清仓",
+                action_override="STOP",
+            ),
+        ),
     ]

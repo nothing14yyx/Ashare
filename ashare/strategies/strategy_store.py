@@ -96,7 +96,8 @@ class StrategyStore:
             "ma20_bias",
             "yearline_state",
         ]
-        indicator_df = base[keep_cols].copy()
+        # 容错：只保留实际存在的列
+        indicator_df = base[[c for c in keep_cols if c in base.columns]].copy()
         indicator_df = indicator_df.rename(columns={"date": "trade_date"})
         indicator_df["trade_date"] = pd.to_datetime(indicator_df["trade_date"]).dt.date
         indicator_df["code"] = indicator_df["code"].astype(str)
@@ -210,7 +211,8 @@ class StrategyStore:
             "wave_type",
             "extra_json",
         ]
-        events_df = base[keep_cols].copy()
+        # 容错处理：只保留实际存在的列
+        events_df = base[[c for c in keep_cols if c in base.columns]].copy()
         events_df = events_df.rename(columns={"date": "sig_date"})
         events_df["sig_date"] = pd.to_datetime(events_df["sig_date"]).dt.date
         events_df["code"] = events_df["code"].astype(str)
@@ -285,9 +287,12 @@ class StrategyStore:
                 .str.slice(0, 255)
                 .replace("", pd.NA)
             )
-        events_df["gdhs_announce_date"] = pd.to_datetime(
-            events_df.get("gdhs_announce_date"), errors="coerce"
-        ).dt.date
+        
+        if "gdhs_announce_date" in events_df.columns:
+            events_df["gdhs_announce_date"] = pd.to_datetime(
+                events_df["gdhs_announce_date"], errors="coerce"
+            ).dt.date
+            
         events_df["extra_json"] = None
         if "extra_json" in base.columns:
             events_df["extra_json"] = base["extra_json"].fillna("").astype(str)

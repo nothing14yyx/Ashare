@@ -5,10 +5,12 @@ import logging
 from typing import Any, Optional
 
 import pandas as pd
-from sqlalchemy import text
+from sqlalchemy import text, bindparam
 
 from ashare.indicators.market_indicator_builder import MarketIndicatorBuilder
 from ashare.monitor.open_monitor_repo import OpenMonitorRepository
+from ashare.indicators.indicator_repo import TechnicalIndicatorService
+from ashare.strategies.strategy_store import StrategyStore
 
 
 class MarketIndicatorRunner:
@@ -24,6 +26,55 @@ class MarketIndicatorRunner:
         self.repo = repo
         self.builder = builder
         self.logger = logger
+        self.tech_service = TechnicalIndicatorService(logger=logger)
+        # 复用策略端的存储逻辑来写指标表
+        from ashare.strategies.ma5_ma20_params import MA5MA20Params
+        self.strat_store = StrategyStore(repo.db_writer, MA5MA20Params(), logger)
+
+    def run_technical_indicators(self, *, latest_date: str) -> None:
+        """核心重构：为 Universe 里的股票预计算技术指标并入库。"""
+        self.logger.info(">>> 正在为 Universe 股票预计算技术指标 (Data Processing)...")
+        
+        # 1. 获取当前 Universe 的股票列表
+        stmt = text("SELECT code FROM a_share_universe WHERE date = :d")
+        with self.repo.engine.connect() as conn:
+            df_universe = pd.read_sql(stmt, conn, params={"d": latest_date})
+        
+        if df_universe.empty:
+            self.logger.warning("当前 Universe 为空，跳过技术指标计算。")
+            return
+            
+        codes = df_universe["code"].unique().tolist()
+        
+        # 2. 加载原始 K 线 (带有足够的 lookback 以计算长均线)
+        end_dt = dt.date.fromisoformat(latest_date)
+        start_dt = end_dt - dt.timedelta(days=500) # 预留一年以上以计算 MA250
+        
+        # 使用 OpenMonitorDataRepository 加载全量日线
+        from ashare.data.universe import AshareUniverseBuilder
+        # 这里复用 app 的逻辑或直接查表
+        stmt_k = text("SELECT * FROM history_daily_kline WHERE code IN :codes AND date BETWEEN :s AND :e")
+        with self.repo.engine.connect() as conn:
+            df_k = pd.read_sql(stmt_k.bindparams(bindparam("codes", expanding=True)), 
+                               conn, params={"codes": codes, "s": start_dt.isoformat(), "e": latest_date})
+        
+        if df_k.empty:
+            self.logger.warning("未读取到 K 线数据，无法计算指标。")
+            return
+
+        # 3. 执行计算
+        df_indicators = self.tech_service.compute_all(df_k)
+        
+        # 4. 批量写入 strategy_indicator_daily 表
+        # 这里我们利用 strategy_store 现成的 write_indicator_daily 方法
+        # 它的 scope="window" 会覆盖写入
+        self.strat_store.write_indicator_daily(
+            latest_date=end_dt,
+            signals=df_indicators,
+            codes=codes,
+            scope_override="window"
+        )
+        self.logger.info("全市场技术指标预计算完成，已入库 %s 条记录。", len(df_indicators))
 
     def run_weekly_indicator(
         self,
@@ -96,6 +147,14 @@ class MarketIndicatorRunner:
             for d in distinct_dates:
                 if d:
                     self.builder.compute_and_persist_board_rotation(str(d))
+            
+            if distinct_dates:
+                self.logger.info(
+                    "已更新板块轮动数据：%s 条（周期 %s 至 %s）",
+                    len(distinct_dates),
+                    distinct_dates[0],
+                    distinct_dates[-1],
+                )
 
             counts = pd.Series(dates).value_counts()
             if (counts > 1).any():

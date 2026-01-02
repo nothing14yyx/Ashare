@@ -8,7 +8,7 @@ from pathlib import Path
 from sqlalchemy import text
 
 from ashare.core.app import AshareApp
-from ashare.strategies.ma5_ma20_trend_strategy import MA5MA20StrategyRunner
+from ashare.strategies.trend_following_strategy import TrendFollowingStrategyRunner
 from ashare.monitor.open_monitor import MA5MA20OpenMonitorRunner
 from ashare.core.schema_manager import ensure_schema
 from ashare.utils.logger import setup_logger
@@ -133,6 +133,8 @@ def _self_check(
         logger.warning("start weekly indicator missing; check weekly pipeline")
 
 
+import argparse
+
 def main(
     *,
     skip_fetch: bool = False,
@@ -141,13 +143,20 @@ def main(
     skip_chip: bool = False,
     skip_daily_indicator: bool = False,
     asof_date: str | None = None,
+    init_db: bool = False,
 ) -> None:
     setup_logger()
     logger = logging.getLogger("ashare")
-    ensure_schema()
+    
+    if init_db:
+        logger.info("正在执行数据库结构校验与初始化...")
+        ensure_schema()
+    
     if not skip_fetch:
-        AshareApp().run()
-    strategy_runner = MA5MA20StrategyRunner()
+        # 现在的 AshareApp 不再默认初始化数据库
+        AshareApp(init_db=False).run()
+    
+    strategy_runner = TrendFollowingStrategyRunner()
     if not skip_strategy:
         # 策略是否执行由 config.yaml: strategy_ma5_ma20_trend.enabled 控制
         strategy_runner.run()
@@ -217,7 +226,22 @@ def main(
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="AShare 项目启动脚本")
+    parser.add_argument("--init-db", action="store_true", help="初始化/校验数据库结构")
+    parser.add_argument("--skip-fetch", action="store_true", help="跳过数据抓取")
+    parser.add_argument("--skip-strategy", action="store_true", help="跳过策略运行")
+    parser.add_argument("--skip-weekly", action="store_true", help="跳过周线指标计算")
+    parser.add_argument("--asof-date", type=str, help="指定日期 (YYYY-MM-DD)")
+    
+    args = parser.parse_args()
+    
+    main(
+        skip_fetch=args.skip_fetch,
+        skip_strategy=args.skip_strategy,
+        skip_weekly=args.skip_weekly,
+        asof_date=args.asof_date,
+        init_db=args.init_db,
+    )
 
 # 验收自检（最小）
 # 1) python -m py_compile ashare/monitor/open_monitor_repo.py scripts/run_open_monitor_scheduler.py scripts/run_index_weekly_channel.py start.py

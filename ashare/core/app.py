@@ -147,10 +147,12 @@ class AshareApp:
         top_liquidity_count: int | None = None,
         history_days: int | None = None,
         min_listing_days: int | None = None,
+        init_db: bool = False,
     ) -> None:
         # 保持入口参数兼容性
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.init_db = init_db
 
         # 日志改为写到项目根目录的 ashare.log，不再跟 output 绑在一起
         self.logger = setup_logger()
@@ -1812,6 +1814,58 @@ class AshareApp:
         for name in preview[:10]:
             self.logger.info(" - %s", name)
 
+    def run_universe_builder(self) -> None:
+        """独立运行 Universe 构建逻辑（纯本地数据处理，不联网）。"""
+        self.logger.info(">>> 开始构建交易 Universe (纯本地模式)...")
+        
+        try:
+            ingest = DataIngestService(self)
+            fundamental = FundamentalService(self)
+            universe = UniverseService(self)
+
+            # 1. 确定基准日期 (从本地日线表推断)
+            latest_trade_day = ingest.resolve_latest_trade_day()
+            self.logger.info("处理基准日期：%s", latest_trade_day)
+
+            # 2. 加载本地元数据 (直接从 DB 读取，不下载)
+            stock_df = self._build_stock_list_from_history("history_daily_kline", latest_trade_day)
+            stock_basic_df = self._load_table("a_share_stock_basic")
+            industry_df = self._load_table("a_share_stock_industry")
+            index_membership = self._load_index_membership_from_db()
+            
+            # 加载已有的基本面宽表 (不刷新，仅读取)
+            fundamentals_wide = fundamental.load_fundamentals(
+                latest_trade_day, index_membership, stock_df
+            )
+
+            # 3. 切片本地历史日线 (纯读取，不下载)
+            end_day = dt.datetime.strptime(latest_trade_day, "%Y-%m-%d").date()
+            history_df, _ = self._slice_recent_window("history_daily_kline", end_day, self.history_days)
+
+            # 4. 构建 Universe 与 流动性筛选
+            universe_df = universe.build_universe(
+                stock_df,
+                history_df,
+                stock_basic_df=stock_basic_df,
+                industry_df=industry_df,
+                index_membership=index_membership,
+            )
+            
+            universe_df = universe.apply_fundamental_filters(universe_df, fundamentals_wide)
+            
+            if universe.persist_universe_snapshot(universe_df):
+                top_liquidity = universe.pick_top_liquidity(universe_df)
+                self._save_sample(top_liquidity, "a_share_top_liquidity")
+                self.logger.info("Universe 与流动性筛选更新完成。")
+                
+                # 重构说明：外部信号同步 (LHB/两融等) 已移至 Pipeline 1
+
+        except Exception as e:
+            self.logger.error("构建 Universe 失败: %s", e, exc_info=True)
+            raise
+        finally:
+            self.db_writer.dispose()
+
     def run(self) -> None:
         """执行 Baostock 数据导出与候选池筛选示例。"""
 
@@ -1826,7 +1880,8 @@ class AshareApp:
                 ]
             )
 
-            SchemaManager(self.db_writer.engine, db_name=self.db_writer.config.db_name).ensure_all()
+            if self.init_db:
+                SchemaManager(self.db_writer.engine, db_name=self.db_writer.config.db_name).ensure_all()
 
             ingest = DataIngestService(self)
             fundamental = FundamentalService(self)
@@ -1868,55 +1923,16 @@ class AshareApp:
                 )
                 return
 
-            # 3.1) 单独创建“最近 N 个自然日”的便捷视图（用于你手动查近期数据）
+            # 4) 同步外部信号原始数据 (龙虎榜、两融、股东户数)
+            self.logger.info(">>> 正在同步原始行为数据 (LHB/Margin/GDHS)...")
+            universe.sync_external_signals(latest_trade_day, pd.DataFrame()) # 传入空 DF 以执行默认的全市场/近期同步
 
-            # 4) 构建候选池并挑选成交额前 N 名
-            try:
-                universe_df = universe.build_universe(
-                    stock_df,
-                    history_df,
-                    stock_basic_df=stock_basic_df,
-                    industry_df=industry_df,
-                    index_membership=index_membership,
-                )
-            except RuntimeError as exc:
-                self.logger.error("生成当日候选池失败: %s", exc)
-                return
+            # 5) 提示进度
+            self.logger.info("==============================================")
+            self.logger.info("原始数据同步完成（含日线、基础面及行为数据）")
+            self.logger.info("Universe 构建逻辑已移至 Pipeline 2 执行。")
+            self.logger.info("==============================================")
 
-            try:
-                universe_df = universe.apply_fundamental_filters(
-                    universe_df, fundamentals_wide
-                )
-            except Exception as exc:  # noqa: BLE001
-                self.logger.warning("基本面过滤阶段出现异常，保留未过滤结果: %s", exc)
-
-            if not universe.persist_universe_snapshot(universe_df):
-                return
-
-            try:
-                top_liquidity = universe.pick_top_liquidity(universe_df)
-            except RuntimeError as exc:
-                self.logger.error(
-                    "挑选成交额前 %s 名失败: %s",
-                    self.universe_builder.top_liquidity_count,
-                    exc,
-                )
-                return
-
-            top_liquidity_table = self._save_sample(
-                top_liquidity, "a_share_top_liquidity"
-            )
-            self.logger.info(
-                "已将成交额排序结果写入表 %s，可用于筛选高流动性标的。",
-                top_liquidity_table,
-            )
-
-            universe.sync_external_signals(latest_trade_day, top_liquidity)
-
-            # 5) 提示历史日线路径
-            self.logger.debug(
-                "历史日线窗口数据来源：%s（切片最近 %s 个交易日）", history_table, self.history_days
-            )
             recent_view = getattr(self, "_last_history_calendar_view", None)
             if recent_view:
                 self.logger.debug(

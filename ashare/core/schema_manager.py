@@ -178,6 +178,8 @@ class SchemaManager:
             tables.open_monitor_quote_table,
             tables.open_monitor_run_table,
         )
+        
+        self.logger.info("数据库结构初始化/校验完成。")
 
     def get_table_names(self) -> TableNames:
         return self._resolve_table_names()
@@ -531,6 +533,9 @@ class SchemaManager:
             *,
             primary_key: Iterable[str] | None = None,
     ) -> None:
+        if self._table_exists(table):
+            return
+            
         cols_clause = ",\n".join(f"  `{name}` {ddl}" for name, ddl in columns.items())
         pk_clause = ""
         if primary_key:
@@ -539,7 +544,7 @@ class SchemaManager:
         ddl = f"CREATE TABLE IF NOT EXISTS `{table}` (\n{cols_clause}{pk_clause}\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;"
         with self.engine.begin() as conn:
             conn.execute(text(ddl))
-        self.logger.info("已创建表 %s。", table)
+        self.logger.info("成功创建了新表：%s", table)
 
     def _drop_relation(self, name: str) -> None:
         if not name:
@@ -1118,7 +1123,7 @@ class SchemaManager:
         )
         with self.engine.begin() as conn:
             conn.execute(stmt)
-        self.logger.info("已创建/更新事实视图 %s。", VIEW_FACT_STOCK_DAILY)
+        self.logger.debug("已创建/更新事实视图 %s。", VIEW_FACT_STOCK_DAILY)
 
     def _ensure_index_membership_view(self) -> None:
         parts: list[str] = []
@@ -1228,7 +1233,7 @@ class SchemaManager:
                     )
                 )
 
-        self.logger.info("已创建/更新 Universe 表 %s。", table)
+        self.logger.debug("已创建/更新 Universe 表 %s。", table)
 
     # ---------- MA5-MA20 strategy ----------
     def _ensure_indicator_table(self, table: str) -> None:

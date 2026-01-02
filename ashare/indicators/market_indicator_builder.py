@@ -131,7 +131,7 @@ class MarketIndicatorBuilder:
 
         # 4. 持久化
         self.repo.persist_board_rotation(trade_date, df_to_save)
-        self.logger.info("已更新 %s 板块轮动数据 (%s 条)", trade_date, len(df_to_save))
+        self.logger.debug("已更新 %s 板块轮动数据 (%s 条)", trade_date, len(df_to_save))
 
     def resolve_weekly_asof_dates(
         self, start_date: dt.date, end_date: dt.date
