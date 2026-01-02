@@ -32,19 +32,20 @@ class MarketIndicatorRunner:
         self.strat_store = StrategyStore(repo.db_writer, MA5MA20Params(), logger)
 
     def run_technical_indicators(self, *, latest_date: str) -> None:
-        """核心重构：为 Universe 里的股票预计算技术指标并入库。"""
-        self.logger.info(">>> 正在为 Universe 股票预计算技术指标 (Data Processing)...")
+        """核心重构：仅为 Top Liquidity (活跃标的) 预计算技术指标。"""
+        self.logger.info(">>> 正在为 Top Liquidity 股票预计算技术指标 (Data Processing)...")
         
-        # 1. 获取当前 Universe 的股票列表
-        stmt = text("SELECT code FROM a_share_universe WHERE date = :d")
+        # 1. 获取当前 Top Liquidity 的股票列表 (精准对齐策略需求)
+        stmt = text("SELECT code FROM a_share_top_liquidity WHERE trade_date = :d")
         with self.repo.engine.connect() as conn:
-            df_universe = pd.read_sql(stmt, conn, params={"d": latest_date})
+            df_liquidity = pd.read_sql(stmt, conn, params={"d": latest_date})
         
-        if df_universe.empty:
-            self.logger.warning("当前 Universe 为空，跳过技术指标计算。")
+        if df_liquidity.empty:
+            self.logger.warning("当前 Top Liquidity 为空，请检查 Universe 构建环节。")
             return
             
-        codes = df_universe["code"].unique().tolist()
+        codes = df_liquidity["code"].unique().tolist()
+        self.logger.info("本次加工范围：活跃标的 %s 只。", len(codes))
         
         # 2. 加载原始 K 线 (带有足够的 lookback 以计算长均线)
         end_dt = dt.date.fromisoformat(latest_date)

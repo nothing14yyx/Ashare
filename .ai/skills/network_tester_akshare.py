@@ -401,7 +401,7 @@ def main() -> None:
     print(f"测试日期：{_date_str(test_day)}（用于龙虎榜/两融接口）")
     print(f"测试股票：{test_symbol}（用于股东户数明细接口）\n")
 
-    out_dir = Path(__file__).resolve().parents[2] / "tool" / "output"
+    out_dir = Path(__file__).resolve().parents[2] / "output"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")

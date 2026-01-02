@@ -29,7 +29,21 @@ class MarketIndicatorBuilder:
 
     @property
     def index_codes(self) -> list[str]:
-        return self.env_builder.index_codes
+        # 兼容性修复：从 env_builder.params 中获取 index_codes
+        params = getattr(self.env_builder, "params", None)
+        if params and hasattr(params, "index_codes"):
+            return params.index_codes
+        # 兜底
+        return ["sh.000001", "sh.000300", "sh.000905", "sz.399001", "sz.399006"]
+
+    @property
+    def benchmark_code(self) -> str:
+        params = getattr(self.env_builder, "params", None)
+        if params and hasattr(params, "index_code"):
+            return params.index_code
+        if params and hasattr(params, "benchmark_code"):
+            return params.benchmark_code
+        return "sh.000001"
 
     def compute_weekly_indicator(
         self,
@@ -55,7 +69,7 @@ class MarketIndicatorBuilder:
         weekly_note = env_context.get("weekly_note")
         weekly_plan_json = weekly_scenario.get("weekly_plan_json")
 
-        benchmark_code = self.env_builder.benchmark_code
+        benchmark_code = self.benchmark_code
         return [
             {
                 "weekly_asof_trade_date": weekly_asof,
@@ -153,7 +167,7 @@ class MarketIndicatorBuilder:
         self, start_date: dt.date, end_date: dt.date
     ) -> list[dict[str, Any]]:
         index_codes = [c for c in self.index_codes if c]
-        benchmark_code = self.env_builder.benchmark_code or "sh.000001"
+        benchmark_code = self.benchmark_code
         if benchmark_code and benchmark_code not in index_codes:
             index_codes.append(benchmark_code)
         if not index_codes:

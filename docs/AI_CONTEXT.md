@@ -68,7 +68,7 @@ Real-time execution checks for signals generated on the previous trading day.
 The agent is equipped with custom tools in `.ai/skills/` to handle specific tasks.
 
 #### **Raw Data Reader (`raw_reader`)**
-*   **Purpose**: Read local data files (JSON, CSV, DB exports) located in `.gitignore` paths like `tool/output/`.
+*   **Purpose**: Read local data files (JSON, CSV, DB exports) located in `.gitignore` paths like `output/`.
 *   **Commands**:
     *   Read File: `python .ai/skills/raw_reader.py read <path>`
     *   List Dir: `python .ai/skills/raw_reader.py list <path>`
@@ -81,7 +81,7 @@ The agent is equipped with custom tools in `.ai/skills/` to handle specific task
 #### **Database Snapshot Exporter (`db_snapshot_exporter`)**
 *   **Purpose**: Export database schema/row counts/sample data into Markdown/JSON for analysis.
 *   **Command**: `python .ai/skills/db_snapshot_exporter.py`
-*   **Output**: `tool/output/db_snapshot_YYYYMMDD_HHMMSS.md` and `.json`
+*   **Output**: `output/db_snapshot_YYYYMMDD_HHMMSS.md` and `.json`
 
 #### **Market Environment Analyzer (`market_env_analyzer`)**
 *   **Purpose**: Build and print a weekly market environment report for a target date.
@@ -106,12 +106,12 @@ The agent is equipped with custom tools in `.ai/skills/` to handle specific task
 #### **Project Exporter (`project_exporter`)**
 *   **Purpose**: Dump project files into a single text file for LLM review.
 *   **Command**: `python .ai/skills/project_exporter.py`
-*   **Output**: `tool/output/project_for_llm_YYYYMMDD_HHMMSS.txt`
+*   **Output**: `output/project_for_llm_YYYYMMDD_HHMMSS.txt`
 
 #### **Project Zip Exporter (`project_zip_exporter`)**
 *   **Purpose**: Package project files into a zip with file manifest.
 *   **Command**: `python .ai/skills/project_zip_exporter.py [options]`
-*   **Output**: zip and manifest under `tool/output/` (see script help)
+*   **Output**: zip and manifest under `output/` (see script help)
 
 ### Running Scripts
 To avoid `ModuleNotFoundError`, always run scripts as modules from the project root:
@@ -146,7 +146,7 @@ Managed by `ashare.core.schema_manager`. Key standards:
 - **`strategy_open_monitor_env`**: Market environment snapshots.
 
 ### Local Data Handling
-- Large datasets and output files in `tool/output/` are **ignored by git**.
+- Large datasets and output files in `output/` are **ignored by git**.
 - **Do NOT** upload these files to remote repositories.
 - Use the **Raw Data Reader** skill to inspect them if needed.
 

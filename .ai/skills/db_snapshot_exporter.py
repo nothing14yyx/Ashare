@@ -7,8 +7,8 @@ export_db_snapshot.py
 - 默认从项目根目录 config.yaml 读取数据库配置（顶层 database.*）
 - 也支持通过环境变量 ASHARE_CONFIG_FILE 指定配置文件路径
 - 生成两份文件：
-  1) tool/output/db_snapshot_YYYYMMDD_HHMMSS.md
-  2) tool/output/db_snapshot_YYYYMMDD_HHMMSS.json
+  1) output/db_snapshot_YYYYMMDD_HHMMSS.md
+  2) output/db_snapshot_YYYYMMDD_HHMMSS.json
 """
 
 from __future__ import annotations
@@ -68,8 +68,8 @@ def _default_config_path() -> Path:
     parser.add_argument(
         "--outdir",
         type=str,
-        default=str(_project_root() / "tool" / "output"),
-        help="输出目录（默认：tool/output）",
+        default=str(_project_root() / "output"),
+        help="输出目录（默认：output）",
     )
 
 
@@ -319,8 +319,8 @@ def main() -> None:
     parser.add_argument(
         "--outdir",
         type=str,
-        default=str(Path(__file__).resolve().parent / "output"),
-        help="输出目录（默认：tool/output）",
+        default=str(_project_root() / "output"),
+        help="输出目录（默认：output）",
     )
     parser.add_argument(
         "--sample-rows",

@@ -156,7 +156,7 @@ def build_manifest(entries: list[FileEntry], project_root: Path, out_zip: Path) 
 def main() -> int:
     script_dir = Path(__file__).resolve().parent      # .../.ai/skills
     project_root = script_dir.parents[1]              # 项目根
-    output_dir = project_root / "tool" / "output"     # tool/output
+    output_dir = project_root / "output"     # output
 
     ts = datetime.now(ZoneInfo("Asia/Singapore")).strftime("%Y%m%d_%H%M%S")
     default_out_zip = output_dir / f"project_export_{ts}.zip"
@@ -165,7 +165,7 @@ def main() -> int:
         description="Export project as zip (binary-preserved) with the same scope rules as export_project.py."
     )
     ap.add_argument("--src", type=str, default=str(project_root), help="Project root (default: project root).")
-    ap.add_argument("--out", type=str, default=str(default_out_zip), help="Output zip path (default: tool/output/...).")
+    ap.add_argument("--out", type=str, default=str(default_out_zip), help="Output zip path (default: output/...).")
     ap.add_argument("--compresslevel", type=int, default=6, help="Zip deflate compresslevel 0-9 (default: 6).")
     args = ap.parse_args()
 

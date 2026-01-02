@@ -159,10 +159,14 @@ class TrendFollowingStrategyRunner:
         out["final_reason"] = out["reason"]
         
         # 1. 准备权重因子
-        # 筹码因子：-1 (差), 0 (平), 1 (好)
-        chip_score = pd.to_numeric(out.get("chip_score"), errors="coerce").fillna(0)
+        # 确保 chip_score 列存在并转换为数值 Series
+        if "chip_score" in out.columns:
+            chip_series = pd.to_numeric(out["chip_score"], errors="coerce").fillna(0)
+        else:
+            chip_series = pd.Series(0.0, index=out.index)
+        
         chip_status = np.select(
-            [chip_score >= 0.5, chip_score <= -0.5],
+            [chip_series >= 0.5, chip_series <= -0.5],
             [1, -1],
             default=0
         )
