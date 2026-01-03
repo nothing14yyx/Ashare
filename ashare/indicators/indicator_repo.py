@@ -53,17 +53,25 @@ class IndicatorRepository:
 
     def fetch_index_trade_dates(self, code: str | list[str], start: dt.date, end: dt.date) -> pd.DataFrame:
         """获取指数交易日历。"""
+        codes = self._normalize_codes(code)
         stmt = text("SELECT DISTINCT date as trade_date FROM history_index_daily_kline WHERE code IN :c AND date BETWEEN :s AND :e")
         with self.db_writer.engine.connect() as conn:
             return pd.read_sql(stmt.bindparams(bindparam("c", expanding=True)), 
-                               conn, params={"c": code, "s": start.isoformat(), "e": end.isoformat()})
+                               conn, params={"c": codes, "s": start.isoformat(), "e": end.isoformat()})
 
     def fetch_index_daily_kline(self, code: str | list[str], start: dt.date, end: dt.date) -> pd.DataFrame:
         """获取指数日线 K 线。"""
+        codes = self._normalize_codes(code)
         stmt = text("SELECT * FROM history_index_daily_kline WHERE code IN :c AND date BETWEEN :s AND :e ORDER BY date ASC")
         with self.db_writer.engine.connect() as conn:
             return pd.read_sql(stmt.bindparams(bindparam("c", expanding=True)), 
-                               conn, params={"c": code, "s": start.isoformat(), "e": end.isoformat()})
+                               conn, params={"c": codes, "s": start.isoformat(), "e": end.isoformat()})
+
+    @staticmethod
+    def _normalize_codes(code: str | list[str]) -> list[str]:
+        if isinstance(code, str):
+            return [code]
+        return [str(c) for c in code]
 
 
 def _kdj(
@@ -147,6 +155,17 @@ class TechnicalIndicatorService:
         # 简单的涨停统计 (假设 9.9% 以上算涨停)
         df["is_limit_up"] = df["ret_1"] >= 0.099
         df["limit_up_cnt_20"] = df.groupby("code")["is_limit_up"].rolling(20, min_periods=1).sum().reset_index(level=0, drop=True)
+        
+        # 一字涨停（开盘/最高/最低/收盘相等且涨幅较大）
+        if all(col in df.columns for col in ["open", "high", "low", "close"]):
+            df["one_word_limit_up"] = (
+                (df["open"] == df["high"])
+                & (df["high"] == df["low"])
+                & (df["low"] == df["close"])
+                & (df["ret_1"] >= 0.095)
+            )
+        else:
+            df["one_word_limit_up"] = False
 
         # 4. 衍生指标 (MACD, KDJ, ATR, RSI)
         def _add_oscillators(sub: pd.DataFrame) -> pd.DataFrame:
@@ -184,6 +203,31 @@ class TechnicalIndicatorService:
 
             # 年线状态
             sub["yearline_state"] = np.where(sub["close"] > sub["ma250"], "ABOVE", "BELOW")
+
+            # 吞没形态（按 K 线实体）
+            prev_open = sub["open"].shift(1)
+            prev_close = sub["close"].shift(1)
+            bull_engulf = (
+                (sub["close"] > sub["open"])
+                & (prev_close < prev_open)
+                & (sub["open"] <= prev_close)
+                & (sub["close"] >= prev_open)
+            )
+            bear_engulf = (
+                (sub["close"] < sub["open"])
+                & (prev_close > prev_open)
+                & (sub["open"] >= prev_close)
+                & (sub["close"] <= prev_open)
+            )
+            engulf_body = (sub["close"] - sub["open"]).abs()
+            engulf_body_atr = engulf_body / sub["atr14"].replace(0, np.nan)
+            engulf_score = np.where(bull_engulf, engulf_body_atr, np.where(bear_engulf, -engulf_body_atr, 0.0))
+            engulf_stop_ref = np.where(bull_engulf, sub["low"], np.where(bear_engulf, sub["high"], np.nan))
+            sub["bull_engulf"] = bull_engulf
+            sub["bear_engulf"] = bear_engulf
+            sub["engulf_body_atr"] = engulf_body_atr
+            sub["engulf_score"] = engulf_score
+            sub["engulf_stop_ref"] = engulf_stop_ref
 
             if "code" not in sub.columns:
                 sub["code"] = group_code

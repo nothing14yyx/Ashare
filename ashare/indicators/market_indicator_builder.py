@@ -10,6 +10,7 @@ from ashare.indicators.indicator_repo import IndicatorRepository
 from ashare.indicators.indicator_utils import atr, consecutive_true, macd
 from ashare.indicators.market_regime import MarketRegimeClassifier
 from ashare.indicators.weekly_env_builder import WeeklyEnvironmentBuilder
+from ashare.core.config import get_section
 
 
 class MarketIndicatorBuilder:
@@ -25,7 +26,26 @@ class MarketIndicatorBuilder:
         self.logger = logger
         self.market_regime = MarketRegimeClassifier()
         self.regime_confirm_days = 2
+        self.daily_regime_cfg = self._load_daily_regime_config()
         self.repo = IndicatorRepository(self.env_builder.db_writer, self.logger)
+
+    @staticmethod
+    def _load_daily_regime_config() -> dict[str, Any]:
+        cfg = get_section("daily_env") or {}
+        if not isinstance(cfg, dict):
+            cfg = {}
+        return {
+            "majority_ratio": float(cfg.get("majority_ratio", 0.5)),
+            "breakdown_vol_weak_threshold": float(
+                cfg.get("breakdown_vol_weak_threshold", 0.9)
+            ),
+            "risk_off_vol_weak_threshold": float(
+                cfg.get("risk_off_vol_weak_threshold", 0.9)
+            ),
+            "bb_width_high_threshold": float(cfg.get("bb_width_high_threshold", 0.12)),
+            "bb_width_high_ratio": float(cfg.get("bb_width_high_ratio", 0.5)),
+            "high_vol_cap": float(cfg.get("high_vol_cap", 0.5)),
+        }
 
     @property
     def index_codes(self) -> list[str]:
@@ -194,9 +214,12 @@ class MarketIndicatorBuilder:
         for code, group in df.groupby("code", sort=False):
             grp = group.sort_values("date").copy()
             close = grp["close"]
+            volume = grp["volume"]
             grp["ma20"] = close.rolling(20, min_periods=20).mean()
             grp["ma60"] = close.rolling(60, min_periods=60).mean()
             grp["ma250"] = close.rolling(250, min_periods=250).mean()
+            grp["vol_ma20"] = volume.rolling(20, min_periods=20).mean()
+            grp["vol_ratio_20"] = volume / grp["vol_ma20"].replace(0, pd.NA)
             std20 = close.rolling(20, min_periods=20).std()
             grp["bb_mid"] = grp["ma20"]
             grp["bb_upper"] = grp["bb_mid"] + 2 * std20
@@ -252,6 +275,11 @@ class MarketIndicatorBuilder:
                 & (grp["dev_ma20_atr"] < risk_off_threshold)
             )
             grp["risk_off_flag"] = risk_off_condition
+            vol_ratio = grp["vol_ratio_20"]
+            breakdown_weak_mask = vol_ratio < self.daily_regime_cfg["breakdown_vol_weak_threshold"]
+            breakdown_weak_mask = breakdown_weak_mask.fillna(False)
+            risk_off_weak_mask = vol_ratio < self.daily_regime_cfg["risk_off_vol_weak_threshold"]
+            risk_off_weak_mask = risk_off_weak_mask.fillna(False)
 
             status = status.mask(
                 (status != "UNKNOWN") & grp["break_confirmed"], "BEAR_CONFIRMED"
@@ -265,6 +293,14 @@ class MarketIndicatorBuilder:
             status = status.mask(
                 (status == "RISK_ON") & risk_off_condition,
                 "RISK_OFF",
+            )
+            status = status.mask(
+                (status == "BREAKDOWN") & breakdown_weak_mask,
+                "BREAKDOWN_WEAK",
+            )
+            status = status.mask(
+                (status == "RISK_OFF") & risk_off_weak_mask,
+                "RISK_OFF_WEAK",
             )
             pullback_mask = (grp["ma60"].notna()) & (close < grp["ma60"])
             status = status.mask((status == "RISK_ON") & pullback_mask, "PULLBACK")
@@ -289,8 +325,8 @@ class MarketIndicatorBuilder:
         merged["above_ma20"] = (merged["close"] > merged["ma20"]) & merged["ma20"].notna()
         merged["above_ma60"] = (merged["close"] > merged["ma60"]) & merged["ma60"].notna()
         day_summary = (
-            merged.groupby("trade_date")[["status", "score_raw", "pullback_mode"]]
-            .apply(self._resolve_daily_regime)
+            merged.groupby("trade_date")[["status", "score_raw", "pullback_mode", "bb_width"]]
+            .apply(self._resolve_daily_regime, cfg=self.daily_regime_cfg)
             .reset_index()
         )
         day_summary = day_summary.sort_values("trade_date").reset_index(drop=True)
@@ -421,25 +457,39 @@ class MarketIndicatorBuilder:
         return rows
 
     @staticmethod
-    def _resolve_daily_regime(group: pd.DataFrame) -> pd.Series:
+    def _resolve_daily_regime(group: pd.DataFrame, *, cfg: dict[str, Any]) -> pd.Series:
         statuses = group["status"].dropna().astype(str).tolist()
         score = group["score_raw"].mean() if not group.empty else None
         pullback_fast = (
             group["pullback_mode"].fillna("").astype(str).eq("FAST_DROP").any()
         )
 
+        def _normalize_status(val: str) -> str:
+            if val == "BREAKDOWN_WEAK":
+                return "RISK_OFF"
+            if val == "RISK_OFF_WEAK":
+                return "PULLBACK"
+            return val
+
+        normalized = [_normalize_status(v) for v in statuses]
+        status_counts = pd.Series(normalized).value_counts() if normalized else pd.Series(dtype=float)
+        total = float(status_counts.sum()) if not status_counts.empty else 0.0
+
+        majority_ratio = float(cfg.get("majority_ratio", 0.5))
+        majority_ratio = max(min(majority_ratio, 1.0), 0.0)
+
         regime = "RISK_ON"
-        if statuses and all(val == "UNKNOWN" for val in statuses):
+        if normalized and all(val == "UNKNOWN" for val in normalized):
             regime = "UNKNOWN"
             score = None
-        elif "BEAR_CONFIRMED" in statuses:
-            regime = "BEAR_CONFIRMED"
-        elif "BREAKDOWN" in statuses:
-            regime = "BREAKDOWN"
-        elif "RISK_OFF" in statuses:
-            regime = "RISK_OFF"
-        elif "PULLBACK" in statuses:
-            regime = "PULLBACK"
+        elif total > 0:
+            for candidate in ["BEAR_CONFIRMED", "BREAKDOWN", "RISK_OFF", "PULLBACK"]:
+                if status_counts.get(candidate, 0.0) / total >= majority_ratio:
+                    regime = candidate
+                    break
+            else:
+                if "PULLBACK" in normalized:
+                    regime = "PULLBACK"
 
         position_hint_map = {
             "RISK_ON": 0.8,
@@ -452,6 +502,17 @@ class MarketIndicatorBuilder:
         position_hint = position_hint_map.get(regime)
         if regime == "PULLBACK" and pullback_fast and position_hint is not None:
             position_hint = min(position_hint, 0.3)
+        high_vol = False
+        if "bb_width" in group.columns:
+            bb_threshold = float(cfg.get("bb_width_high_threshold", 0.12))
+            bb_ratio = float(cfg.get("bb_width_high_ratio", 0.5))
+            high_vol_mask = group["bb_width"] >= bb_threshold
+            if high_vol_mask.any():
+                ratio = float(high_vol_mask.sum()) / float(len(group))
+                if ratio >= bb_ratio:
+                    high_vol = True
+        if high_vol and position_hint is not None:
+            position_hint = min(position_hint, float(cfg.get("high_vol_cap", 0.5)))
 
         return pd.Series(
             {
@@ -459,6 +520,7 @@ class MarketIndicatorBuilder:
                 "regime": regime,
                 "position_hint": position_hint,
                 "pullback_fast": pullback_fast,
+                "high_vol": high_vol,
             }
         )
 

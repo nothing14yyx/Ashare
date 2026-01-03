@@ -129,8 +129,11 @@ strategy_ma5_ma20_trend:
 
   volume_ratio_threshold: 1.5
   volume_ma_window: 5
+  # 低信号保护：base_buy 过少时降仓但不归零
+  min_signals: 3
+  min_signals_cap_scale: 0.5
 
-  pullback_band: 0.01
+  pullback_band: 0.02
   # NEAR_SIGNAL: close around MA20
   near_ma20_band: 0.02
   # NEAR_SIGNAL: cross-up gap band (ma5 below ma20 but close)
@@ -141,11 +144,41 @@ strategy_ma5_ma20_trend:
   # BUY_CONFIRM: require MA5 >= MA20
   buy_confirm_require_ma5_ge_ma20: true
 
+  # 高位滞涨阈值（风险提示/卖出）
+  stagnation_vol_ratio_threshold: 2.0
+  stagnation_pct_abs_threshold: 0.01
+  stagnation_ma20_bias_threshold: 0.1
+
+  # 吞没形态软因子阈值
+  engulf_body_atr_threshold: 0.6
+  engulf_vol_ratio_threshold: 1.2
+  engulf_near_ma20_band: 0.02
+  engulf_score_weight: 0.3
+  engulf_risk_ma20_bias_threshold: 0.06
+
+  # Wyckoff 软因子
+  wyckoff_enabled: true
+  wyckoff_confirm_min_score: 1.0
+  wyckoff_score_weight: 0.5
+
+  # 软确认回看窗口（避免当日信号稀疏）
+  soft_confirm_lookback_days: 10
+  soft_confirm_cap_scale: 0.5
+  # 质量分拦截与降级
+  quality_stop_threshold: -3.0
+  quality_soft_threshold: -1.0
+  quality_soft_cap_scale: 0.7
+
+  # 一字涨停阈值（HardGate）
+  one_word_limit_up_pct: 0.095
+
   indicator_table: strategy_indicator_daily
   signal_events_table: strategy_signal_events
 
   # signals 写入范围：latest=仅最新交易日（默认），window=回填本次计算窗口内全部交易日
   signals_write_scope: window
+  signals_write_batch_days: 5
+  signals_write_window_days: 10
   # 信号有效期（交易日口径）
   valid_days: 3
 
@@ -213,3 +246,35 @@ open_monitor:
   export_csv: false
   export_top_n: 100
   output_subdir: open_monitor
+
+# Weekly market env config (channel + risk control)
+weekly_env:
+  # Linear regression channel
+  lrc_length: 52
+  lrc_dev: 2.0
+  ma_fast: 30
+  ma_slow: 60
+  # Volume validation
+  breakout_vol_ratio_threshold: 1.2
+  breakdown_vol_weak_threshold: 0.9
+  # Slope change (normalized by close)
+  slope_change_ratio_threshold: 0.002
+  # Volatility regime control
+  bandwidth_lookback: 104
+  bandwidth_high_quantile: 0.9
+  bandwidth_cap: 0.4
+  # Channel vs Pattern conflict handling
+  conflict_requires_vol_confirm: true
+  conflict_gate: ALLOW_SMALL
+
+# Daily market env config (regime + risk control)
+daily_env:
+  # Multi-index regime: ratio of indices needed to upgrade risk level
+  majority_ratio: 0.5
+  # Volume validation for breakdown / risk off
+  breakdown_vol_weak_threshold: 0.9
+  risk_off_vol_weak_threshold: 0.9
+  # High volatility cap (bb_width)
+  bb_width_high_threshold: 0.12
+  bb_width_high_ratio: 0.5
+  high_vol_cap: 0.5

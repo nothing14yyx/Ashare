@@ -1,74 +1,37 @@
 # A股量化策略分析系统
 
-基于 Baostock 和 AkShare 的 A 股量化策略分析系统，提供数据采集、策略分析、开盘监测和风险控制等功能。
+基于 Baostock 与 AkShare 的 A 股量化分析平台，覆盖数据采集、指标加工、趋势策略与开盘监测，支持数据库自动建表与日常流水线化运行。
 
-## 项目概述
+## 项目概览
 
-本项目是一个综合性的 A 股量化分析平台，主要功能包括：
-
-- **数据采集**：从 Baostock 获取股票基础数据、日线数据、指数数据等
-- **策略分析**：实现 MA5-MA20 趋势策略、筹码筛选策略等
-- **开盘监测**：实时监测前一交易日信号在开盘时的执行可行性
-- **风险控制**：多维度风险评估和过滤机制
-- **数据库管理**：自动创建和维护策略相关的数据表结构
-
-## 核心功能
-
-### 1. 数据采集与预处理
-- 自动登录 Baostock 获取股票列表和日线数据
-- 支持历史数据批量拉取和增量更新
-- 提供流动性筛选和高流动性标的排序
-- 支持龙虎榜、两融、股东户数等行为数据采集
-
-### 2. 策略分析模块
-- **MA5-MA20 趋势策略**：基于均线交叉的顺势交易策略
-  - 多头排列趋势过滤
-  - MA5/MA20 金叉死叉信号
-  - 放量确认和 MACD 过滤
-  - KDJ 低位金叉增强信号
-- **筹码筛选策略**：基于股东户数变化的筹码集中度分析
-- **周线通道策略**：基于周线级别的趋势通道分析
-
-### 3. 开盘监测系统
-- 读取前一交易日收盘信号（BUY）
-- 结合实时行情进行二次过滤
-- 提供追高风险、破位风险、涨停风险等多维度评估
-- 输出可执行/不可执行清单
-
-### 4. 风险控制机制
-- 基本面风险评估（净利润、同比增长等）
-- 技术面风险控制（ATR止损、均线破位等）
-- 市场环境过滤（大盘趋势、情绪指标等）
-- 个股特殊风险（ST标签、妖股识别等）
+- **数据采集**：Baostock 日线/指数/基本面，AkShare 龙虎榜/两融/股东户数等行为数据
+- **指标与环境**：技术指标、日线市场环境、周线通道与市场状态
+- **策略执行**：MA5-MA20 趋势跟随（含量价与动量确认、回踩与形态判断等）
+- **开盘监测**：基于前一交易日信号的盘前/盘中执行评估（EXECUTE/WAIT/STOP）
+- **数据库管理**：Schema 自动创建与校验，保证表结构一致
 
 ## 项目结构
 
 ```
 AShare/
-├── ashare/                 # 核心模块（分包：core/data/indicators/strategies/monitor/utils）
-│   ├── core/              # 应用入口/配置/DB/表结构
-│   ├── data/              # 数据源与数据管理
-│   ├── indicators/        # 指标与市场环境
-│   ├── strategies/        # 策略与筛选
-│   ├── monitor/           # 开盘监测体系
-│   └── utils/             # 通用工具
-├── config.yaml            # 配置文件
-├── start.py              # 项目启动脚本
-├── scripts/              # 各功能模块运行脚本（run_*.py）
-├── requirements.txt       # 依赖包
-└── README.md             # 项目说明
+├── ashare/                 # 核心模块（core/data/indicators/strategies/monitor/utils）
+├── scripts/                # 日常流水线脚本（pipeline_*.py）
+├── docs/                   # 项目文档
+├── output/                 # 统一导出目录（日志/导出文件等）
+├── config.yaml             # 主配置文件
+├── requirements.txt        # 依赖包
+└── start.py                # 旧版入口（当前建议使用 scripts 流水线）
 ```
 
 ## 安装与配置
 
-### 1. 环境准备
+### 1. 安装依赖
 ```bash
-# 安装依赖
 pip install -r requirements.txt
 ```
 
 ### 2. 数据库配置
-项目默认使用 MySQL 数据库，可在 `config.yaml` 中配置：
+在 `config.yaml` 中配置 MySQL：
 
 ```yaml
 database:
@@ -80,7 +43,7 @@ database:
 ```
 
 ### 3. 代理配置（可选）
-如果需要通过代理访问网络，可在 `config.yaml` 中配置：
+如需代理网络：
 
 ```yaml
 proxy:
@@ -88,144 +51,60 @@ proxy:
   https: http://127.0.0.1:7890
 ```
 
-## 使用方法
+## 使用流程（推荐）
 
-### 1. 完整流程运行
+建议每日收盘后运行 Pipeline 1-3，次日交易时段运行 Pipeline 4。
+
 ```bash
-# 运行完整流程（数据采集 + 策略分析 + 开盘监测）
-python start.py
+# 1) 数据采集
+python -m scripts.pipeline_1_fetch_raw
+
+# 2) 指标处理（日线/周线/技术指标）
+python -m scripts.pipeline_2_process_indicators
+
+# 3) 策略扫描（趋势跟随）
+python -m scripts.pipeline_3_run_strategy
+
+# 4) 开盘/盘中执行监测
+python -m scripts.pipeline_4_execution_monitor
 ```
 
-### 2. 单独运行各模块
+如需定时执行开盘监测：
 
-说明：推荐使用 `python -m scripts.run_xxx` 运行；也可用 `python scripts/run_xxx.py`。
-
-#### 数据采集
 ```bash
-# 仅运行数据采集（股票列表、日线数据等）
-python -c "from ashare.app import AshareApp; AshareApp().run()"
+python -m scripts.run_open_monitor_scheduler
 ```
 
-#### MA5-MA20 策略
-```bash
-# 运行 MA5-MA20 趋势策略
-python -m scripts.run_ma5_ma20_trend_strategy
-```
+## 关键配置
 
-#### 筹码筛选
-```bash
-# 运行筹码筛选策略
-python -m scripts.run_chip_filter
-```
+### app
+- `app.output_dir`: 统一导出目录（默认 `output`）
+- `app.fetch_daily_kline`: 是否拉取/更新日线 K 线
+- `app.fetch_stock_meta`: 是否拉取股票元数据
 
-#### 开盘监测
-```bash
-# 运行开盘监测
-python -m scripts.run_open_monitor
+### strategy_ma5_ma20_trend
+- `enabled`: 是否启用 MA5-MA20 趋势策略
+- `universe_source`: 选股池来源（top_liquidity/universe/all）
+- `signals_write_scope`: 信号写入范围（latest/window）
 
-# 定时运行开盘监测（每5分钟一次）
-python -m scripts.run_open_monitor_scheduler --interval 5
-```
+### open_monitor
+- `quote_source`: 行情来源（eastmoney/akshare）
+- `signal_lookback_days`: 回看信号天数
+- `interval_minutes`: 调度间隔（供调度器/去重桶使用）
 
-#### 周线市场指标
-```bash
-# 运行周线市场指标分析
-python -m scripts.run_index_weekly_channel
-```
+## 核心表与视图
 
-#### 日线市场指标
-```bash
-# 运行日线市场指标分析
-python -m scripts.run_daily_market_indicator
-```
-
-#### 预开盘漏斗
-```bash
-# 运行预开盘漏斗分析
-python -m scripts.run_premarket_funnel
-```
-
-## 配置说明
-
-### 策略参数配置
-在 `config.yaml` 中可以配置各种策略参数：
-
-#### MA5-MA20 策略配置
-```yaml
-strategy_ma5_ma20_trend:
-  enabled: true
-  lookback_days: 300
-  volume_ratio_threshold: 1.5
-  pullback_band: 0.01
-  kdj_low_threshold: 30
-  signals_write_scope: window
-  valid_days: 3
-```
-
-#### 开盘监测配置
-```yaml
-open_monitor:
-  enabled: true
-  signal_lookback_days: 5
-  quote_source: eastmoney
-  max_gap_up_pct: 0.05
-  max_gap_down_pct: -0.03
-  min_open_vs_ma20_pct: 0.0
-  limit_up_trigger_pct: 9.7
-  write_to_db: true
-  incremental_write: true
-```
-
-### 数据库表结构
-系统自动管理以下核心数据表：
-
-- `a_share_stock_list`: 股票列表
-- `history_daily_kline`: 历史日线数据
-- `a_share_universe`: 股票池（已过滤ST、退市等）
-- `strategy_indicator_daily`: 策略指标数据
+- `history_daily_kline`: 日线 K 线历史
+- `strategy_indicator_daily`: 日线指标
 - `strategy_signal_events`: 策略信号事件
-- `strategy_ready_signals`: 策略准备就绪信号
-- `strategy_chip_filter`: 筹码筛选数据
+- `strategy_ready_signals`（视图）: 可执行信号视图
 - `strategy_open_monitor_eval`: 开盘监测评估结果
-- `strategy_open_monitor_quote`: 开盘监测行情数据
-
-## 策略逻辑
-
-### MA5-MA20 趋势策略
-1. **趋势过滤**：多头排列（close > MA60 > MA250，MA20 > MA60 > MA250）
-2. **买入信号**：
-   - MA5 上穿 MA20（金叉）+ 放量 + MACD 确认
-   - 趋势回踩 MA20 + MA5 向上 + MACD 确认
-   - MACD 柱翻红确认
-   - W 底突破确认
-3. **卖出信号**：
-   - MA5 下穿 MA20（死叉）
-   - 跌破 MA20 且放量
-   - MACD 柱翻绿
-
-### 开盘监测逻辑
-1. 读取前一交易日的 BUY 信号
-2. 获取实时开盘行情
-3. 多维度过滤：
-   - 高开过多（追高风险）
-   - 低开破位（跌破 MA20）
-   - 涨停（买不到）
-4. 输出执行建议（EXECUTE/WAIT/STOP）
 
 ## 注意事项
 
-1. **网络环境**：项目依赖 Baostock 和 AkShare 接口，需要稳定的网络连接
-2. **数据更新**：建议在交易日结束后运行数据采集，确保数据完整性
-3. **策略参数**：可根据市场环境和个人偏好调整策略参数
-4. **风险提示**：所有策略仅供研究参考，不构成投资建议
-
-## 扩展功能
-
-项目设计具有良好的扩展性，可以方便地添加：
-- 新的量化策略
-- 其他数据源
-- 更多风险控制指标
-- 自定义信号评估逻辑
+- 输出文件统一在根目录 `output/`，该目录已加入 `.gitignore`。
+- 数据采集建议在交易日收盘后执行，保证数据完整性。
+- 运行脚本请保持在项目根目录，优先使用 `python -m scripts.xxx`。
 
 ## 许可证
 

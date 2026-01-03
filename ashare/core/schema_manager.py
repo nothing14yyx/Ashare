@@ -1264,6 +1264,12 @@ class SchemaManager:
             "limit_up_cnt_20": "DOUBLE NULL",
             "ma20_bias": "DOUBLE NULL",
             "yearline_state": "VARCHAR(50) NULL",
+            "bull_engulf": "TINYINT(1) NULL",
+            "bear_engulf": "TINYINT(1) NULL",
+            "engulf_body_atr": "DOUBLE NULL",
+            "engulf_score": "DOUBLE NULL",
+            "engulf_stop_ref": "DOUBLE NULL",
+            "one_word_limit_up": "TINYINT(1) NULL",
         }
         if not self._table_exists(table):
             self._create_table(table, columns, primary_key=("trade_date", "code"))

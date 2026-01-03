@@ -16,15 +16,22 @@ def query_db(sql_query: str, limit: int = 20):
         
         # 简单的安全检查：如果是 SELECT 且没有 LIMIT，自动加上 LIMIT
         sql_lower = sql_query.lower().strip()
+        read_prefixes = ("select", "show", "describe", "explain")
+        is_read_query = sql_lower.startswith(read_prefixes)
         if sql_lower.startswith("select") and "limit" not in sql_lower and "count" not in sql_lower:
             sql_query += f" LIMIT {limit}"
-            
-        with db.engine.connect() as conn:
-            df = pd.read_sql(text(sql_query), conn)
-            
-        # 日期格式化为 ISO 字符串，处理 NaN
-        result = df.to_json(orient="records", date_format="iso", force_ascii=False)
-        print(result)
+
+        if is_read_query:
+            with db.engine.connect() as conn:
+                df = pd.read_sql(text(sql_query), conn)
+
+            # 日期格式化为 ISO 字符串，处理 NaN
+            result = df.to_json(orient="records", date_format="iso", force_ascii=False)
+            print(result)
+        else:
+            with db.engine.begin() as conn:
+                result = conn.execute(text(sql_query))
+            print(json.dumps({"status": "ok", "rows_affected": result.rowcount}, ensure_ascii=False))
         
     except Exception as e:
         # 输出标准 JSON 错误格式，方便 AI 解析

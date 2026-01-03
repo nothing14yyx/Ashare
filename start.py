@@ -5,16 +5,17 @@ import json
 import logging
 from pathlib import Path
 
+import pandas as pd
 from sqlalchemy import text
 
 from ashare.core.app import AshareApp
 from ashare.strategies.trend_following_strategy import TrendFollowingStrategyRunner
 from ashare.monitor.open_monitor import MA5MA20OpenMonitorRunner
-from ashare.core.schema_manager import ensure_schema
+from ashare.core.schema_manager import ensure_schema, STRATEGY_CODE_MA5_MA20_TREND
 from ashare.utils.logger import setup_logger
-from scripts.run_index_weekly_channel import run_weekly_market_indicator
-from scripts.run_chip_filter import main as run_chip_filter
-from scripts.run_daily_market_indicator import run_daily_market_indicator
+from ashare.indicators.market_indicator_runner import MarketIndicatorRunner
+from ashare.indicators.market_indicator_builder import MarketIndicatorBuilder
+from ashare.strategies.chip_filter import ChipFilter
 
 
 def _parse_asof_date(raw: str | None) -> str | None:
@@ -167,11 +168,70 @@ def main(
     ready_view = str(params.ready_signals_view or "").strip() or None
     signal_table = str(getattr(strategy_runner.params, "signal_events_table", "") or "").strip()
 
+    def _build_indicator_runner() -> MarketIndicatorRunner:
+        monitor_runner = MA5MA20OpenMonitorRunner()
+        builder = MarketIndicatorBuilder(
+            env_builder=monitor_runner.env_builder,
+            logger=monitor_runner.logger,
+        )
+        return MarketIndicatorRunner(
+            repo=monitor_runner.repo,
+            builder=builder,
+            logger=monitor_runner.logger,
+        )
+
+    def _run_daily_market_indicator(*, start_date: str | None, end_date: str | None, mode: str) -> dict:
+        runner = _build_indicator_runner()
+        return runner.run_daily_indicator(start_date=start_date, end_date=end_date, mode=mode)
+
+    def _run_weekly_market_indicator(*, start_date: str | None, end_date: str | None, mode: str) -> dict:
+        runner = _build_indicator_runner()
+        return runner.run_weekly_indicator(start_date=start_date, end_date=end_date, mode=mode)
+
+    def _run_chip_filter() -> int:
+        repo = monitor_runner.repo
+        table = strategy_runner.params.signal_events_table
+        latest_date = _resolve_latest_sig_date(repo, table, STRATEGY_CODE_MA5_MA20_TREND)
+        if not latest_date:
+            logger.warning("chip filter skipped: no latest sig_date.")
+            return 0
+        stmt = text(
+            f"""
+            SELECT
+              e.`sig_date`,
+              e.`code`,
+              e.`signal`,
+              e.`final_action`,
+              e.`risk_tag`,
+              ind.`close`,
+              ind.`ma20`,
+              ind.`vol_ratio`,
+              ind.`atr14`,
+              ind.`macd_hist`,
+              ind.`kdj_k`,
+              ind.`rsi14`,
+              ind.`ma20_bias`,
+              ind.`yearline_state`
+            FROM `{table}` e
+            LEFT JOIN `{strategy_runner.params.indicator_table}` ind
+              ON ind.`trade_date` = e.`sig_date` AND ind.`code` = e.`code`
+            WHERE e.`strategy_code` = :strategy AND e.`sig_date` = :d
+            """
+        )
+        with repo.engine.begin() as conn:
+            sig_df = pd.read_sql(stmt, conn, params={"strategy": STRATEGY_CODE_MA5_MA20_TREND, "d": latest_date})
+        if sig_df.empty:
+            logger.warning("chip filter skipped: empty signals at %s", latest_date)
+            return 0
+        chip = ChipFilter()
+        result = chip.apply(sig_df)
+        return int(len(result))
+
     # 执行日线市场指标计算
     daily_indicator_status: dict = {"written": 0}
     if not skip_daily_indicator:
         try:
-            daily_indicator_status = run_daily_market_indicator(
+            daily_indicator_status = _run_daily_market_indicator(
                 start_date=asof_date,
                 end_date=asof_date,
                 mode="incremental",
@@ -183,7 +243,7 @@ def main(
     chip_filter_status: dict = {"processed": 0}
     if not skip_chip:
         try:
-            chip_filter_status["processed"] = run_chip_filter()
+            chip_filter_status["processed"] = _run_chip_filter()
         except Exception as exc:  # noqa: BLE001
             logger.warning("start chip filter failed: %s", exc)
 
@@ -192,7 +252,7 @@ def main(
     if not skipped_weekly:
         asof_date = _parse_asof_date(asof_date)
         try:
-            weekly_status = run_weekly_market_indicator(
+            weekly_status = _run_weekly_market_indicator(
                 start_date=asof_date,
                 end_date=asof_date,
                 mode="incremental",

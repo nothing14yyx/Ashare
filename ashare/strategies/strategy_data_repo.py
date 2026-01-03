@@ -150,10 +150,55 @@ class StrategyDataRepository:
 
         start_date = latest_date - dt.timedelta(days=lookback * 2) # 留出足够的日历日
         
+        select_cols = [
+            "trade_date",
+            "code",
+            "close",
+            "volume",
+            "ma5",
+            "ma20",
+            "ma60",
+            "ma250",
+            "atr14",
+            "rsi14",
+            "macd_hist",
+            "vol_ratio",
+            "ma20_bias",
+            "bull_engulf",
+            "bear_engulf",
+            "engulf_body_atr",
+            "engulf_score",
+            "engulf_stop_ref",
+            "one_word_limit_up",
+        ]
+        existing_cols: set[str] = set()
+        try:
+            with self.db_writer.engine.begin() as conn:
+                rows = conn.execute(
+                    text(
+                        """
+                        SELECT COLUMN_NAME
+                        FROM information_schema.COLUMNS
+                        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = :table
+                        """
+                    ),
+                    {"table": table},
+                ).fetchall()
+            existing_cols = {str(row[0]) for row in rows}
+        except Exception as exc:  # noqa: BLE001
+            self.logger.warning("读取指标表字段失败，将尝试按默认列读取：%s", exc)
+
+        if existing_cols:
+            select_cols = [col for col in select_cols if col in existing_cols]
+        if "trade_date" not in select_cols or "code" not in select_cols:
+            self.logger.warning("指标表缺少必要字段，已跳过读取。")
+            return pd.DataFrame()
+
+        cols_sql = ", ".join(f"`{col}`" for col in select_cols)
         stmt = (
             text(
                 f"""
-                SELECT *
+                SELECT {cols_sql}
                 FROM `{table}`
                 WHERE `code` IN :codes AND `trade_date` BETWEEN :start_date AND :latest_date
                 ORDER BY `code`, `trade_date`

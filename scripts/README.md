@@ -7,7 +7,7 @@
 | 顺序 | 脚本名称 | 阶段 | 核心任务 |
 | :--- | :--- | :--- | :--- |
 | 1 | `pipeline_1_fetch_raw.py` | **数据准备** | 从 Baostock/AkShare 抓取原始日线、基本面、龙虎榜等数据存入历史表。 |
-| 2 | `pipeline_2_process_indicators.py` | **数据处理** | 基于历史数据计算全市场指标、大盘周线环境、板块轮动状态。 |
+| 2 | `pipeline_2_process_indicators.py` | **数据处理** | 基于历史数据计算全市场指标，先周线后日线环境，并补齐板块轮动状态。 |
 | 3 | `pipeline_3_run_strategy.py` | **策略运行** | 扫描 Universe，应用 MA5-MA20 策略生成买卖信号，并预计算筹码分数。 |
 | 4 | `pipeline_4_execution_monitor.py` | **实盘监控** | 结合实时行情（Snapshot）对信号进行临场评估，给出最终执行建议。 |
 

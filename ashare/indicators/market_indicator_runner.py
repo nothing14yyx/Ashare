@@ -54,7 +54,14 @@ class MarketIndicatorRunner:
         # 使用 OpenMonitorDataRepository 加载全量日线
         from ashare.data.universe import AshareUniverseBuilder
         # 这里复用 app 的逻辑或直接查表
-        stmt_k = text("SELECT * FROM history_daily_kline WHERE code IN :codes AND date BETWEEN :s AND :e")
+        select_cols = "`date`,`code`,`open`,`high`,`low`,`close`,`preclose`,`volume`,`amount`"
+        stmt_k = text(
+            f"""
+            SELECT {select_cols}
+            FROM history_daily_kline
+            WHERE code IN :codes AND date BETWEEN :s AND :e
+            """
+        )
         with self.repo.engine.connect() as conn:
             df_k = pd.read_sql(stmt_k.bindparams(bindparam("codes", expanding=True)), 
                                conn, params={"codes": codes, "s": start_dt.isoformat(), "e": latest_date})

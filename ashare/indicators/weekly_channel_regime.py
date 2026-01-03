@@ -178,6 +178,12 @@ class WeeklyChannelClassifier:
         near_ma_eps: float = 0.01,
         ma_fast: int = 30,
         ma_slow: int = 60,
+        breakout_vol_ratio_threshold: float = 1.2,
+        breakdown_vol_weak_threshold: float = 0.9,
+        slope_change_ratio_threshold: float = 0.002,
+        bandwidth_lookback: int = 104,
+        bandwidth_high_quantile: float = 0.9,
+        bandwidth_cap: float = 0.4,
         primary_code: str = "sh.000001",
     ) -> None:
         self.lrc_length = max(int(lrc_length), 2)
@@ -187,6 +193,12 @@ class WeeklyChannelClassifier:
         self.near_ma_eps = float(near_ma_eps)
         self.ma_fast = max(int(ma_fast), 1)
         self.ma_slow = max(int(ma_slow), 1)
+        self.breakout_vol_ratio_threshold = float(breakout_vol_ratio_threshold)
+        self.breakdown_vol_weak_threshold = float(breakdown_vol_weak_threshold)
+        self.slope_change_ratio_threshold = float(slope_change_ratio_threshold)
+        self.bandwidth_lookback = max(int(bandwidth_lookback), 5)
+        self.bandwidth_high_quantile = float(bandwidth_high_quantile)
+        self.bandwidth_cap = float(bandwidth_cap)
         self.primary_code = str(primary_code or "").strip() or "sh.000001"
 
     @staticmethod
@@ -215,6 +227,7 @@ class WeeklyChannelClassifier:
         low = float(last.get("low")) if pd.notna(last.get("low")) else None
         upper = float(last.get("lrc_upper")) if pd.notna(last.get("lrc_upper")) else None
         lower = float(last.get("lrc_lower")) if pd.notna(last.get("lrc_lower")) else None
+        center = float(last.get("lrc_center")) if pd.notna(last.get("lrc_center")) else None
         slope = float(last.get("lrc_slope")) if pd.notna(last.get("lrc_slope")) else None
         ma30 = float(last.get("ma30")) if pd.notna(last.get("ma30")) else None
         ma60 = float(last.get("ma60")) if pd.notna(last.get("ma60")) else None
@@ -260,11 +273,19 @@ class WeeklyChannelClassifier:
         )
 
         if upper is not None and close is not None and close > upper:
-            state = "CHANNEL_BREAKOUT_UP"
-            note = "周收盘价上破通道上轨"
+            if wk_vol_ratio_20 is not None and wk_vol_ratio_20 < self.breakout_vol_ratio_threshold:
+                state = "BREAKOUT_UP_WEAK"
+                note = "上破上轨但量能不足（疑似诱多）"
+            else:
+                state = "CHANNEL_BREAKOUT_UP"
+                note = "周收盘价上破通道上轨"
         elif lower is not None and close is not None and close < lower:
-            state = "CHANNEL_BREAKDOWN"
-            note = "周收盘价跌破通道下轨"
+            if wk_vol_ratio_20 is not None and wk_vol_ratio_20 < self.breakdown_vol_weak_threshold:
+                state = "BREAKDOWN_WEAK"
+                note = "跌破下轨但量能萎缩（疑似挖坑）"
+            else:
+                state = "CHANNEL_BREAKDOWN"
+                note = "周收盘价跌破通道下轨"
         elif near_lower and near_ma30:
             state = "LOWER_RAIL_NEAR_MA30_ZONE"
             note = "触及/接近下轨且在30周线附近（反弹观察区）"
@@ -285,14 +306,22 @@ class WeeklyChannelClassifier:
             "LOWER_RAIL_NEAR_MA30_ZONE": 0.4,
             "EXTREME_NEAR_MA60_ZONE": 0.2,
             "CHANNEL_BREAKDOWN": 0.0,
+            "BREAKOUT_UP_WEAK": 0.5,
+            "BREAKDOWN_WEAK": 0.1,
         }
 
         position_hint = chan_pos_clamped
         if state == "CHANNEL_BREAKOUT_UP":
             base = position_hint_map.get(state)
             position_hint = base if position_hint is None else max(position_hint, base)
+        elif state == "BREAKOUT_UP_WEAK":
+            base = position_hint_map.get(state)
+            position_hint = base if position_hint is None else min(position_hint, base)
         elif state == "CHANNEL_BREAKDOWN":
             position_hint = 0.0
+        elif state == "BREAKDOWN_WEAK":
+            base = position_hint_map.get(state)
+            position_hint = base if position_hint is None else min(position_hint, base)
         elif state == "EXTREME_NEAR_MA60_ZONE":
             position_hint = 0.3 if position_hint is None else min(position_hint, 0.3)
         elif state == "LOWER_RAIL_NEAR_MA30_ZONE":
@@ -310,6 +339,40 @@ class WeeklyChannelClassifier:
             except Exception:
                 week_end_str = str(week_end)[:10]
 
+        slope_change_ratio = None
+        if slope_change_4w is not None and close not in (None, 0):
+            slope_change_ratio = float(slope_change_4w) / float(close)
+        if slope_change_ratio is not None and abs(slope_change_ratio) >= self.slope_change_ratio_threshold:
+            if slope_change_ratio < 0:
+                position_hint = (
+                    min(position_hint, 0.4) if position_hint is not None else 0.4
+                )
+                note = f"{note};斜率转弱"
+            else:
+                position_hint = (
+                    max(position_hint, 0.6) if position_hint is not None else 0.6
+                )
+                note = f"{note};斜率转强"
+
+        bandwidth_pct = None
+        if center not in (None, 0) and upper is not None and lower is not None:
+            bandwidth_pct = (upper - lower) / abs(center)
+        if bandwidth_pct is not None and "bandwidth_pct" not in wk.columns:
+            wk["bandwidth_pct"] = (wk["lrc_upper"] - wk["lrc_lower"]) / wk["lrc_center"].replace(0, np.nan)
+        if "bandwidth_pct" in wk.columns and wk["bandwidth_pct"].notna().any():
+            recent = wk["bandwidth_pct"].tail(self.bandwidth_lookback).dropna()
+            if not recent.empty:
+                try:
+                    high_band = float(np.nanpercentile(recent.to_numpy(), self.bandwidth_high_quantile * 100.0))
+                except Exception:
+                    high_band = None
+                if high_band is not None and bandwidth_pct is not None and bandwidth_pct >= high_band:
+                    if position_hint is None:
+                        position_hint = self.bandwidth_cap
+                    else:
+                        position_hint = min(position_hint, self.bandwidth_cap)
+                    note = f"{note};波动率过高降仓"
+
         return {
             "week_end": week_end_str,
             "close": close,
@@ -319,6 +382,8 @@ class WeeklyChannelClassifier:
             "chan_lower": lower,
             "chan_slope": slope,
             "chan_pos": chan_pos,
+            "chan_center": center,
+            "chan_bandwidth_pct": bandwidth_pct,
             "high": high,
             "low": low,
             "wk_volume": volume,

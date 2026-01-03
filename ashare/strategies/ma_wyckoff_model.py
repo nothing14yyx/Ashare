@@ -10,6 +10,14 @@ ACTION_REDUCE = "REDUCE"         # 减仓 (量价顶背离/动能衰竭)
 ACTION_SELL = "SELL"             # 清仓 (均线死叉/破位)
 ACTION_HOLD = "HOLD"             # 持有
 
+WYCKOFF_SCORE_MAP = {
+    ACTION_BUY_STRONG: 2.0,
+    ACTION_BUY_LIGHT: 1.0,
+    ACTION_REDUCE: -1.0,
+    ACTION_SELL: -2.0,
+    ACTION_HOLD: 0.0,
+}
+
 def calculate_ma(series: pd.Series, window: int) -> pd.Series:
     """简单移动平均 (SMA)"""
     return series.rolling(window=window).mean()
@@ -153,3 +161,11 @@ class MAWyckoffStrategy:
 
         return df
 
+    def build_factors(self, df: pd.DataFrame) -> pd.DataFrame:
+        """输出可被趋势策略消费的 wyckoff_confirm / wyckoff_score。"""
+        if df.empty:
+            return df
+        out = self.run(df)
+        out["wyckoff_score"] = out["action"].map(WYCKOFF_SCORE_MAP).fillna(0.0)
+        out["wyckoff_confirm"] = out["action"].isin([ACTION_BUY_STRONG])
+        return out

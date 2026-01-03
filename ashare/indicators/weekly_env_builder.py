@@ -14,6 +14,7 @@ from ashare.data.baostock_core import BaostockDataFetcher
 from ashare.data.baostock_session import BaostockSession
 from ashare.indicators.market_regime import MarketRegimeClassifier
 from ashare.core.schema_manager import WEEKLY_MARKET_BENCHMARK_CODE
+from ashare.core.config import get_section
 from ashare.utils.convert import to_float
 from ashare.indicators.weekly_channel_regime import WeeklyChannelClassifier
 from ashare.indicators.weekly_pattern_system import WeeklyPlanSystem
@@ -43,7 +44,53 @@ class WeeklyEnvironmentBuilder:
 
         self.market_regime = MarketRegimeClassifier()
         self.benchmark_code = WEEKLY_MARKET_BENCHMARK_CODE
-        self.weekly_channel = WeeklyChannelClassifier(primary_code=self.benchmark_code)
+        channel_cfg = get_section("weekly_env") or {}
+        if not isinstance(channel_cfg, dict):
+            channel_cfg = {}
+
+        def _get_float(key: str, default: float) -> float:
+            raw = channel_cfg.get(key, default)
+            try:
+                return float(raw)
+            except Exception:
+                return float(default)
+
+        def _get_int(key: str, default: int) -> int:
+            raw = channel_cfg.get(key, default)
+            try:
+                return int(raw)
+            except Exception:
+                return int(default)
+
+        def _get_str(key: str, default: str) -> str:
+            raw = channel_cfg.get(key, default)
+            return str(raw).strip() or str(default)
+
+        def _get_bool(key: str, default: bool) -> bool:
+            raw = channel_cfg.get(key, default)
+            if isinstance(raw, bool):
+                return raw
+            if isinstance(raw, str):
+                return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+            return bool(raw)
+
+        self.weekly_channel = WeeklyChannelClassifier(
+            primary_code=self.benchmark_code,
+            lrc_length=_get_int("lrc_length", 52),
+            lrc_dev=_get_float("lrc_dev", 2.0),
+            ma_fast=_get_int("ma_fast", 30),
+            ma_slow=_get_int("ma_slow", 60),
+            breakout_vol_ratio_threshold=_get_float("breakout_vol_ratio_threshold", 1.2),
+            breakdown_vol_weak_threshold=_get_float("breakdown_vol_weak_threshold", 0.9),
+            slope_change_ratio_threshold=_get_float("slope_change_ratio_threshold", 0.002),
+            bandwidth_lookback=_get_int("bandwidth_lookback", 104),
+            bandwidth_high_quantile=_get_float("bandwidth_high_quantile", 0.9),
+            bandwidth_cap=_get_float("bandwidth_cap", 0.4),
+        )
+        self.conflict_requires_vol_confirm = _get_bool(
+            "conflict_requires_vol_confirm", True
+        )
+        self.conflict_gate = _get_str("conflict_gate", "ALLOW_SMALL").upper() or "ALLOW_SMALL"
         self.weekly_plan_system = WeeklyPlanSystem()
 
         self._calendar_cache: set[str] = set()
@@ -786,6 +833,9 @@ class WeeklyEnvironmentBuilder:
         weekly_phase = str(_get_env("weekly_phase") or "").upper()
         weekly_tags = str(_get_env("weekly_tags") or "")
         weekly_risk_score = to_float(_get_env("weekly_risk_score"))
+        weekly_state = str(_get_env("weekly_state") or "").upper()
+        weekly_scene_code = str(_get_env("weekly_scene_code") or "").upper()
+        daily_regime = str(_get_env("regime") or "").upper()
 
         if not gating_enabled:
             return "ALLOW"
@@ -820,6 +870,58 @@ class WeeklyEnvironmentBuilder:
 
         if "VOL_WEAK" in weekly_tags and risk_level != "LOW":
             baseline_gate = _tighten(baseline_gate, "ALLOW_SMALL")
+
+        if risk_level == "HIGH" and baseline_gate == "WAIT":
+            baseline_gate = "ALLOW_SMALL"
+
+        def _channel_bias(state: str) -> str:
+            if state in {"CHANNEL_BREAKOUT_UP"}:
+                return "BULL"
+            if state in {"BREAKOUT_UP_WEAK"}:
+                return "BULL_WEAK"
+            if state in {"CHANNEL_BREAKDOWN"}:
+                return "BEAR"
+            if state in {"BREAKDOWN_WEAK"}:
+                return "BEAR_WEAK"
+            return "NEUTRAL"
+
+        def _pattern_bias(phase: str) -> str:
+            phase_norm = str(phase or "").upper()
+            if phase_norm in {"BULL_TREND"}:
+                return "BULL"
+            if phase_norm in {"BEAR_TREND", "BREAKDOWN_RISK"}:
+                return "BEAR"
+            return "NEUTRAL"
+
+        channel_bias = _channel_bias(weekly_state)
+        pattern_bias = _pattern_bias(weekly_phase)
+        vol_confirmed = "VOL_CONFIRM" in weekly_tags
+
+        # 冲突裁决：通道/形态方向不一致时，强制要求量能确认，否则降级 gate
+        conflict_gate = self.conflict_gate or "ALLOW_SMALL"
+        if (
+            channel_bias.startswith("BULL")
+            and pattern_bias == "BEAR"
+            and (not vol_confirmed or not self.conflict_requires_vol_confirm)
+        ):
+            baseline_gate = _tighten(baseline_gate, conflict_gate)
+        if (
+            channel_bias.startswith("BEAR")
+            and pattern_bias == "BULL"
+            and (not vol_confirmed or not self.conflict_requires_vol_confirm)
+        ):
+            baseline_gate = _tighten(baseline_gate, conflict_gate)
+        if channel_bias == "BULL_WEAK" and (not vol_confirmed or not self.conflict_requires_vol_confirm):
+            baseline_gate = _tighten(baseline_gate, conflict_gate)
+        if channel_bias == "BEAR_WEAK" and pattern_bias != "BEAR":
+            baseline_gate = _tighten(baseline_gate, conflict_gate)
+
+        if weekly_state in {"NEAR_LOWER_RAIL", "LOWER_RAIL_NEAR_MA30_ZONE"} and daily_regime in {
+            "RISK_OFF",
+            "BREAKDOWN",
+            "BEAR_CONFIRMED",
+        }:
+            baseline_gate = _tighten(baseline_gate, "WAIT")
 
         return baseline_gate
 
@@ -870,7 +972,7 @@ class WeeklyEnvironmentBuilder:
         # Risk (weekly) x Emotion (daily regime) matrix.
         matrix = {
             "HIGH": {
-                "RISK_ON": ("WAIT", 0.15, "HIGH_RISK_RISK_ON"),
+                "RISK_ON": ("ALLOW_SMALL", 0.15, "HIGH_RISK_RISK_ON"),
                 "PULLBACK": ("WAIT", 0.15, "HIGH_RISK_PULLBACK"),
                 "RISK_OFF": ("STOP", 0.0, "HIGH_RISK_RISK_OFF"),
                 "BREAKDOWN": ("STOP", 0.0, "HIGH_RISK_BREAKDOWN"),
@@ -974,6 +1076,10 @@ class WeeklyEnvironmentBuilder:
         if weekly_gate_policy:
             gate_norm = str(weekly_gate_policy).strip().upper()
             reason_parts["weekly_gate_policy"] = gate_norm
+        weekly_risk_level = str(env_context.get("weekly_risk_level") or "").strip().upper()
+        if gate_norm == "WAIT" and weekly_risk_level == "HIGH":
+            gate_norm = "ALLOW_SMALL"
+            reason_parts["weekly_gate_policy_override"] = "ALLOW_SMALL"
 
         index_gate_norm = None
         index_snapshot = env_context.get("index_intraday")
@@ -1087,7 +1193,6 @@ class WeeklyEnvironmentBuilder:
             if final_cap > cap_limit:
                 final_cap = cap_limit
                 reason_parts["gate_cap_limit"] = f"RISK_EMOTION_{cap_limit:.2f}"
-        weekly_risk_level = str(env_context.get("weekly_risk_level") or "").strip().upper()
         weekly_scene = str(
             env_context.get("weekly_scene_code") or env_context.get("weekly_scene") or ""
         ).strip().upper()
