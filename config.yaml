@@ -1,0 +1,283 @@
+
+logging:
+  # 日志级别（DEBUG/INFO/WARNING/ERROR 或数字），默认 INFO；
+  # 也可通过环境变量 ASHARE_LOG_LEVEL 覆盖。
+  level: INFO
+  # 控制台输出级别（默认沿用 level）
+  console_level: INFO
+  # 文件输出级别（默认沿用 level）
+  file_level: INFO
+
+app:
+  # 输出目录（AshareApp.output_dir）
+  output_dir: output
+  # 是否拉取/增量更新日线K线数据（history_daily_kline）
+  # true：会调用 Baostock K 线接口进行冷启动/增量更新
+  # false：不请求 Baostock K 线接口，只从数据库表切片读取
+  #       （要求 history_daily_kline 表已存在且非空）
+  fetch_daily_kline: true
+
+  # 是否导出股票元数据（股票列表/证券基本资料/行业分类/指数成分股）
+  # true：会调用 Baostock 元数据接口更新 a_share_stock_list/a_share_stock_basic/a_share_stock_industry/index_*_members
+  # false：不请求 Baostock 元数据接口，只从数据库读取（要求相关表已存在，或至少存在 history_daily_kline 用于兜底）
+  fetch_stock_meta: true
+
+  # 最近 N 个交易日窗口
+  history_days: 600
+
+  # 近期自然日视图窗口（仅用于你手动查询近期数据方便）
+  # - 会创建/刷新视图：history_recent_{history_view_days}_days
+  # - 与 history_days 解耦；history_days 仍用于程序内部计算窗口
+  # - 设为 0 则不创建视图
+  history_view_days: 45
+  # 流动性排序时保留的股票数量
+  top_liquidity_count: 100
+  # 最少上市天数过滤阈值
+  min_listing_days: 60
+  # 是否在每次运行时刷新 Baostock 季频财务数据（非常耗时）
+  # true：每次运行都会打 Baostock 接口，更新 fundamentals_quarter_* 表
+  # false：只使用数据库中已有的财务表，直接拼接 fundamentals_latest_wide
+  refresh_fundamentals: false
+
+  # 是否拉取常用指数日线数据（用于大盘趋势过滤）
+  fetch_index_kline: true
+  index_codes:
+    - sh.000001
+    - sh.000300
+    - sh.000905
+    - sz.399001
+    - sz.399006
+  index_history_days: 900
+
+  # 是否创建/更新股票-行业维表（基于 query_stock_industry）
+  build_stock_industry_dim: true
+
+database:
+  host: 127.0.0.1
+  port: 3306
+  user: root
+  password: ""
+  db_name: ashare
+  # SQLAlchemy 连接池配置，避免频繁创建连接
+  pool_size: 5
+  max_overflow: 10
+  pool_recycle: 1800
+  pool_timeout: 30
+
+proxy:
+  http: http://127.0.0.1:7890
+  https: http://127.0.0.1:7890
+
+baostock:
+  # Baostock 登录失败时的重试次数与间隔（秒）
+  retry: 3
+  retry_sleep: 3.0
+  # Socket 超时（秒），防止底层网络调用无限等待
+  socket_timeout: 30
+  # 登录状态保活探测间隔（秒），避免高频心跳导致频繁登录
+  keepalive_interval: 60
+  # 单只股票拉取的子进程超时时间（秒）
+  per_code_timeout: 30
+  # 单只股票最大尝试次数
+  max_retries: 2
+  # 断点续跑判定：每只股票满足最少行数后视为已完成
+  resume_min_rows_per_code: 200
+  # 并发控制：默认/最小/最大子进程数以及网络带宽上限
+  worker_processes: 1
+  min_worker_processes: 1
+  max_worker_processes: 8
+  network_worker_cap: 1
+  # 进度日志与批量写入配置
+  progress_log_every: 100
+  history_flush_batch: 5
+  history_write_chunksize: 500
+  # 清理策略：window=仅清理当前批次区间，skip=直接追加；history_retention_days>0 时会按窗口定期清理
+  history_cleanup_mode: window
+  history_retention_days: 0
+
+akshare:
+  enabled: true
+  lhb:
+    enabled: true
+  margin:
+    enabled: true
+    exchanges:
+      - sse
+      - szse
+  gdhs:
+    enabled: true
+    period: ""
+    detail_enabled: true
+    detail_top_n: 100
+
+  board_industry:
+    enabled: true
+    spot_enabled: true
+    hist_enabled: true
+    history_days: 300
+    adjust: hfq
+    build_stock_board_dim: true
+
+# MA5-MA20 顺势趋势波段系统
+# - enabled: true 时会在 start.py 数据采集后自动运行，默认写入 signals 表并创建 candidates 视图
+strategy_ma5_ma20_trend:
+  enabled: true
+  # 选股池来源：top_liquidity（推荐，低频）/ universe / all
+  universe_source: top_liquidity
+  # 与 app.history_days 对齐（默认 365）
+  lookback_days: 300
+
+  volume_ratio_threshold: 1.5
+  volume_ma_window: 5
+  # 低信号保护：base_buy 过少时降仓但不归零
+  min_signals: 3
+  min_signals_cap_scale: 0.5
+
+  pullback_band: 0.02
+  # NEAR_SIGNAL: close around MA20
+  near_ma20_band: 0.02
+  # NEAR_SIGNAL: cross-up gap band (ma5 below ma20 but close)
+  near_cross_gap_band: 0.005
+  # NEAR_SIGNAL: require macd_hist > 0
+  near_signal_macd_required: false
+  kdj_low_threshold: 30
+  # BUY_CONFIRM: require MA5 >= MA20
+  buy_confirm_require_ma5_ge_ma20: true
+
+  # 高位滞涨阈值（风险提示/卖出）
+  stagnation_vol_ratio_threshold: 2.0
+  stagnation_pct_abs_threshold: 0.01
+  stagnation_ma20_bias_threshold: 0.1
+
+  # 吞没形态软因子阈值
+  engulf_body_atr_threshold: 0.6
+  engulf_vol_ratio_threshold: 1.2
+  engulf_near_ma20_band: 0.02
+  engulf_score_weight: 0.3
+  engulf_risk_ma20_bias_threshold: 0.06
+
+  # Wyckoff 软因子
+  wyckoff_enabled: true
+  wyckoff_confirm_min_score: 1.0
+  wyckoff_score_weight: 0.5
+
+  # 软确认回看窗口（避免当日信号稀疏）
+  soft_confirm_lookback_days: 10
+  soft_confirm_cap_scale: 0.5
+  # 质量分拦截与降级
+  quality_stop_threshold: -3.0
+  quality_soft_threshold: -1.0
+  quality_soft_cap_scale: 0.7
+
+  # 一字涨停阈值（HardGate）
+  one_word_limit_up_pct: 0.095
+
+  indicator_table: strategy_indicator_daily
+  signal_events_table: strategy_signal_events
+
+  # signals 写入范围：latest=仅最新交易日（默认），window=回填本次计算窗口内全部交易日
+  signals_write_scope: window
+  signals_write_batch_days: 5
+  signals_write_window_days: 10
+  # 信号有效期（交易日口径）
+  valid_days: 3
+
+# 开盘监测：检查“前一交易日收盘 BUY 信号”是否可在今日开盘执行
+open_monitor:
+  enabled: true
+  # 以下两项仅供 SchemaManager 生成 ready_signals_view 时使用（open_monitor 运行时不直接读取这些表）
+  # signal_events_table 默认沿用 strategy_ma5_ma20_trend.signal_events_table，可显式覆盖
+  # indicator_table 默认沿用 strategy_ma5_ma20_trend.indicator_table（用于补齐 close/ma*/atr 等指标列）
+  # signal_events_table: strategy_signal_events
+  # indicator_table: strategy_indicator_daily
+  quote_table: strategy_open_monitor_quote
+  output_table: strategy_open_monitor_eval
+  minute_table: strategy_open_monitor_minute
+  # 指数代码与回看窗口
+  index_code: sh.000001
+  index_hist_lookback_days: 250
+
+  # 回看近 N 个交易日的 BUY 信号作为候选
+  signal_lookback_days: 5
+
+  # 行情来源：akshare / eastmoney（路线A：建议固定 eastmoney，避免 AkShare/代理导致噪音）
+  quote_source: eastmoney
+
+  # 调度间隔（分钟）：默认与 run_open_monitor_scheduler 对齐，同时作为盘中去重桶大小
+  interval_minutes: 5
+  # 去重时间桶分辨率（分钟）：缺省跟 interval_minutes 一致，可单独覆盖
+  run_id_minutes: 5
+  run_id_use_seconds: true
+
+  # 过滤阈值（按你的风格可自行调小/调大）
+  max_gap_up_pct: 0.05        # 今开高开超过 5%：不追
+  max_gap_up_atr_mult: 1.5    # 动态阈值：gap_up > min(max_gap_up_pct, ATR*mult/昨收) 也会不追（更能挡住跳空追高）
+  max_gap_down_pct: -0.03     # 今开低开超过 -3%：不接
+  min_open_vs_ma20_pct: 0.0   # 今开必须站上 MA20（0.0=不允许跌破）
+  limit_up_trigger_pct: 9.7   # 涨幅接近/达到涨停：跳过
+
+  # 追高过滤：入场价相对 MA5 乖离过大（例如 0.08=超过 MA5 8% 就不追）
+  max_entry_vs_ma5_pct: 0.08
+  # 乖离/拉升阈值：用于可解释化派生字段
+  runup_atr_max: 1.2
+  dev_ma5_atr_max: 2.0
+  dev_ma20_atr_max: 2.5
+
+  # 指数关键位突破阈值（用于盘中解锁/解释）
+  live_breakout_high_eps: 0.002    # 冲过上沿：high >= upper * (1 + eps)
+  live_breakout_latest_eps: 0.001  # 站稳上方：latest >= upper * (1 + eps)
+  live_retest_pct: 0.003           # 回踩容忍：upper * pct 与 ATR 容忍二选大
+  live_retest_atr_mult: 0.5        # 回踩容忍：daily_atr14 * mult
+  minute_fetch_timeout_sec: 5
+  minute_fetch_skip_non_trading_day: true
+
+  # 风控：开盘以“实际入场价”为基准计算止损（stop_ref=entry-stop_atr_mult*ATR）
+  stop_atr_mult: 2.0
+
+  # 情绪过滤：信号日如果已经接近涨停的大阳线，次日默认不追
+  signal_day_limit_up_pct: 0.095
+
+  # 大盘环境分数阈值（指数均线评分低于此值时默认 WAIT）
+  env_index_score_threshold: 1
+
+  # 输出
+  write_to_db: true
+  # 增量写入：true=每次运行 append（保留历史快照，便于对比）；false=按 monitor_date+code 去重，只保留当天最新一份
+  incremental_write: true
+  # 增量导出：true=文件名带 checked_at 时间戳，避免同一天多次导出覆盖
+  incremental_export_timestamp: true
+  export_csv: false
+  export_top_n: 100
+  output_subdir: open_monitor
+
+# Weekly market env config (channel + risk control)
+weekly_env:
+  # Linear regression channel
+  lrc_length: 52
+  lrc_dev: 2.0
+  ma_fast: 30
+  ma_slow: 60
+  # Volume validation
+  breakout_vol_ratio_threshold: 1.2
+  breakdown_vol_weak_threshold: 0.9
+  # Slope change (normalized by close)
+  slope_change_ratio_threshold: 0.002
+  # Volatility regime control
+  bandwidth_lookback: 104
+  bandwidth_high_quantile: 0.9
+  bandwidth_cap: 0.4
+  # Channel vs Pattern conflict handling
+  conflict_requires_vol_confirm: true
+  conflict_gate: ALLOW_SMALL
+
+# Daily market env config (regime + risk control)
+daily_env:
+  # Multi-index regime: ratio of indices needed to upgrade risk level
+  majority_ratio: 0.5
+  # Volume validation for breakdown / risk off
+  breakdown_vol_weak_threshold: 0.9
+  risk_off_vol_weak_threshold: 0.9
+  # High volatility cap (bb_width)
+  bb_width_high_threshold: 0.12
+  bb_width_high_ratio: 0.5
+  high_vol_cap: 0.5

@@ -12,6 +12,7 @@ pytest_debug.log
 
 # Python
 __pycache__/
+
 *.pyc
 *.pyo
 *.pyd
@@ -29,3 +30,13 @@ pip-delete-this-directory.txt
 .pytest_cache/
 .hypothesis/
 ```
+
+dbn_trading_auto
+.idea
+/project_for_llm.txt
+ashare.log
+.qwen/
+gha-creds-*.json
+diff_output.txt
+output/
+

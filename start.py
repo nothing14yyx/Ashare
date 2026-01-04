@@ -1,11 +1,311 @@
 """项目启动脚本入口, 直接执行即可运行示例."""
 
-from ashare.app import AshareApp
+import datetime as dt
+import json
+import logging
+from pathlib import Path
+
+import pandas as pd
+from sqlalchemy import text
+
+from ashare.core.app import AshareApp
+from ashare.strategies.trend_following_strategy import TrendFollowingStrategyRunner
+from ashare.monitor.open_monitor import MA5MA20OpenMonitorRunner
+from ashare.core.schema_manager import ensure_schema, STRATEGY_CODE_MA5_MA20_TREND
+from ashare.utils.logger import setup_logger
+from ashare.indicators.market_indicator_runner import MarketIndicatorRunner
+from ashare.indicators.market_indicator_builder import MarketIndicatorBuilder
+from ashare.strategies.chip_filter import ChipFilter
 
 
-def main() -> None:
-    AshareApp().run()
+def _parse_asof_date(raw: str | None) -> str | None:
+    if not raw:
+        return None
+    try:
+        return dt.date.fromisoformat(str(raw)).isoformat()
+    except Exception:  # noqa: BLE001
+        logger = logging.getLogger("ashare")
+        logger.warning("start --asof-date 无法解析：%s", raw)
+        return None
+
+
+def _resolve_latest_sig_date(
+    repo, table: str, strategy_code: str
+) -> str | None:
+    if not table or not repo._table_exists(table):  # noqa: SLF001
+        return None
+    if "sig_date" not in repo._get_table_columns(table):  # noqa: SLF001
+        return None
+    clause = "WHERE `strategy_code` = :strategy_code" if strategy_code else ""
+    stmt = text(
+        f"SELECT MAX(`sig_date`) AS latest_sig_date FROM `{table}` {clause}"
+    )
+    with repo.engine.begin() as conn:
+        row = conn.execute(stmt, {"strategy_code": strategy_code}).mappings().first()
+    if not row:
+        return None
+    v = row.get("latest_sig_date")
+    if isinstance(v, dt.datetime):
+        return v.date().isoformat()
+    if isinstance(v, dt.date):
+        return v.isoformat()
+    if v:
+        try:
+            return dt.datetime.fromisoformat(str(v)).date().isoformat()
+        except Exception:  # noqa: BLE001
+            return None
+    return None
+
+
+def _load_sig_date_breakdown(
+    repo, table: str, strategy_code: str, limit: int = 7
+) -> list[dict]:
+    if not table or not repo._table_exists(table):  # noqa: SLF001
+        return []
+    cols = set(repo._get_table_columns(table))  # noqa: SLF001
+    if "sig_date" not in cols:
+        return []
+
+    clauses = []
+    params: dict = {"limit": limit}
+    if strategy_code and "strategy_code" in cols:
+        clauses.append("`strategy_code` = :strategy_code")
+        params["strategy_code"] = strategy_code
+    if "signal" in cols:
+        clauses.append("`signal` = 'BUY'")
+
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    stmt = text(
+        f"""
+        SELECT `sig_date`, COUNT(*) AS cnt
+        FROM `{table}`
+        {where}
+        GROUP BY `sig_date`
+        ORDER BY `sig_date` DESC
+        LIMIT :limit
+        """
+    )
+
+    with repo.engine.begin() as conn:
+        rows = conn.execute(stmt, params).fetchall()
+
+    breakdown = []
+    for row in rows:
+        sig_date = row[0]
+        cnt = row[1]
+        if sig_date:
+            breakdown.append({"sig_date": str(sig_date), "count": int(cnt or 0)})
+    return breakdown
+
+
+def _self_check(
+    repo,
+    *,
+    ready_view: str | None,
+    total_buy_cnt: int,
+    latest_sig_date_cnt: int,
+    weekly_status: dict,
+    skipped_weekly: bool,
+    daily_indicator_written: int,
+    chip_processed: int,
+) -> None:
+    logger = logging.getLogger("ashare")
+    if ready_view and repo._table_exists(ready_view):  # noqa: SLF001
+        ready_view_msg = f"ready_signals_view={ready_view}"
+    else:
+        ready_view_msg = "ready_signals_view=missing"
+
+    weekly_msg = "weekly=skipped" if skipped_weekly else f"weekly_written={weekly_status.get('written', 0)}"
+    logger.info(
+        "start summary: %s buy_total_recent=%s latest_buy=%s daily_written=%s chip_processed=%s %s",
+        ready_view_msg,
+        total_buy_cnt,
+        latest_sig_date_cnt,
+        daily_indicator_written,
+        chip_processed,
+        weekly_msg,
+    )
+    if skipped_weekly:
+        return
+    written = weekly_status.get("written", 0)
+    if written:
+        logger.debug("start weekly indicator written=%s", written)
+    else:
+        logger.warning("start weekly indicator missing; check weekly pipeline")
+
+
+import argparse
+
+def main(
+    *,
+    skip_fetch: bool = False,
+    skip_strategy: bool = False,
+    skip_weekly: bool = False,
+    skip_chip: bool = False,
+    skip_daily_indicator: bool = False,
+    asof_date: str | None = None,
+    init_db: bool = False,
+) -> None:
+    setup_logger()
+    logger = logging.getLogger("ashare")
+    
+    if init_db:
+        logger.info("正在执行数据库结构校验与初始化...")
+        ensure_schema()
+    
+    if not skip_fetch:
+        # 现在的 AshareApp 不再默认初始化数据库
+        AshareApp(init_db=False).run()
+    
+    strategy_runner = TrendFollowingStrategyRunner()
+    if not skip_strategy:
+        # 策略是否执行由 config.yaml: strategy_ma5_ma20_trend.enabled 控制
+        strategy_runner.run()
+
+    monitor_runner = MA5MA20OpenMonitorRunner()
+    repo = monitor_runner.repo
+    params = monitor_runner.params
+    ready_view = str(params.ready_signals_view or "").strip() or None
+    signal_table = str(getattr(strategy_runner.params, "signal_events_table", "") or "").strip()
+
+    def _build_indicator_runner() -> MarketIndicatorRunner:
+        monitor_runner = MA5MA20OpenMonitorRunner()
+        builder = MarketIndicatorBuilder(
+            env_builder=monitor_runner.env_builder,
+            logger=monitor_runner.logger,
+        )
+        return MarketIndicatorRunner(
+            repo=monitor_runner.repo,
+            builder=builder,
+            logger=monitor_runner.logger,
+        )
+
+    def _run_daily_market_indicator(*, start_date: str | None, end_date: str | None, mode: str) -> dict:
+        runner = _build_indicator_runner()
+        return runner.run_daily_indicator(start_date=start_date, end_date=end_date, mode=mode)
+
+    def _run_weekly_market_indicator(*, start_date: str | None, end_date: str | None, mode: str) -> dict:
+        runner = _build_indicator_runner()
+        return runner.run_weekly_indicator(start_date=start_date, end_date=end_date, mode=mode)
+
+    def _run_chip_filter() -> int:
+        repo = monitor_runner.repo
+        table = strategy_runner.params.signal_events_table
+        latest_date = _resolve_latest_sig_date(repo, table, STRATEGY_CODE_MA5_MA20_TREND)
+        if not latest_date:
+            logger.warning("chip filter skipped: no latest sig_date.")
+            return 0
+        stmt = text(
+            f"""
+            SELECT
+              e.`sig_date`,
+              e.`code`,
+              e.`signal`,
+              e.`final_action`,
+              e.`risk_tag`,
+              ind.`close`,
+              ind.`ma20`,
+              ind.`vol_ratio`,
+              ind.`atr14`,
+              ind.`macd_hist`,
+              ind.`kdj_k`,
+              ind.`rsi14`,
+              ind.`ma20_bias`,
+              ind.`yearline_state`
+            FROM `{table}` e
+            LEFT JOIN `{strategy_runner.params.indicator_table}` ind
+              ON ind.`trade_date` = e.`sig_date` AND ind.`code` = e.`code`
+            WHERE e.`strategy_code` = :strategy AND e.`sig_date` = :d
+            """
+        )
+        with repo.engine.begin() as conn:
+            sig_df = pd.read_sql(stmt, conn, params={"strategy": STRATEGY_CODE_MA5_MA20_TREND, "d": latest_date})
+        if sig_df.empty:
+            logger.warning("chip filter skipped: empty signals at %s", latest_date)
+            return 0
+        chip = ChipFilter()
+        result = chip.apply(sig_df)
+        return int(len(result))
+
+    # 执行日线市场指标计算
+    daily_indicator_status: dict = {"written": 0}
+    if not skip_daily_indicator:
+        try:
+            daily_indicator_status = _run_daily_market_indicator(
+                start_date=asof_date,
+                end_date=asof_date,
+                mode="incremental",
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("start daily indicator failed: %s", exc)
+
+    # 执行筹码筛选计算
+    chip_filter_status: dict = {"processed": 0}
+    if not skip_chip:
+        try:
+            chip_filter_status["processed"] = _run_chip_filter()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("start chip filter failed: %s", exc)
+
+    weekly_status: dict = {"written": 0}
+    skipped_weekly = bool(skip_weekly)
+    if not skipped_weekly:
+        asof_date = _parse_asof_date(asof_date)
+        try:
+            weekly_status = _run_weekly_market_indicator(
+                start_date=asof_date,
+                end_date=asof_date,
+                mode="incremental",
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("start weekly indicator failed: %s", exc)
+
+    breakdown = []
+    if ready_view and repo._table_exists(ready_view):  # noqa: SLF001
+        breakdown = _load_sig_date_breakdown(repo, ready_view, params.strategy_code)
+    if not breakdown and signal_table:
+        breakdown = _load_sig_date_breakdown(repo, signal_table, params.strategy_code)
+
+    latest_trade_date = repo._resolve_latest_trade_date(ready_view=ready_view)  # noqa: SLF001
+    if not latest_trade_date and signal_table:
+        latest_trade_date = _resolve_latest_sig_date(repo, signal_table, params.strategy_code)
+
+    latest_sig_date_buy_cnt = breakdown[0]["count"] if breakdown else 0
+    buy_cnt_total_recent_n_days = sum(item.get("count", 0) for item in breakdown)
+
+    _self_check(
+        repo,
+        ready_view=ready_view,
+        total_buy_cnt=buy_cnt_total_recent_n_days,
+        latest_sig_date_cnt=latest_sig_date_buy_cnt,
+        weekly_status=weekly_status,
+        skipped_weekly=skipped_weekly,
+        daily_indicator_written=int(daily_indicator_status.get("written", 0) or 0),
+        chip_processed=int(chip_filter_status.get("processed", 0) or 0),
+    )
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="AShare 项目启动脚本")
+    parser.add_argument("--init-db", action="store_true", help="初始化/校验数据库结构")
+    parser.add_argument("--skip-fetch", action="store_true", help="跳过数据抓取")
+    parser.add_argument("--skip-strategy", action="store_true", help="跳过策略运行")
+    parser.add_argument("--skip-weekly", action="store_true", help="跳过周线指标计算")
+    parser.add_argument("--asof-date", type=str, help="指定日期 (YYYY-MM-DD)")
+    
+    args = parser.parse_args()
+    
+    main(
+        skip_fetch=args.skip_fetch,
+        skip_strategy=args.skip_strategy,
+        skip_weekly=args.skip_weekly,
+        asof_date=args.asof_date,
+        init_db=args.init_db,
+    )
+
+# 验收自检（最小）
+# 1) python -m py_compile ashare/monitor/open_monitor_repo.py scripts/run_open_monitor_scheduler.py scripts/run_index_weekly_channel.py start.py
+# 2) 周末/非交易日：python -m scripts.run_open_monitor_scheduler --once
+#    - monitor_date 回落到最近交易日，open_monitor 可正常构建环境
+# 3) python start.py
+#    - 报告中的 BUY 总数与 SQL 查询一致，周线 run_id= WEEKLY_{asof_date} 存在

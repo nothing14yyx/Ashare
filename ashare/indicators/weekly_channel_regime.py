@@ -1,0 +1,483 @@
+from __future__ import annotations
+
+"""周线下跌/上升通道（线性回归通道）+ 30/60 周均线的情景分类。
+
+设计目标：
+- 尽量把“手动画通道”的主观部分，替换成可重复的计算方法；
+- 输出“情景（state）+ 仓位提示（position_hint）+ 通道位置百分比（chan_pos）+ 关键价位
+  （upper/lower/MA30/MA60）”，便于在 open_monitor / 报告里展示或做过滤。
+
+注意：
+- 这里不做艾略特波浪计数（主观性强），只保留可客观落地的条件判断；
+- 通道用线性回归中轴 + 残差标准差*dev 的上下轨。
+"""
+
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
+
+import numpy as np
+import pandas as pd
+
+
+def _to_weekly_ohlcv(df_daily: pd.DataFrame) -> pd.DataFrame:
+    """把日线 OHLCV 按 code 聚合成周线（week_end=当周最后交易日）。
+
+    期望列：code,date,open,high,low,close,volume,(optional amount)
+    返回列：code,week_end,open,high,low,close,volume,(optional amount)
+    """
+
+    if df_daily is None or df_daily.empty:
+        return pd.DataFrame(columns=["code", "week_end", "open", "high", "low", "close", "volume"])
+
+    work = df_daily.copy()
+    work["date_dt"] = pd.to_datetime(work["date"], errors="coerce")
+    for col in ["open", "high", "low", "close", "volume", "amount"]:
+        if col in work.columns:
+            work[col] = pd.to_numeric(work[col], errors="coerce")
+
+    keep = [
+        c
+        for c in ["code", "date", "date_dt", "open", "high", "low", "close", "volume", "amount"]
+        if c in work.columns
+    ]
+    work = work[keep].dropna(subset=["code", "date_dt"]).copy()
+    if work.empty:
+        return pd.DataFrame(columns=["code", "week_end", "open", "high", "low", "close", "volume"])
+
+    out_parts = []
+    for code, grp in work.groupby("code", sort=False):
+        grp = grp.sort_values("date_dt").copy()
+        grp["week_key"] = grp["date_dt"].dt.to_period("W-FRI")
+
+        def _agg_week(g: pd.DataFrame) -> pd.Series:
+            g = g.sort_values("date_dt")
+            week_end_dt = g["date_dt"].iloc[-1]
+            week_end = week_end_dt.date().isoformat() if pd.notna(week_end_dt) else None
+            data = {
+                "open": g["open"].iloc[0],
+                "high": g["high"].max(),
+                "low": g["low"].min(),
+                "close": g["close"].iloc[-1],
+                "volume": g["volume"].sum(),
+                "week_end": week_end,
+            }
+            if "amount" in g.columns:
+                data["amount"] = g["amount"].sum()
+            return pd.Series(data)
+
+        grouped = grp.groupby("week_key", sort=False)
+        try:
+            wk = (
+                grouped.apply(_agg_week, include_groups=False)
+                .dropna(subset=["open", "high", "low", "close"])
+                .reset_index(drop=True)
+            )
+        except TypeError:
+            wk = (
+                grouped.apply(_agg_week)
+                .dropna(subset=["open", "high", "low", "close"])
+                .reset_index(drop=True)
+            )
+        if wk.empty:
+            continue
+        wk["code"] = str(code)
+        out_parts.append(wk)
+
+    if not out_parts:
+        return pd.DataFrame(columns=["code", "week_end", "open", "high", "low", "close", "volume"])
+
+    out = pd.concat(out_parts, ignore_index=True)
+    out = out.sort_values(["code", "week_end"]).reset_index(drop=True)
+
+    cols = ["code", "week_end", "open", "high", "low", "close", "volume"]
+    if "amount" in out.columns:
+        cols.append("amount")
+    out = out[[c for c in cols if c in out.columns]]
+    return out
+
+
+def _sma(s: pd.Series, n: int) -> pd.Series:
+    n = max(int(n), 1)
+    return s.rolling(n, min_periods=n).mean()
+
+
+def _linear_regression_channel(
+    close: pd.Series,
+    *,
+    length: int = 52,
+    dev: float = 2.0,
+) -> pd.DataFrame:
+    """线性回归通道：center + dev*std(residual) 的上下轨。
+
+    - length: 回归窗口（周）
+    - dev: 标准差倍数
+    """
+
+    close = pd.to_numeric(close, errors="coerce").astype(float)
+    n = len(close)
+    center = np.full(n, np.nan, dtype=float)
+    upper = np.full(n, np.nan, dtype=float)
+    lower = np.full(n, np.nan, dtype=float)
+    slope = np.full(n, np.nan, dtype=float)
+
+    length = max(int(length), 2)
+    x = np.arange(length, dtype=float)
+
+    for i in range(length - 1, n):
+        y = close.iloc[i - length + 1 : i + 1].to_numpy(dtype=float)
+        if np.any(np.isnan(y)):
+            continue
+        a, b = np.polyfit(x, y, 1)  # y = a*x + b
+        y_hat = a * x + b
+        resid = y - y_hat
+        sigma = float(np.std(resid, ddof=1)) if length > 2 else 0.0
+
+        center[i] = y_hat[-1]
+        upper[i] = y_hat[-1] + float(dev) * sigma
+        lower[i] = y_hat[-1] - float(dev) * sigma
+        slope[i] = a
+
+    return pd.DataFrame(
+        {
+            "lrc_center": center,
+            "lrc_upper": upper,
+            "lrc_lower": lower,
+            "lrc_slope": slope,
+        },
+        index=close.index,
+    )
+
+
+@dataclass
+class WeeklyChannelResult:
+    state: Optional[str]
+    position_hint: Optional[float]
+    detail: Dict[str, Dict[str, Any]]
+    context: Dict[str, Any]
+
+    def to_payload(self) -> Dict[str, Any]:
+        payload = {
+            "state": self.state,
+            "position_hint": self.position_hint,
+            "detail": self.detail,
+        }
+        payload.update(self.context)
+        return payload
+
+
+class WeeklyChannelClassifier:
+    """周线通道情景分类器（指数/个股均可）。"""
+
+    def __init__(
+        self,
+        *,
+        lrc_length: int = 52,
+        lrc_dev: float = 2.0,
+        touch_chan_eps: float = 0.005,
+        near_lower_eps: float = 0.02,
+        near_ma_eps: float = 0.01,
+        ma_fast: int = 30,
+        ma_slow: int = 60,
+        breakout_vol_ratio_threshold: float = 1.2,
+        breakdown_vol_weak_threshold: float = 0.9,
+        slope_change_ratio_threshold: float = 0.002,
+        bandwidth_lookback: int = 104,
+        bandwidth_high_quantile: float = 0.9,
+        bandwidth_cap: float = 0.4,
+        primary_code: str = "sh.000001",
+    ) -> None:
+        self.lrc_length = max(int(lrc_length), 2)
+        self.lrc_dev = float(lrc_dev)
+        self.touch_chan_eps = float(touch_chan_eps)
+        self.near_lower_eps = float(near_lower_eps)
+        self.near_ma_eps = float(near_ma_eps)
+        self.ma_fast = max(int(ma_fast), 1)
+        self.ma_slow = max(int(ma_slow), 1)
+        self.breakout_vol_ratio_threshold = float(breakout_vol_ratio_threshold)
+        self.breakdown_vol_weak_threshold = float(breakdown_vol_weak_threshold)
+        self.slope_change_ratio_threshold = float(slope_change_ratio_threshold)
+        self.bandwidth_lookback = max(int(bandwidth_lookback), 5)
+        self.bandwidth_high_quantile = float(bandwidth_high_quantile)
+        self.bandwidth_cap = float(bandwidth_cap)
+        self.primary_code = str(primary_code or "").strip() or "sh.000001"
+
+    @staticmethod
+    def _near(x: float | None, y: float | None, eps: float) -> bool:
+        if x is None or y is None:
+            return False
+        if pd.isna(x) or pd.isna(y) or y == 0:
+            return False
+        return abs(float(x) - float(y)) / abs(float(y)) <= float(eps)
+
+    def _classify_one(self, wk: pd.DataFrame) -> Dict[str, Any]:
+        # 分组后的 wk 可能继承了全表的原始 index（不是从 0 开始的连续 RangeIndex）
+        # 若直接 concat(lrc.reset_index(drop=True)) 会发生 index 对齐错位，导致出现
+        # close/week_end 为 None 但通道列有值的“幽灵行”。
+        wk = wk.copy().reset_index(drop=True)
+        wk["ma30"] = _sma(wk["close"], self.ma_fast)
+        wk["ma60"] = _sma(wk["close"], self.ma_slow)
+        wk["vol_ma20"] = _sma(wk["volume"], 20)
+        lrc = _linear_regression_channel(wk["close"], length=self.lrc_length, dev=self.lrc_dev)
+        # wk 已 reset_index(drop=True)，lrc 的 index 与 wk 完全一致，直接 concat 即可
+        wk = pd.concat([wk, lrc], axis=1)
+
+        last = wk.iloc[-1]
+        close = float(last.get("close")) if pd.notna(last.get("close")) else None
+        high = float(last.get("high")) if pd.notna(last.get("high")) else None
+        low = float(last.get("low")) if pd.notna(last.get("low")) else None
+        upper = float(last.get("lrc_upper")) if pd.notna(last.get("lrc_upper")) else None
+        lower = float(last.get("lrc_lower")) if pd.notna(last.get("lrc_lower")) else None
+        center = float(last.get("lrc_center")) if pd.notna(last.get("lrc_center")) else None
+        slope = float(last.get("lrc_slope")) if pd.notna(last.get("lrc_slope")) else None
+        ma30 = float(last.get("ma30")) if pd.notna(last.get("ma30")) else None
+        ma60 = float(last.get("ma60")) if pd.notna(last.get("ma60")) else None
+        volume = float(last.get("volume")) if pd.notna(last.get("volume")) else None
+        amount = float(last.get("amount")) if pd.notna(last.get("amount")) else None
+        vol_ma20 = float(last.get("vol_ma20")) if pd.notna(last.get("vol_ma20")) else None
+
+        wk_vol_ratio_20 = None
+        if volume is not None and vol_ma20 not in (None, 0):
+            wk_vol_ratio_20 = volume / vol_ma20 if vol_ma20 else None
+
+        prev_high = None
+        if len(wk) >= 2:
+            prev_row = wk.iloc[-2]
+            prev_high = float(prev_row.get("high")) if pd.notna(prev_row.get("high")) else None
+
+        slope_change_4w = None
+        slope_shift = wk["lrc_slope"].shift(4)
+        if not slope_shift.empty:
+            last_slope = wk["lrc_slope"].iloc[-1]
+            prev_slope = slope_shift.iloc[-1]
+            if pd.notna(last_slope) and pd.notna(prev_slope):
+                slope_change_4w = float(last_slope - prev_slope)
+
+        state = "INSIDE_CHANNEL"
+        note = "仍在通道内运行"
+
+        chan_pos = None
+        chan_pos_clamped = None
+        if close is not None and upper is not None and lower is not None and upper > lower:
+            chan_pos = (close - lower) / (upper - lower)
+            chan_pos_clamped = min(max(chan_pos, 0.0), 1.0)
+
+        near_lower = (
+            lower is not None
+            and (
+                (close is not None and self._near(close, lower, self.near_lower_eps))
+                or (low is not None and low <= lower * (1.0 + self.touch_chan_eps))
+            )
+        )
+        near_ma30 = self._near(close, ma30, self.near_ma_eps) or (
+            ma30 is not None and low is not None and low <= ma30 * (1.0 + self.near_ma_eps)
+        )
+
+        if upper is not None and close is not None and close > upper:
+            if wk_vol_ratio_20 is not None and wk_vol_ratio_20 < self.breakout_vol_ratio_threshold:
+                state = "BREAKOUT_UP_WEAK"
+                note = "上破上轨但量能不足（疑似诱多）"
+            else:
+                state = "CHANNEL_BREAKOUT_UP"
+                note = "周收盘价上破通道上轨"
+        elif lower is not None and close is not None and close < lower:
+            if wk_vol_ratio_20 is not None and wk_vol_ratio_20 < self.breakdown_vol_weak_threshold:
+                state = "BREAKDOWN_WEAK"
+                note = "跌破下轨但量能萎缩（疑似挖坑）"
+            else:
+                state = "CHANNEL_BREAKDOWN"
+                note = "周收盘价跌破通道下轨"
+        elif near_lower and near_ma30:
+            state = "LOWER_RAIL_NEAR_MA30_ZONE"
+            note = "触及/接近下轨且在30周线附近（反弹观察区）"
+        elif near_lower:
+            state = "NEAR_LOWER_RAIL"
+            note = "靠近通道下轨（下轨反弹观察区）"
+        elif (
+            self._near(close, ma60, self.near_ma_eps)
+            or (ma60 is not None and low is not None and low <= ma60 * (1.0 + self.near_ma_eps))
+        ):
+            state = "EXTREME_NEAR_MA60_ZONE"
+            note = "回踩到60周线附近（更深调整观察区）"
+
+        position_hint_map = {
+            "CHANNEL_BREAKOUT_UP": 0.8,
+            "INSIDE_CHANNEL": 0.6,
+            "NEAR_LOWER_RAIL": 0.5,
+            "LOWER_RAIL_NEAR_MA30_ZONE": 0.4,
+            "EXTREME_NEAR_MA60_ZONE": 0.2,
+            "CHANNEL_BREAKDOWN": 0.0,
+            "BREAKOUT_UP_WEAK": 0.5,
+            "BREAKDOWN_WEAK": 0.1,
+        }
+
+        position_hint = chan_pos_clamped
+        if state == "CHANNEL_BREAKOUT_UP":
+            base = position_hint_map.get(state)
+            position_hint = base if position_hint is None else max(position_hint, base)
+        elif state == "BREAKOUT_UP_WEAK":
+            base = position_hint_map.get(state)
+            position_hint = base if position_hint is None else min(position_hint, base)
+        elif state == "CHANNEL_BREAKDOWN":
+            position_hint = 0.0
+        elif state == "BREAKDOWN_WEAK":
+            base = position_hint_map.get(state)
+            position_hint = base if position_hint is None else min(position_hint, base)
+        elif state == "EXTREME_NEAR_MA60_ZONE":
+            position_hint = 0.3 if position_hint is None else min(position_hint, 0.3)
+        elif state == "LOWER_RAIL_NEAR_MA30_ZONE":
+            position_hint = 0.4 if position_hint is None else min(position_hint, 0.4)
+        elif state == "NEAR_LOWER_RAIL":
+            position_hint = 0.5 if position_hint is None else min(position_hint, 0.5)
+        elif position_hint is None:
+            position_hint = position_hint_map.get(state)
+
+        week_end = last.get("week_end")
+        week_end_str = None
+        if pd.notna(week_end):
+            try:
+                week_end_str = pd.to_datetime(week_end).date().isoformat()
+            except Exception:
+                week_end_str = str(week_end)[:10]
+
+        slope_change_ratio = None
+        if slope_change_4w is not None and close not in (None, 0):
+            slope_change_ratio = float(slope_change_4w) / float(close)
+        if slope_change_ratio is not None and abs(slope_change_ratio) >= self.slope_change_ratio_threshold:
+            if slope_change_ratio < 0:
+                position_hint = (
+                    min(position_hint, 0.4) if position_hint is not None else 0.4
+                )
+                note = f"{note};斜率转弱"
+            else:
+                position_hint = (
+                    max(position_hint, 0.6) if position_hint is not None else 0.6
+                )
+                note = f"{note};斜率转强"
+
+        bandwidth_pct = None
+        if center not in (None, 0) and upper is not None and lower is not None:
+            bandwidth_pct = (upper - lower) / abs(center)
+        if bandwidth_pct is not None and "bandwidth_pct" not in wk.columns:
+            wk["bandwidth_pct"] = (wk["lrc_upper"] - wk["lrc_lower"]) / wk["lrc_center"].replace(0, np.nan)
+        if "bandwidth_pct" in wk.columns and wk["bandwidth_pct"].notna().any():
+            recent = wk["bandwidth_pct"].tail(self.bandwidth_lookback).dropna()
+            if not recent.empty:
+                try:
+                    high_band = float(np.nanpercentile(recent.to_numpy(), self.bandwidth_high_quantile * 100.0))
+                except Exception:
+                    high_band = None
+                if high_band is not None and bandwidth_pct is not None and bandwidth_pct >= high_band:
+                    if position_hint is None:
+                        position_hint = self.bandwidth_cap
+                    else:
+                        position_hint = min(position_hint, self.bandwidth_cap)
+                    note = f"{note};波动率过高降仓"
+
+        return {
+            "week_end": week_end_str,
+            "close": close,
+            "ma30": ma30,
+            "ma60": ma60,
+            "chan_upper": upper,
+            "chan_lower": lower,
+            "chan_slope": slope,
+            "chan_pos": chan_pos,
+            "chan_center": center,
+            "chan_bandwidth_pct": bandwidth_pct,
+            "high": high,
+            "low": low,
+            "wk_volume": volume,
+            "wk_amount": amount,
+            "wk_vol_ma20": vol_ma20,
+            "wk_vol_ratio_20": wk_vol_ratio_20,
+            "slope_change_4w": slope_change_4w,
+            "prev_high": prev_high,
+            "channel_dir": (
+                "DOWN" if (slope is not None and slope < 0) else "UP" if (slope is not None and slope > 0) else None
+            ),
+            "state": state,
+            "position_hint": position_hint,
+            "note": note,
+        }
+
+    def classify(self, df_daily: pd.DataFrame) -> WeeklyChannelResult:
+        if df_daily is None or df_daily.empty:
+            return WeeklyChannelResult(state=None, position_hint=None, detail={}, context={})
+
+        wk = _to_weekly_ohlcv(df_daily)
+        if wk.empty:
+            return WeeklyChannelResult(state=None, position_hint=None, detail={}, context={})
+
+        detail: Dict[str, Dict[str, Any]] = {}
+        weekly_bars_by_code: Dict[str, list[dict[str, Any]]] = {}
+        for code, grp in wk.groupby("code", sort=False):
+            grp = grp.sort_values("week_end").reset_index(drop=True)
+            if len(grp) < max(self.ma_slow, self.lrc_length):
+                # 数据不足时仍输出最新值，但 state/通道可能为 None
+                payload = self._classify_one(grp)
+            else:
+                payload = self._classify_one(grp)
+            detail[str(code)] = payload
+
+            code_weekly_bars: list[dict[str, Any]] = []
+            if not grp.empty:
+                for _, row in grp.tail(120).iterrows():
+                    try:
+                        week_end = pd.to_datetime(row.get("week_end")).date().isoformat()
+                    except Exception:
+                        week_end = str(row.get("week_end"))[:10]
+                    code_weekly_bars.append(
+                        {
+                            "week_end": week_end,
+                            "open": float(row.get("open")) if pd.notna(row.get("open")) else None,
+                            "high": float(row.get("high")) if pd.notna(row.get("high")) else None,
+                            "low": float(row.get("low")) if pd.notna(row.get("low")) else None,
+                            "close": float(row.get("close")) if pd.notna(row.get("close")) else None,
+                            "volume": float(row.get("volume")) if pd.notna(row.get("volume")) else None,
+                            "amount": float(row.get("amount")) if pd.notna(row.get("amount")) else None,
+                        }
+                    )
+            weekly_bars_by_code[str(code)] = code_weekly_bars
+
+        # 选一个“主参考指数”输出整体 state（便于 open_monitor 直接引用）
+        primary = self.primary_code
+        if primary not in detail and detail:
+            primary = sorted(detail.keys())[0]
+        primary_payload = detail.get(primary, {}) if detail else {}
+
+        primary_weekly_bars: list[dict[str, Any]] = []
+        if not wk.empty and primary:
+            primary_df = wk[wk["code"] == primary].sort_values("week_end").tail(120)
+            if not primary_df.empty:
+                for _, row in primary_df.iterrows():
+                    try:
+                        week_end = pd.to_datetime(row.get("week_end")).date().isoformat()
+                    except Exception:
+                        week_end = str(row.get("week_end"))[:10]
+                    primary_weekly_bars.append(
+                        {
+                            "week_end": week_end,
+                            "open": float(row.get("open")) if pd.notna(row.get("open")) else None,
+                            "high": float(row.get("high")) if pd.notna(row.get("high")) else None,
+                            "low": float(row.get("low")) if pd.notna(row.get("low")) else None,
+                            "close": float(row.get("close")) if pd.notna(row.get("close")) else None,
+                            "volume": float(row.get("volume")) if pd.notna(row.get("volume")) else None,
+                            "amount": float(row.get("amount")) if pd.notna(row.get("amount")) else None,
+                        }
+                    )
+
+        return WeeklyChannelResult(
+            state=primary_payload.get("state"),
+            position_hint=primary_payload.get("position_hint"),
+            detail=detail,
+            context={
+                "primary_code": primary if detail else None,
+                "week_end": primary_payload.get("week_end"),
+                "chan_pos": primary_payload.get("chan_pos"),
+                "note": primary_payload.get("note"),
+                "wk_vol_ratio_20": primary_payload.get("wk_vol_ratio_20"),
+                "slope_change_4w": primary_payload.get("slope_change_4w"),
+                "primary_weekly_bars": primary_weekly_bars,
+                "weekly_bars_by_code": weekly_bars_by_code,
+            },
+        )
